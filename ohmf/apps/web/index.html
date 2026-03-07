@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self' http://localhost:18080 http://127.0.0.1:18080; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'" />
+    <meta name="referrer" content="no-referrer" />
+    <meta http-equiv="Permissions-Policy" content="camera=(), microphone=(), geolocation=()" />
+    <title>OHMF Messages</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="bg-layer"></div>
+    <section class="auth-shell" id="auth-shell">
+      <div class="auth-card">
+        <h1>Sign in to OHMF</h1>
+        <p class="auth-muted">Use your phone number. In local dev, OTP is <code>123456</code>.</p>
+        <p class="status-msg" id="auth-status" role="status" aria-live="polite"></p>
+
+        <form id="phone-start-form">
+          <label for="phone-input">Phone Number (E.164)</label>
+          <input id="phone-input" name="phone" type="tel" placeholder="+15551230001" required />
+          <button type="submit" class="send-btn full">Send OTP</button>
+        </form>
+
+        <form id="phone-verify-form" class="hidden">
+          <label for="otp-input">OTP Code</label>
+          <input id="otp-input" name="otp" type="text" inputmode="numeric" maxlength="6" placeholder="123456" required />
+          <button type="submit" class="send-btn full">Verify and Continue</button>
+        </form>
+      </div>
+    </section>
+
+    <div class="app-shell hidden" id="app-shell">
+      <aside class="sidebar" id="sidebar">
+        <header class="sidebar-header">
+          <h1>Messages</h1>
+          <div class="header-actions">
+            <button class="icon-btn" id="new-chat-btn" aria-label="New conversation">+</button>
+            <button class="icon-btn" id="logout-btn" aria-label="Logout">x</button>
+          </div>
+        </header>
+        <form class="new-chat-form hidden" id="new-chat-form">
+          <label for="new-phone-input">Start new message</label>
+          <div class="row">
+            <input id="new-phone-input" type="tel" placeholder="+15551239999" />
+            <button type="submit" class="send-btn compact">Start</button>
+          </div>
+        </form>
+        <div class="search-wrap">
+          <input id="search-input" type="search" placeholder="Search conversations" />
+        </div>
+        <ul class="thread-list" id="thread-list"></ul>
+      </aside>
+
+      <main class="chat" id="chat">
+        <header class="chat-header">
+          <button class="back-btn" id="back-btn" aria-label="Back">Back</button>
+          <div class="chat-title-wrap">
+            <p class="chat-title" id="chat-title">Select a conversation</p>
+            <p class="chat-subtitle" id="chat-subtitle">No active thread</p>
+          </div>
+        </header>
+
+        <section class="message-list" id="message-list">
+          <div class="empty-state" id="empty-state">
+            <h2>Start chatting</h2>
+            <p>Pick a conversation or start a new one with a phone number.</p>
+          </div>
+        </section>
+
+        <form class="composer" id="composer">
+          <input
+            id="composer-input"
+            type="text"
+            placeholder="Message"
+            autocomplete="off"
+            maxlength="1000"
+          />
+          <button type="submit" class="send-btn">Send</button>
+        </form>
+      </main>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,11 @@
+DROP TABLE IF EXISTS idempotency_keys;
+DROP TABLE IF EXISTS messages;
+DROP TABLE IF EXISTS conversation_counters;
+DROP TABLE IF EXISTS conversation_external_members;
+DROP TABLE IF EXISTS conversation_members;
+DROP TABLE IF EXISTS external_contacts;
+DROP TABLE IF EXISTS conversations;
+DROP TABLE IF EXISTS phone_verification_challenges;
+DROP TABLE IF EXISTS refresh_tokens;
+DROP TABLE IF EXISTS devices;
+DROP TABLE IF EXISTS users;
