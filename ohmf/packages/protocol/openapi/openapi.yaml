@@ -1,0 +1,190 @@
+openapi: 3.0.3
+info:
+  title: OHMF MVP API
+  version: 1.0.0
+servers:
+  - url: http://localhost:18080
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    ErrorEnvelope:
+      type: object
+      required: [code, message, request_id]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        request_id:
+          type: string
+        details:
+          type: object
+          additionalProperties: true
+    PhoneStartRequest:
+      type: object
+      required: [phone_e164, channel]
+      properties:
+        phone_e164: { type: string }
+        channel: { type: string, enum: [SMS] }
+    PhoneStartResponse:
+      type: object
+      properties:
+        challenge_id: { type: string }
+        expires_in_sec: { type: integer }
+        retry_after_sec: { type: integer }
+        otp_strategy: { type: string }
+    PhoneVerifyRequest:
+      type: object
+      required: [challenge_id, otp_code, device]
+      properties:
+        challenge_id: { type: string }
+        otp_code: { type: string }
+        device:
+          type: object
+          properties:
+            platform: { type: string }
+            device_name: { type: string }
+            push_token: { type: string }
+            public_key: { type: string }
+    TokenPair:
+      type: object
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+    CreateConversationRequest:
+      type: object
+      required: [type, participants]
+      properties:
+        type: { type: string, enum: [DM] }
+        participants:
+          type: array
+          items: { type: string }
+        transport_policy: { type: string, default: AUTO }
+    SendMessageRequest:
+      type: object
+      required: [conversation_id, idempotency_key, content_type, content]
+      properties:
+        conversation_id: { type: string }
+        idempotency_key: { type: string }
+        content_type: { type: string }
+        content:
+          type: object
+          additionalProperties: true
+        client_generated_id: { type: string }
+    SendPhoneMessageRequest:
+      type: object
+      required: [phone_e164, idempotency_key, content_type, content]
+      properties:
+        phone_e164: { type: string }
+        idempotency_key: { type: string }
+        content_type: { type: string }
+        content:
+          type: object
+          additionalProperties: true
+security:
+  - bearerAuth: []
+paths:
+  /v1/auth/phone/start:
+    post:
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PhoneStartRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PhoneStartResponse' }
+  /v1/auth/phone/verify:
+    post:
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PhoneVerifyRequest' }
+      responses:
+        '200':
+          description: OK
+  /v1/auth/refresh:
+    post:
+      security: []
+      responses:
+        '200':
+          description: OK
+  /v1/auth/logout:
+    post:
+      responses:
+        '204':
+          description: No Content
+  /v1/conversations:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateConversationRequest' }
+      responses:
+        '201':
+          description: Created
+    get:
+      responses:
+        '200':
+          description: OK
+  /v1/conversations/{id}:
+    get:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+  /v1/messages:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SendMessageRequest' }
+      responses:
+        '201':
+          description: Created
+  /v1/messages/phone:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SendPhoneMessageRequest' }
+      responses:
+        '201':
+          description: Created
+  /v1/conversations/{id}/messages:
+    get:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+  /v1/conversations/{id}/read:
+    post:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '204':
+          description: No Content

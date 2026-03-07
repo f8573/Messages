@@ -1,0 +1,14 @@
+version: "2"
+sql:
+  - engine: postgresql
+    schema:
+      - sqlc/schema/*.sql
+    queries:
+      - sqlc/queries/*.sql
+    gen:
+      go:
+        package: sqlc
+        out: internal/db/sqlc
+        sql_package: pgx/v5
+        emit_interface: true
+        emit_empty_slices: true

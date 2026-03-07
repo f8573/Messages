@@ -1,0 +1,5 @@
+.tools/
+**/.tools/
+services/gateway/bin/
+services/gateway/.env
+services/gateway/coverage.out
