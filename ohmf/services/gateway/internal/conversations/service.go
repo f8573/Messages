@@ -69,6 +69,69 @@ func (s *Service) CreateDM(ctx context.Context, actor string, participants []str
 	return Conversation{ConversationID: id, Type: t, Participants: all, UpdatedAt: time.Now().UTC().Format(time.RFC3339)}, nil
 }
 
+func (s *Service) FindOrCreatePhoneDM(ctx context.Context, actor, phoneE164 string) (Conversation, error) {
+	if phoneE164 == "" {
+		return Conversation{}, errors.New("phone_e164_required")
+	}
+
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return Conversation{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	var conversationID string
+	err = tx.QueryRow(ctx, `
+		SELECT c.id::text
+		FROM conversations c
+		JOIN conversation_members cm ON cm.conversation_id = c.id
+		JOIN conversation_external_members cem ON cem.conversation_id = c.id
+		JOIN external_contacts ec ON ec.id = cem.external_contact_id
+		WHERE c.type = 'PHONE_DM'
+		  AND cm.user_id = $1::uuid
+		  AND ec.phone_e164 = $2
+		LIMIT 1
+	`, actor, phoneE164).Scan(&conversationID)
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return Conversation{}, err
+		}
+
+		var externalID string
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO external_contacts (phone_e164)
+			VALUES ($1)
+			ON CONFLICT (phone_e164) DO UPDATE SET phone_e164 = EXCLUDED.phone_e164
+			RETURNING id::text
+		`, phoneE164).Scan(&externalID); err != nil {
+			return Conversation{}, err
+		}
+
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO conversations (type, transport_policy)
+			VALUES ('PHONE_DM', 'AUTO')
+			RETURNING id::text
+		`).Scan(&conversationID); err != nil {
+			return Conversation{}, err
+		}
+
+		if _, err := tx.Exec(ctx, `INSERT INTO conversation_counters (conversation_id, next_server_order) VALUES ($1::uuid, 1)`, conversationID); err != nil {
+			return Conversation{}, err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO conversation_members (conversation_id, user_id, role) VALUES ($1::uuid, $2::uuid, 'MEMBER')`, conversationID, actor); err != nil {
+			return Conversation{}, err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO conversation_external_members (conversation_id, external_contact_id) VALUES ($1::uuid, $2::uuid)`, conversationID, externalID); err != nil {
+			return Conversation{}, err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return Conversation{}, err
+	}
+	return s.Get(ctx, actor, conversationID)
+}
+
 func (s *Service) List(ctx context.Context, actor string) ([]Conversation, error) {
 	rows, err := s.db.Query(ctx, `
 		SELECT c.id::text, c.type, c.updated_at

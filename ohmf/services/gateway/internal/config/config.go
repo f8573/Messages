@@ -7,32 +7,68 @@ import (
 )
 
 type Config struct {
-	Env             string
-	Addr            string
-	LogLevel        string
-	DBDSN           string
-	RedisAddr       string
-	JWTSecret       string
-	AccessTTL       time.Duration
-	RefreshTTL      time.Duration
-	AutoMigrate     bool
-	MigrationsDir   string
-	AllowedOrigin   string
+	Env                    string
+	Addr                   string
+	LogLevel               string
+	DBDSN                  string
+	RedisAddr              string
+	RedisDB                int
+	JWTSecret              string
+	AccessTTL              time.Duration
+	RefreshTTL             time.Duration
+	AutoMigrate            bool
+	MigrationsDir          string
+	AllowedOrigin          string
+	UseKafkaSend           bool
+	UseCassandraReads      bool
+	EnableWSSend           bool
+	KafkaBrokers           string
+	KafkaIngressTopic      string
+	KafkaPersistedTopic    string
+	KafkaDeliveryTopic     string
+	KafkaSMSDispatchTopic  string
+	KafkaPresenceTopic     string
+	KafkaMicroserviceTopic string
+	KafkaClientID          string
+	AckTimeout             time.Duration
+	CassandraHosts         string
+	CassandraKeyspace      string
+	CassandraUsername      string
+	CassandraPassword      string
+	CassandraConsistency   string
 }
 
 func Load() Config {
 	return Config{
-		Env:           get("APP_ENV", "dev"),
-		Addr:          get("APP_ADDR", ":8080"),
-		LogLevel:      get("APP_LOG_LEVEL", "info"),
-		DBDSN:         get("APP_DB_DSN", "postgres://ohmf:ohmf@localhost:5432/ohmf?sslmode=disable"),
-		RedisAddr:     get("APP_REDIS_ADDR", "localhost:6379"),
-		JWTSecret:     get("APP_JWT_SECRET", "dev-only-change-me"),
-		AccessTTL:     time.Duration(getInt("APP_ACCESS_TTL_MINUTES", 15)) * time.Minute,
-		RefreshTTL:    time.Duration(getInt("APP_REFRESH_TTL_HOURS", 24*30)) * time.Hour,
-		AutoMigrate:   getBool("APP_AUTO_MIGRATE", true),
-		MigrationsDir: get("APP_MIGRATIONS_DIR", "migrations"),
-		AllowedOrigin: get("APP_ALLOWED_ORIGIN", "*"),
+		Env:                    get("APP_ENV", "dev"),
+		Addr:                   get("APP_ADDR", ":8080"),
+		LogLevel:               get("APP_LOG_LEVEL", "info"),
+		DBDSN:                  get("APP_DB_DSN", "postgres://ohmf:ohmf@localhost:5432/ohmf?sslmode=disable"),
+		RedisAddr:              get("APP_REDIS_ADDR", "localhost:6379"),
+		RedisDB:                getInt("APP_REDIS_DB", 0),
+		JWTSecret:              get("APP_JWT_SECRET", "dev-only-change-me"),
+		AccessTTL:              time.Duration(getInt("APP_ACCESS_TTL_MINUTES", 15)) * time.Minute,
+		RefreshTTL:             time.Duration(getInt("APP_REFRESH_TTL_HOURS", 24*30)) * time.Hour,
+		AutoMigrate:            getBool("APP_AUTO_MIGRATE", true),
+		MigrationsDir:          get("APP_MIGRATIONS_DIR", "migrations"),
+		AllowedOrigin:          get("APP_ALLOWED_ORIGIN", "*"),
+		UseKafkaSend:           getBool("APP_USE_KAFKA_SEND", false),
+		UseCassandraReads:      getBool("APP_USE_CASSANDRA_READS", false),
+		EnableWSSend:           getBool("APP_ENABLE_WS_SEND", false),
+		KafkaBrokers:           get("APP_KAFKA_BROKERS", "localhost:9092"),
+		KafkaIngressTopic:      get("APP_KAFKA_INGRESS_TOPIC", "msg.ingress.v1"),
+		KafkaPersistedTopic:    get("APP_KAFKA_PERSISTED_TOPIC", "msg.persisted.v1"),
+		KafkaDeliveryTopic:     get("APP_KAFKA_DELIVERY_TOPIC", "msg.delivery.v1"),
+		KafkaSMSDispatchTopic:  get("APP_KAFKA_SMS_DISPATCH_TOPIC", "msg.sms.dispatch.v1"),
+		KafkaPresenceTopic:     get("APP_KAFKA_PRESENCE_TOPIC", "presence.events.v1"),
+		KafkaMicroserviceTopic: get("APP_KAFKA_MICROSERVICE_TOPIC", "microservice.events.v1"),
+		KafkaClientID:          get("APP_KAFKA_CLIENT_ID", "ohmf-gateway"),
+		AckTimeout:             time.Duration(getInt("APP_ACK_TIMEOUT_MS", 2000)) * time.Millisecond,
+		CassandraHosts:         get("APP_CASSANDRA_HOSTS", "localhost:9042"),
+		CassandraKeyspace:      get("APP_CASSANDRA_KEYSPACE", "ohmf_messages"),
+		CassandraUsername:      get("APP_CASSANDRA_USERNAME", ""),
+		CassandraPassword:      get("APP_CASSANDRA_PASSWORD", ""),
+		CassandraConsistency:   get("APP_CASSANDRA_CONSISTENCY", "quorum"),
 	}
 }
 

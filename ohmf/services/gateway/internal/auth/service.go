@@ -175,6 +175,44 @@ func (s *Service) VerifyPhone(ctx context.Context, req VerifyRequest, ip string)
 		return nil, err
 	}
 
+	// Promote phone-based conversations into first-class user conversations so
+	// newly verified users immediately receive existing messages.
+	if _, err := tx.Exec(ctx, `
+		WITH matched AS (
+			SELECT DISTINCT cem.conversation_id
+			FROM conversation_external_members cem
+			JOIN external_contacts ec ON ec.id = cem.external_contact_id
+			WHERE ec.phone_e164 = $1
+		)
+		INSERT INTO conversation_members (conversation_id, user_id, role)
+		SELECT m.conversation_id, $2::uuid, 'MEMBER'
+		FROM matched m
+		ON CONFLICT (conversation_id, user_id) DO NOTHING
+	`, phoneE164, userID); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `
+		WITH matched AS (
+			SELECT DISTINCT cem.conversation_id
+			FROM conversation_external_members cem
+			JOIN external_contacts ec ON ec.id = cem.external_contact_id
+			WHERE ec.phone_e164 = $1
+		)
+		UPDATE conversations c
+		SET type = 'DM', transport_policy = 'AUTO', updated_at = now()
+		WHERE c.id IN (SELECT conversation_id FROM matched)
+	`, phoneE164); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM conversation_external_members cem
+		USING external_contacts ec
+		WHERE cem.external_contact_id = ec.id
+		  AND ec.phone_e164 = $1
+	`, phoneE164); err != nil {
+		return nil, err
+	}
+
 	var deviceID string
 	err = tx.QueryRow(ctx, `
 		INSERT INTO devices (user_id, platform, device_name, push_token, public_key, last_seen_at)

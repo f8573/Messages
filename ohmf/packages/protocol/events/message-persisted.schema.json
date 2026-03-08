@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ohmf.local/schemas/message-persisted.schema.json",
+  "title": "MessagePersistedEvent",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "message_id",
+    "conversation_id",
+    "sender_user_id",
+    "server_order",
+    "transport",
+    "status",
+    "persisted_at_ms",
+    "delivery_targets"
+  ],
+  "properties": {
+    "event_id": { "type": "string", "minLength": 1 },
+    "message_id": { "type": "string", "minLength": 1 },
+    "conversation_id": { "type": "string", "minLength": 1 },
+    "sender_user_id": { "type": "string", "minLength": 1 },
+    "server_order": { "type": "integer" },
+    "transport": { "type": "string", "enum": ["OHMF", "SMS"] },
+    "status": { "type": "string", "enum": ["SENT", "DELIVERED", "READ", "FAIL_DELIVERY", "FAIL_SEND"] },
+    "persisted_at_ms": { "type": "integer" },
+    "delivery_targets": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "trace_id": { "type": "string" }
+  }
+}

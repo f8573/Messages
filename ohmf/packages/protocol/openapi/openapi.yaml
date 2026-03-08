@@ -85,6 +85,33 @@ components:
         content:
           type: object
           additionalProperties: true
+    SMSDeliveryStatus:
+      type: string
+      enum: [SENT, FAIL_SEND]
+    OHMFDeliveryStatus:
+      type: string
+      enum: [SENT, DELIVERED, READ, FAIL_DELIVERY, FAIL_SEND]
+    SendMessageResponse:
+      type: object
+      required: [message_id, server_order, transport, status, queued]
+      properties:
+        message_id: { type: string }
+        server_order: { type: integer }
+        transport: { type: string, enum: [OHMF] }
+        status: { $ref: '#/components/schemas/OHMFDeliveryStatus' }
+        queued: { type: boolean }
+        ack_timeout_ms: { type: integer, nullable: true }
+    SendPhoneMessageResponse:
+      type: object
+      required: [message_id, conversation_id, server_order, transport, status, queued]
+      properties:
+        message_id: { type: string }
+        conversation_id: { type: string }
+        server_order: { type: integer }
+        transport: { type: string, enum: [SMS] }
+        status: { $ref: '#/components/schemas/SMSDeliveryStatus' }
+        queued: { type: boolean }
+        ack_timeout_ms: { type: integer, nullable: true }
 security:
   - bearerAuth: []
 paths:
@@ -158,6 +185,14 @@ paths:
       responses:
         '201':
           description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SendMessageResponse' }
+        '202':
+          description: Accepted and queued for persistence
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SendMessageResponse' }
   /v1/messages/phone:
     post:
       requestBody:
@@ -168,6 +203,28 @@ paths:
       responses:
         '201':
           description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SendPhoneMessageResponse' }
+        '202':
+          description: Accepted and queued for persistence
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SendPhoneMessageResponse' }
+  /v1/ws:
+    get:
+      summary: WebSocket gateway endpoint
+      description: >
+        Upgrade this request to WebSocket. Authenticate with `access_token` query parameter
+        or `Authorization: Bearer <token>` header during upgrade handshake.
+      parameters:
+        - in: query
+          name: access_token
+          required: false
+          schema: { type: string }
+      responses:
+        '101':
+          description: Switching Protocols
   /v1/conversations/{id}/messages:
     get:
       parameters:

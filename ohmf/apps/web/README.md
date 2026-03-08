@@ -34,7 +34,9 @@ Gateway API should be running at:
   - `GET /v1/conversations`
   - `GET /v1/conversations/{id}/messages`
 - New message and sent indicators:
-  - Optimistic `PENDING -> SENT/FAILED` status on outgoing messages
+  - SMS delivery statuses: `SENT`, `FAIL_SEND`
+  - OHMF delivery statuses: `SENT`, `DELIVERED`, `READ`, `FAIL_DELIVERY`, `FAIL_SEND`
+  - OHMF outgoing messages show an iMessage-style delivery indicator label
 - Start new message to phone number:
   - Creates a local draft thread from phone input
   - First send uses `POST /v1/messages/phone`

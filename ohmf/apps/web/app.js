@@ -2,7 +2,20 @@
 
 const API_BASE_URL = (window.localStorage.getItem("ohmf.apiBaseUrl") || "http://localhost:18080").replace(/\/+$/, "");
 const AUTH_STORAGE_KEY = "ohmf.auth.session.v1";
-const STORE_VERSION = 1;
+const STORE_VERSION = 2;
+const TRANSPORT_SMS = "SMS";
+const TRANSPORT_OHMF = "OHMF";
+const SMS_DELIVERY_STATUSES = Object.freeze({
+  SENT: "SENT",
+  FAIL_SEND: "FAIL_SEND",
+});
+const OHMF_DELIVERY_STATUSES = Object.freeze({
+  SENT: "SENT",
+  DELIVERED: "DELIVERED",
+  READ: "READ",
+  FAIL_DELIVERY: "FAIL_DELIVERY",
+  FAIL_SEND: "FAIL_SEND",
+});
 
 const state = {
   auth: null,
@@ -10,7 +23,12 @@ const state = {
   query: "",
   activeThreadId: null,
   threads: [],
+  typingDraft: "",
 };
+let liveSyncInFlight = false;
+let eventStreamAbort = null;
+let eventStreamReconnectTimer = 0;
+let refreshAuthInFlight = null;
 
 const el = {
   authShell: document.getElementById("auth-shell"),
@@ -18,7 +36,9 @@ const el = {
   authStatus: document.getElementById("auth-status"),
   phoneStartForm: document.getElementById("phone-start-form"),
   phoneVerifyForm: document.getElementById("phone-verify-form"),
+  countryCodeSelect: document.getElementById("country-code-select"),
   phoneInput: document.getElementById("phone-input"),
+  phoneE164Preview: document.getElementById("phone-e164-preview"),
   otpInput: document.getElementById("otp-input"),
   threadList: document.getElementById("thread-list"),
   messageList: document.getElementById("message-list"),
@@ -32,7 +52,11 @@ const el = {
   newChatBtn: document.getElementById("new-chat-btn"),
   logoutBtn: document.getElementById("logout-btn"),
   newChatForm: document.getElementById("new-chat-form"),
+  newCountryCodeSelect: document.getElementById("new-country-code-select"),
   newPhoneInput: document.getElementById("new-phone-input"),
+  nicknameBtn: document.getElementById("nickname-btn"),
+  blockBtn: document.getElementById("block-btn"),
+  closeThreadBtn: document.getElementById("close-thread-btn"),
 };
 
 function nowISO() {
@@ -41,9 +65,7 @@ function nowISO() {
 
 function formatShortTime(value) {
   const d = new Date(value);
-  if (Number.isNaN(d.getTime())) {
-    return "";
-  }
+  if (Number.isNaN(d.getTime())) return "";
   return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 }
 
@@ -54,17 +76,28 @@ function sanitizeText(value, limit = 1000) {
     .slice(0, limit);
 }
 
-function normalizePhone(value) {
-  const compact = String(value || "").replace(/[^\d+]/g, "");
-  if (!/^\+\d{8,15}$/.test(compact)) {
-    return "";
-  }
-  return compact;
+function onlyDigits(value, limit = 32) {
+  return String(value || "").replace(/\D/g, "").slice(0, limit);
+}
+
+function formatPhoneLocal(value) {
+  const digits = onlyDigits(value, 10);
+  if (digits.length <= 3) return digits ? `(${digits}` : "";
+  if (digits.length <= 6) return `(${digits.slice(0, 3)})-${digits.slice(3)}`;
+  return `(${digits.slice(0, 3)})-${digits.slice(3, 6)}-${digits.slice(6)}`;
+}
+
+function toE164(countryCode, localValue) {
+  const prefix = String(countryCode || "").trim();
+  const digits = onlyDigits(localValue, 15);
+  if (!/^\+\d{1,4}$/.test(prefix)) return "";
+  const raw = `${prefix}${digits}`;
+  if (!/^\+\d{8,15}$/.test(raw)) return "";
+  return raw;
 }
 
 function makeIdempotencyKey(prefix = "msg") {
-  const rand = Math.random().toString(36).slice(2, 10);
-  return `${prefix}-${Date.now()}-${rand}`;
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function initials(name) {
@@ -91,9 +124,7 @@ function authStoreLoad() {
   if (!raw) return null;
   try {
     const parsed = JSON.parse(raw);
-    if (!parsed || !parsed.accessToken || !parsed.refreshToken || !parsed.userId) {
-      return null;
-    }
+    if (!parsed || !parsed.accessToken || !parsed.refreshToken || !parsed.userId) return null;
     return parsed;
   } catch {
     return null;
@@ -106,22 +137,14 @@ function conversationStoreKey() {
 
 function saveConversationStore() {
   if (!state.auth?.userId) return;
-  const data = {
-    version: STORE_VERSION,
-    savedAt: nowISO(),
-    threads: state.threads.map((thread) => ({
-      id: thread.id,
-      kind: thread.kind,
-      title: thread.title,
-      subtitle: thread.subtitle,
-      updatedAt: thread.updatedAt,
-      externalPhones: thread.externalPhones || [],
-      participants: thread.participants || [],
-      messages: thread.messages || [],
-      loadedMessages: Boolean(thread.loadedMessages),
-    })),
-  };
-  window.localStorage.setItem(conversationStoreKey(), JSON.stringify(data));
+  window.localStorage.setItem(
+    conversationStoreKey(),
+    JSON.stringify({
+      version: STORE_VERSION,
+      savedAt: nowISO(),
+      threads: state.threads,
+    })
+  );
 }
 
 function loadConversationStore() {
@@ -135,10 +158,22 @@ function loadConversationStore() {
       kind: sanitizeText(thread.kind, 24) || "dm",
       title: sanitizeText(thread.title, 80) || "Conversation",
       subtitle: sanitizeText(thread.subtitle, 120),
+      nickname: sanitizeText(thread.nickname, 80),
       updatedAt: thread.updatedAt || nowISO(),
+      blocked: Boolean(thread.blocked),
+      closed: Boolean(thread.closed),
       externalPhones: Array.isArray(thread.externalPhones) ? thread.externalPhones.map((p) => sanitizeText(p, 32)) : [],
       participants: Array.isArray(thread.participants) ? thread.participants.map((p) => sanitizeText(p, 80)) : [],
-      messages: Array.isArray(thread.messages) ? thread.messages : [],
+      messages: Array.isArray(thread.messages)
+        ? thread.messages.map((message) => {
+            const transport = normalizeTransport(message.transport);
+            return {
+              ...message,
+              transport,
+              status: normalizeDeliveryStatus(transport, message.status),
+            };
+          })
+        : [],
       loadedMessages: Boolean(thread.loadedMessages),
     }));
   } catch {
@@ -152,19 +187,15 @@ function setAuthStatus(message, isError = false) {
 }
 
 async function apiRequest(path, options = {}, allowRetry = true) {
-  const url = `${API_BASE_URL}${path}`;
   const headers = new Headers(options.headers || {});
   headers.set("Content-Type", "application/json");
-  if (state.auth?.accessToken) {
-    headers.set("Authorization", `Bearer ${state.auth.accessToken}`);
-  }
-  const response = await fetch(url, { ...options, headers, credentials: "omit" });
+  if (state.auth?.accessToken) headers.set("Authorization", `Bearer ${state.auth.accessToken}`);
+
+  const response = await fetch(`${API_BASE_URL}${path}`, { ...options, headers, credentials: "omit" });
 
   if (response.status === 401 && allowRetry && state.auth?.refreshToken) {
     const refreshed = await refreshAuthTokens();
-    if (refreshed) {
-      return apiRequest(path, options, false);
-    }
+    if (refreshed) return apiRequest(path, options, false);
   }
 
   const text = await response.text();
@@ -177,11 +208,9 @@ async function apiRequest(path, options = {}, allowRetry = true) {
     }
   }
   if (!response.ok) {
-    const code = payload?.code || `http_${response.status}`;
-    const message = payload?.message || "Request failed";
-    const error = new Error(message);
-    error.code = code;
+    const error = new Error(payload?.message || "Request failed");
     error.status = response.status;
+    error.code = payload?.code || `http_${response.status}`;
     throw error;
   }
   return payload;
@@ -189,44 +218,50 @@ async function apiRequest(path, options = {}, allowRetry = true) {
 
 async function refreshAuthTokens() {
   if (!state.auth?.refreshToken) return false;
-  try {
-    const payload = await fetch(`${API_BASE_URL}/v1/auth/refresh`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ refresh_token: state.auth.refreshToken }),
-      credentials: "omit",
-    });
-    if (!payload.ok) return false;
-    const json = await payload.json();
-    const tokens = json?.tokens;
-    if (!tokens?.access_token || !tokens?.refresh_token) return false;
-    authStoreSet({
-      ...state.auth,
-      accessToken: tokens.access_token,
-      refreshToken: tokens.refresh_token,
-    });
-    return true;
-  } catch {
-    return false;
-  }
+  if (refreshAuthInFlight) return refreshAuthInFlight;
+
+  const sessionAtStart = state.auth;
+  refreshAuthInFlight = (async () => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/v1/auth/refresh`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refresh_token: sessionAtStart.refreshToken }),
+        credentials: "omit",
+      });
+      if (!response.ok) return false;
+      const json = await response.json();
+      const tokens = json?.tokens;
+      if (!tokens?.access_token || !tokens?.refresh_token) return false;
+      if (!state.auth || state.auth.userId !== sessionAtStart.userId) return false;
+      authStoreSet({
+        ...state.auth,
+        accessToken: tokens.access_token,
+        refreshToken: tokens.refresh_token,
+      });
+      return true;
+    } catch {
+      return false;
+    } finally {
+      refreshAuthInFlight = null;
+    }
+  })();
+
+  return refreshAuthInFlight;
 }
 
 function pickTitle(conversation) {
-  if (conversation.externalPhones?.length) {
-    return conversation.externalPhones[0];
-  }
+  if (conversation.nickname) return conversation.nickname;
+  if (conversation.externalPhones?.length) return conversation.externalPhones[0];
   const others = (conversation.participants || []).filter((id) => id !== state.auth?.userId);
-  if (others.length) {
-    return `User ${others[0].slice(0, 8)}`;
-  }
-  return `Conversation ${conversation.id.slice(0, 8)}`;
+  return others.length ? `User ${others[0].slice(0, 8)}` : `Conversation ${conversation.id.slice(0, 8)}`;
 }
 
 function pickSubtitle(conversation) {
-  if (conversation.kind === "phone") return "SMS thread";
+  if (conversation.blocked) return "Blocked";
+  if (conversation.kind === "phone") return "Phone conversation (OTT preferred)";
   const others = (conversation.participants || []).filter((id) => id !== state.auth?.userId).length;
-  if (others <= 0) return "Only you";
-  return `${others} participant${others > 1 ? "s" : ""}`;
+  return others <= 0 ? "Only you" : `${others} participant${others > 1 ? "s" : ""}`;
 }
 
 function mapConversation(item) {
@@ -236,7 +271,10 @@ function mapConversation(item) {
     kind,
     title: "",
     subtitle: "",
+    nickname: "",
     updatedAt: item.updated_at || nowISO(),
+    blocked: false,
+    closed: false,
     participants: Array.isArray(item.participants) ? item.participants.map((v) => sanitizeText(v, 80)) : [],
     externalPhones: Array.isArray(item.external_phones) ? item.external_phones.map((v) => sanitizeText(v, 32)) : [],
     messages: [],
@@ -248,16 +286,67 @@ function mapConversation(item) {
 }
 
 function mapMessage(item) {
-  const text = sanitizeText(item?.content?.text || JSON.stringify(item?.content || {}), 1000);
-  const outgoing = item.sender_user_id === state.auth?.userId;
+  const transport = normalizeTransport(item.transport);
+  const status = normalizeDeliveryStatus(
+    transport,
+    item.status || (item.sender_user_id === state.auth?.userId ? OHMF_DELIVERY_STATUSES.SENT : "")
+  );
   return {
-    id: sanitizeText(item.message_id, 80),
-    direction: outgoing ? "out" : "in",
-    text,
+    id: sanitizeText(item?.message_id, 80),
+    direction: item.sender_user_id === state.auth?.userId ? "out" : "in",
+    text: sanitizeText(item?.content?.text || JSON.stringify(item?.content || {}), 1000),
     createdAt: item.created_at || nowISO(),
     serverOrder: Number(item.server_order || 0),
-    status: outgoing ? "SENT" : "",
+    status,
+    transport,
+    reactions: {},
+    editedAt: "",
+    deleted: false,
   };
+}
+
+function normalizeTransport(value) {
+  return sanitizeText(value, 24) === TRANSPORT_SMS ? TRANSPORT_SMS : TRANSPORT_OHMF;
+}
+
+function legacyStatusToCurrent(value, transport) {
+  const status = sanitizeText(value, 40).toUpperCase();
+  if (!status) return "";
+  if (status === "FAILED") return "FAIL_SEND";
+  if (status === "PENDING") return "SENT";
+  if (status.startsWith("SENT (SMS")) return "SENT";
+  if (status === "SENT (SMS FALLBACK)") return "SENT";
+  if (transport === TRANSPORT_SMS && status === "DELIVERED") return "SENT";
+  if (transport === TRANSPORT_SMS && status === "READ") return "SENT";
+  return status;
+}
+
+function normalizeDeliveryStatus(transport, status) {
+  const resolvedTransport = normalizeTransport(transport);
+  const normalized = legacyStatusToCurrent(status, resolvedTransport);
+  if (!normalized) return "";
+  const allowed = resolvedTransport === TRANSPORT_SMS ? SMS_DELIVERY_STATUSES : OHMF_DELIVERY_STATUSES;
+  return Object.values(allowed).includes(normalized) ? normalized : resolvedTransport === TRANSPORT_SMS ? SMS_DELIVERY_STATUSES.SENT : OHMF_DELIVERY_STATUSES.SENT;
+}
+
+function deliveryIndicatorLabel(message) {
+  if (normalizeTransport(message.transport) !== TRANSPORT_OHMF || message.direction !== "out") return "";
+  const status = normalizeDeliveryStatus(message.transport, message.status);
+  const statusStamp = message.statusUpdatedAt ? formatShortTime(message.statusUpdatedAt) : "";
+  switch (status) {
+    case OHMF_DELIVERY_STATUSES.SENT:
+      return "Sent";
+    case OHMF_DELIVERY_STATUSES.DELIVERED:
+      return statusStamp ? `Delivered ${statusStamp}` : "Delivered";
+    case OHMF_DELIVERY_STATUSES.READ:
+      return statusStamp ? `Read ${statusStamp}` : "Read";
+    case OHMF_DELIVERY_STATUSES.FAIL_DELIVERY:
+      return "Failed delivery";
+    case OHMF_DELIVERY_STATUSES.FAIL_SEND:
+      return "Failed to send";
+    default:
+      return "";
+  }
 }
 
 function threadSort(a, b) {
@@ -274,9 +363,10 @@ function getActiveThread() {
 
 function visibleThreads() {
   const q = sanitizeText(state.query, 120).toLowerCase();
-  if (!q) return [...state.threads].sort(threadSort);
-  return state.threads
+  return [...state.threads]
+    .filter((thread) => !thread.closed)
     .filter((thread) => {
+      if (!q) return true;
       const combined = `${thread.title} ${thread.subtitle} ${(thread.messages || []).map((m) => m.text).join(" ")}`.toLowerCase();
       return combined.includes(q);
     })
@@ -284,12 +374,11 @@ function visibleThreads() {
 }
 
 function upsertThread(thread) {
+  thread.title = pickTitle(thread);
+  thread.subtitle = pickSubtitle(thread);
   const idx = state.threads.findIndex((item) => item.id === thread.id);
-  if (idx === -1) {
-    state.threads.push(thread);
-  } else {
-    state.threads[idx] = { ...state.threads[idx], ...thread };
-  }
+  if (idx === -1) state.threads.push(thread);
+  else state.threads[idx] = { ...state.threads[idx], ...thread };
   state.threads.sort(threadSort);
 }
 
@@ -300,18 +389,12 @@ async function loadConversationsFromApi() {
     const mapped = mapConversation(item);
     const existing = getThreadById(mapped.id);
     if (existing) {
-      upsertThread({
-        ...mapped,
-        messages: existing.messages,
-        loadedMessages: existing.loadedMessages,
-      });
+      upsertThread({ ...mapped, messages: existing.messages, loadedMessages: existing.loadedMessages, nickname: existing.nickname, blocked: existing.blocked, closed: existing.closed });
     } else {
       upsertThread(mapped);
     }
   }
-  if (!state.activeThreadId && state.threads.length > 0) {
-    state.activeThreadId = state.threads[0].id;
-  }
+  if (!state.activeThreadId && visibleThreads().length > 0) state.activeThreadId = visibleThreads()[0].id;
   saveConversationStore();
 }
 
@@ -321,28 +404,150 @@ async function loadMessagesForThread(threadId) {
   const payload = await apiRequest(`/v1/conversations/${encodeURIComponent(threadId)}/messages`, { method: "GET" });
   const items = Array.isArray(payload?.items) ? payload.items : [];
   const messages = items.map(mapMessage);
-  upsertThread({
-    ...thread,
-    messages,
-    loadedMessages: true,
-    updatedAt: messages.length ? messages[messages.length - 1].createdAt : thread.updatedAt,
-  });
+  upsertThread({ ...thread, messages, loadedMessages: true, updatedAt: messages.length ? messages[messages.length - 1].createdAt : thread.updatedAt });
+  const refreshedThread = getThreadById(threadId) || thread;
+  await markConversationRead(refreshedThread);
   saveConversationStore();
+}
+
+async function refreshLiveState() {
+  if (!state.auth || liveSyncInFlight) return;
+  liveSyncInFlight = true;
+  try {
+    await loadConversationsFromApi();
+    const active = getActiveThread();
+    if (active && active.kind !== "draft_phone") {
+      await loadMessagesForThread(active.id);
+    }
+    renderAll();
+  } catch (error) {
+    console.error(error);
+  } finally {
+    liveSyncInFlight = false;
+  }
+}
+
+function stopEventStream() {
+  if (eventStreamReconnectTimer) {
+    window.clearTimeout(eventStreamReconnectTimer);
+    eventStreamReconnectTimer = 0;
+  }
+  if (eventStreamAbort) {
+    eventStreamAbort.abort();
+    eventStreamAbort = null;
+  }
+}
+
+function scheduleEventStreamReconnect(delayMs = 1500) {
+  if (!state.auth || eventStreamReconnectTimer) return;
+  eventStreamReconnectTimer = window.setTimeout(() => {
+    eventStreamReconnectTimer = 0;
+    void startEventStream();
+  }, delayMs);
+}
+
+function handleSSEEvent(name, rawData) {
+  if (name === "sync_required") {
+    void refreshLiveState();
+  }
+}
+
+async function startEventStream() {
+  if (!state.auth || eventStreamAbort) return;
+  const controller = new AbortController();
+  eventStreamAbort = controller;
+  try {
+    const response = await fetch(`${API_BASE_URL}/v1/events/stream`, {
+      method: "GET",
+      headers: {
+        Accept: "text/event-stream",
+        Authorization: `Bearer ${state.auth.accessToken}`,
+      },
+      signal: controller.signal,
+      credentials: "omit",
+      cache: "no-store",
+    });
+    if (response.status === 401 && state.auth?.refreshToken) {
+      const refreshed = await refreshAuthTokens();
+      if (refreshed) {
+        eventStreamAbort = null;
+        scheduleEventStreamReconnect(200);
+        return;
+      }
+    }
+    if (!response.ok || !response.body) {
+      throw new Error(`stream_http_${response.status}`);
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let eventName = "";
+    let dataLines = [];
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        if (!line) {
+          const payload = dataLines.join("\n");
+          handleSSEEvent(eventName || "message", payload);
+          eventName = "";
+          dataLines = [];
+          continue;
+        }
+        if (line.startsWith(":")) continue;
+        if (line.startsWith("event:")) {
+          eventName = line.slice(6).trim();
+          continue;
+        }
+        if (line.startsWith("data:")) {
+          dataLines.push(line.slice(5).trim());
+        }
+      }
+    }
+    if (!controller.signal.aborted) {
+      scheduleEventStreamReconnect();
+    }
+  } catch (error) {
+    if (!controller.signal.aborted) {
+      console.error(error);
+      scheduleEventStreamReconnect();
+    }
+  } finally {
+    if (eventStreamAbort === controller) {
+      eventStreamAbort = null;
+    }
+  }
 }
 
 async function ensureMessagesLoaded(threadId) {
   const thread = getThreadById(threadId);
-  if (!thread) return;
-  if (thread.kind === "draft_phone") return;
-  if (thread.loadedMessages) return;
+  if (!thread || thread.kind === "draft_phone" || thread.loadedMessages) return;
   await loadMessagesForThread(threadId);
+}
+
+async function markConversationRead(thread) {
+  const lastIncoming = [...(thread.messages || [])].reverse().find((msg) => msg.direction === "in" && msg.serverOrder > 0);
+  if (!lastIncoming) return;
+  try {
+    await apiRequest(`/v1/conversations/${encodeURIComponent(thread.id)}/read`, {
+      method: "POST",
+      body: JSON.stringify({ through_server_order: lastIncoming.serverOrder }),
+    });
+  } catch {
+    // Best effort.
+  }
 }
 
 function buildThreadItem(thread) {
   const button = document.createElement("button");
   button.type = "button";
   button.className = `thread-item${thread.id === state.activeThreadId ? " active" : ""}`;
-  button.dataset.threadId = thread.id;
 
   const avatar = document.createElement("div");
   avatar.className = "avatar";
@@ -351,20 +556,22 @@ function buildThreadItem(thread) {
   const body = document.createElement("div");
   const meta = document.createElement("div");
   meta.className = "thread-meta";
+
   const name = document.createElement("p");
   name.className = "thread-name";
   name.textContent = thread.title;
+
   const time = document.createElement("p");
   time.className = "thread-time";
   time.textContent = formatShortTime(thread.updatedAt);
-  meta.append(name, time);
 
   const preview = document.createElement("p");
   preview.className = "thread-preview";
   const last = thread.messages?.[thread.messages.length - 1];
-  preview.textContent = last ? last.text : "No messages yet";
-  body.append(meta, preview);
+  preview.textContent = last ? (last.deleted ? "Message deleted" : last.text) : "No messages yet";
 
+  meta.append(name, time);
+  body.append(meta, preview);
   button.append(avatar, body);
   button.addEventListener("click", async () => {
     state.activeThreadId = thread.id;
@@ -382,16 +589,66 @@ function buildThreadItem(thread) {
 
 function renderThreadList() {
   el.threadList.replaceChildren();
-  const threads = visibleThreads();
-  for (const thread of threads) {
+  for (const thread of visibleThreads()) {
     const li = document.createElement("li");
     li.appendChild(buildThreadItem(thread));
     el.threadList.appendChild(li);
   }
 }
 
+function isNonSMSMessage(message) {
+  return normalizeTransport(message.transport) !== TRANSPORT_SMS;
+}
+
+function addReaction(threadId, messageId) {
+  const emoji = sanitizeText(window.prompt("Reaction emoji", "👍"), 4);
+  if (!emoji) return;
+  const thread = getThreadById(threadId);
+  if (!thread) return;
+  const nextMessages = (thread.messages || []).map((msg) => {
+    if (msg.id !== messageId) return msg;
+    const reactions = { ...(msg.reactions || {}) };
+    reactions[emoji] = Number(reactions[emoji] || 0) + 1;
+    return { ...msg, reactions };
+  });
+  upsertThread({ ...thread, messages: nextMessages });
+  saveConversationStore();
+  renderAll();
+}
+
+function editMessage(threadId, messageId) {
+  const thread = getThreadById(threadId);
+  const msg = thread?.messages?.find((m) => m.id === messageId);
+  if (!thread || !msg || msg.deleted) return;
+  const nextText = sanitizeText(window.prompt("Edit message", msg.text), 1000);
+  if (!nextText) return;
+  const nextMessages = thread.messages.map((m) => (m.id === messageId ? { ...m, text: nextText, editedAt: nowISO() } : m));
+  upsertThread({ ...thread, messages: nextMessages, updatedAt: nowISO() });
+  saveConversationStore();
+  renderAll();
+}
+
+function deleteMessage(threadId, messageId) {
+  const thread = getThreadById(threadId);
+  if (!thread) return;
+  const nextMessages = thread.messages.map((m) => (m.id === messageId ? { ...m, deleted: true, text: "Message deleted", editedAt: nowISO() } : m));
+  upsertThread({ ...thread, messages: nextMessages, updatedAt: nowISO() });
+  saveConversationStore();
+  renderAll();
+}
+
+function scrollMessageListToBottom() {
+  el.messageList.scrollTop = el.messageList.scrollHeight;
+}
+
 function renderMessages() {
   const thread = getActiveThread();
+  const blocked = Boolean(thread?.blocked);
+  el.nicknameBtn.disabled = !thread;
+  el.blockBtn.disabled = !thread;
+  el.closeThreadBtn.disabled = !thread;
+  el.blockBtn.textContent = blocked ? "Unblock" : "Block";
+
   if (!thread) {
     el.title.textContent = "Select a conversation";
     el.subtitle.textContent = "No active thread";
@@ -399,9 +656,11 @@ function renderMessages() {
     el.messageList.replaceChildren(el.emptyState);
     return;
   }
+
   el.title.textContent = thread.title;
   el.subtitle.textContent = thread.subtitle;
-  el.composerInput.disabled = false;
+  el.composerInput.disabled = blocked;
+  el.composerInput.placeholder = blocked ? "Unblock this user to send messages" : "Message";
   el.messageList.replaceChildren();
 
   for (const message of thread.messages || []) {
@@ -410,22 +669,85 @@ function renderMessages() {
 
     const bubble = document.createElement("article");
     bubble.className = `bubble ${message.direction}`;
-    bubble.textContent = message.text;
+    bubble.textContent = message.deleted ? "Message deleted" : message.text;
 
     const meta = document.createElement("p");
     meta.className = `bubble-meta ${message.direction}`;
     const stamp = formatShortTime(message.createdAt);
+    const edited = message.editedAt ? "edited" : "";
+    const leftMeta = document.createElement("span");
+    leftMeta.textContent = stamp;
+    meta.appendChild(leftMeta);
+
     if (message.direction === "out") {
-      meta.textContent = `${stamp} ${message.status || ""}`.trim();
-    } else {
-      meta.textContent = stamp;
+      const normalizedStatus = normalizeDeliveryStatus(message.transport, message.status);
+      if (normalizedStatus) {
+        const statusNode = document.createElement("span");
+        statusNode.className = `delivery-status status-${normalizedStatus.toLowerCase().replace(/_/g, "-")}`;
+        const ohmfLabel = deliveryIndicatorLabel(message);
+        statusNode.textContent = ohmfLabel || normalizedStatus;
+        meta.appendChild(statusNode);
+      }
+    }
+
+    if (edited) {
+      const editedNode = document.createElement("span");
+      editedNode.textContent = edited;
+      meta.appendChild(editedNode);
     }
 
     wrap.append(bubble, meta);
+
+    const nonSMS = isNonSMSMessage(message);
+    if (nonSMS) {
+      const reactionKeys = Object.keys(message.reactions || {});
+      if (reactionKeys.length) {
+        const reactionMeta = document.createElement("p");
+        reactionMeta.className = `bubble-meta ${message.direction}`;
+        reactionMeta.textContent = reactionKeys.map((k) => `${k} ${message.reactions[k]}`).join("  ");
+        wrap.appendChild(reactionMeta);
+      }
+
+      const actions = document.createElement("div");
+      actions.className = "bubble-actions";
+
+      const reactBtn = document.createElement("button");
+      reactBtn.type = "button";
+      reactBtn.textContent = "React";
+      reactBtn.addEventListener("click", () => addReaction(thread.id, message.id));
+      actions.appendChild(reactBtn);
+
+      if (message.direction === "out" && !message.deleted) {
+        const editBtn = document.createElement("button");
+        editBtn.type = "button";
+        editBtn.textContent = "Edit";
+        editBtn.addEventListener("click", () => editMessage(thread.id, message.id));
+        actions.appendChild(editBtn);
+
+        const deleteBtn = document.createElement("button");
+        deleteBtn.type = "button";
+        deleteBtn.textContent = "Delete";
+        deleteBtn.addEventListener("click", () => deleteMessage(thread.id, message.id));
+        actions.appendChild(deleteBtn);
+      }
+
+      wrap.appendChild(actions);
+    }
+
     el.messageList.appendChild(wrap);
   }
 
-  el.messageList.scrollTop = el.messageList.scrollHeight;
+  if (state.typingDraft && !thread.blocked) {
+    const typingWrap = document.createElement("div");
+    typingWrap.className = "bubble-wrap out";
+    const typingBubble = document.createElement("article");
+    typingBubble.className = "bubble out typing";
+    typingBubble.textContent = "Typing...";
+    typingWrap.appendChild(typingBubble);
+    el.messageList.appendChild(typingWrap);
+  }
+
+  requestAnimationFrame(scrollMessageListToBottom);
 }
 
 function renderAll() {
@@ -434,9 +756,7 @@ function renderAll() {
 }
 
 function openMobileThread() {
-  if (window.matchMedia("(max-width: 880px)").matches) {
-    el.appShell.classList.add("mobile-chat-open");
-  }
+  if (window.matchMedia("(max-width: 880px)").matches) el.appShell.classList.add("mobile-chat-open");
 }
 
 function closeMobileThread() {
@@ -453,23 +773,25 @@ function showAuthShell() {
   el.authShell.classList.remove("hidden");
 }
 
-function pushPendingMessage(threadId, text) {
+function pushPendingMessage(threadId, text, transport = TRANSPORT_OHMF) {
   const thread = getThreadById(threadId);
   if (!thread) return null;
+  const normalizedTransport = normalizeTransport(transport);
+  const status = normalizedTransport === TRANSPORT_SMS ? SMS_DELIVERY_STATUSES.SENT : OHMF_DELIVERY_STATUSES.SENT;
   const pending = {
     id: `tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     direction: "out",
     text,
     createdAt: nowISO(),
-    status: "PENDING",
+    status,
+    statusUpdatedAt: nowISO(),
+    transport: normalizedTransport,
     serverOrder: 0,
+    reactions: {},
+    editedAt: "",
+    deleted: false,
   };
-  const nextMessages = [...(thread.messages || []), pending];
-  upsertThread({
-    ...thread,
-    messages: nextMessages,
-    updatedAt: pending.createdAt,
-  });
+  upsertThread({ ...thread, messages: [...(thread.messages || []), pending], updatedAt: pending.createdAt });
   saveConversationStore();
   return pending.id;
 }
@@ -477,38 +799,118 @@ function pushPendingMessage(threadId, text) {
 function patchMessage(threadId, messageId, patch) {
   const thread = getThreadById(threadId);
   if (!thread) return;
-  const nextMessages = (thread.messages || []).map((message) => (message.id === messageId ? { ...message, ...patch } : message));
-  upsertThread({
-    ...thread,
-    messages: nextMessages,
-    updatedAt: patch.createdAt || thread.updatedAt,
+  const nextMessages = (thread.messages || []).map((message) => {
+    if (message.id !== messageId) return message;
+    const merged = { ...message, ...patch };
+    const transport = normalizeTransport(merged.transport);
+    return {
+      ...merged,
+      transport,
+      status: normalizeDeliveryStatus(transport, merged.status),
+      statusUpdatedAt: patch.status ? (patch.statusUpdatedAt || nowISO()) : merged.statusUpdatedAt,
+    };
   });
+  upsertThread({ ...thread, messages: nextMessages, updatedAt: patch.createdAt || thread.updatedAt });
   saveConversationStore();
 }
 
+async function createOrGetPhoneConversation(phone) {
+  const payload = await apiRequest("/v1/conversations/phone", {
+    method: "POST",
+    body: JSON.stringify({ phone_e164: phone }),
+  });
+  const mapped = mapConversation(payload);
+  const existing = state.threads.find((t) => t.id === mapped.id);
+  if (existing) {
+    upsertThread({ ...existing, ...mapped });
+  } else {
+    upsertThread(mapped);
+  }
+  return mapped.id;
+}
+
+function moveDraftToConversation(draftId, conversationId, phone) {
+  const draft = getThreadById(draftId);
+  const existing = getThreadById(conversationId);
+  const carried = draft?.messages || [];
+  const merged = [...(existing?.messages || []), ...carried];
+  state.threads = state.threads.filter((t) => t.id !== draftId);
+  upsertThread({
+    ...(existing || {}),
+    id: conversationId,
+    kind: "phone",
+    title: existing?.title || phone,
+    subtitle: existing?.subtitle || "Phone conversation (OTT preferred)",
+    externalPhones: [phone],
+    participants: existing?.participants || [state.auth.userId],
+    messages: merged,
+    loadedMessages: Boolean(existing?.loadedMessages),
+    updatedAt: nowISO(),
+  });
+  state.activeThreadId = conversationId;
+}
+
+async function sendOTT(conversationId, text) {
+  return apiRequest("/v1/messages", {
+    method: "POST",
+    body: JSON.stringify({
+      conversation_id: conversationId,
+      idempotency_key: makeIdempotencyKey("conv"),
+      content_type: "text",
+      content: { text },
+    }),
+  });
+}
+
+async function sendSMS(phone, text) {
+  return apiRequest("/v1/messages/phone", {
+    method: "POST",
+    body: JSON.stringify({
+      phone_e164: phone,
+      idempotency_key: makeIdempotencyKey("phone"),
+      content_type: "text",
+      content: { text },
+    }),
+  });
+}
+
 async function sendInConversation(thread, text) {
-  const pendingId = pushPendingMessage(thread.id, text);
+  const pendingId = pushPendingMessage(thread.id, text, TRANSPORT_OHMF);
   renderAll();
   try {
-    const payload = await apiRequest("/v1/messages", {
-      method: "POST",
-      body: JSON.stringify({
-        conversation_id: thread.id,
-        idempotency_key: makeIdempotencyKey("conv"),
-        content_type: "text",
-        content: { text },
-      }),
-    });
+    const payload = await sendOTT(thread.id, text);
+    const finalMessageId = sanitizeText(payload.message_id, 80) || pendingId;
     patchMessage(thread.id, pendingId, {
-      id: sanitizeText(payload.message_id, 80) || pendingId,
+      id: finalMessageId,
       serverOrder: Number(payload.server_order || 0),
-      status: "SENT",
+      status: OHMF_DELIVERY_STATUSES.SENT,
+      transport: TRANSPORT_OHMF,
       createdAt: nowISO(),
+      statusUpdatedAt: nowISO(),
     });
     await ensureMessagesLoaded(thread.id);
-  } catch (error) {
-    patchMessage(thread.id, pendingId, { status: "FAILED" });
-    throw error;
+  } catch (err) {
+    const phone = thread.externalPhones?.[0];
+    if (thread.kind !== "phone" || !phone) {
+      patchMessage(thread.id, pendingId, { status: OHMF_DELIVERY_STATUSES.FAIL_SEND });
+      throw err;
+    }
+
+    try {
+      const smsPayload = await sendSMS(phone, text);
+      patchMessage(thread.id, pendingId, {
+        id: sanitizeText(smsPayload.message_id, 80) || pendingId,
+        serverOrder: Number(smsPayload.server_order || 0),
+        status: SMS_DELIVERY_STATUSES.SENT,
+        transport: TRANSPORT_SMS,
+        createdAt: nowISO(),
+        statusUpdatedAt: nowISO(),
+      });
+      await ensureMessagesLoaded(thread.id);
+    } catch (smsErr) {
+      patchMessage(thread.id, pendingId, { status: SMS_DELIVERY_STATUSES.FAIL_SEND, transport: TRANSPORT_SMS });
+      throw smsErr;
+    }
   }
 }
 
@@ -522,7 +924,10 @@ function ensureDraftPhoneThread(phone) {
     id: `draft:${phone}`,
     kind: "draft_phone",
     title: phone,
-    subtitle: "New SMS conversation",
+    subtitle: "New phone conversation",
+    nickname: "",
+    blocked: false,
+    closed: false,
     updatedAt: nowISO(),
     participants: [state.auth?.userId || ""],
     externalPhones: [phone],
@@ -537,64 +942,72 @@ function ensureDraftPhoneThread(phone) {
 
 async function sendInDraftPhoneConversation(thread, text) {
   const phone = thread.externalPhones?.[0] || "";
-  const pendingId = pushPendingMessage(thread.id, text);
+  const pendingId = pushPendingMessage(thread.id, text, TRANSPORT_OHMF);
   renderAll();
   try {
-    const payload = await apiRequest("/v1/messages/phone", {
-      method: "POST",
-      body: JSON.stringify({
-        phone_e164: phone,
-        idempotency_key: makeIdempotencyKey("phone"),
-        content_type: "text",
-        content: { text },
-      }),
+    const conversationId = await createOrGetPhoneConversation(phone);
+    moveDraftToConversation(thread.id, conversationId, phone);
+    const payload = await sendOTT(conversationId, text);
+    const finalMessageId = sanitizeText(payload.message_id, 80) || pendingId;
+    patchMessage(conversationId, pendingId, {
+      id: finalMessageId,
+      serverOrder: Number(payload.server_order || 0),
+      status: OHMF_DELIVERY_STATUSES.SENT,
+      transport: TRANSPORT_OHMF,
+      createdAt: nowISO(),
+      statusUpdatedAt: nowISO(),
     });
-    const conversationId = sanitizeText(payload.conversation_id, 80);
-    if (!conversationId) throw new Error("missing_conversation_id");
-    const oldDraftId = thread.id;
-    state.threads = state.threads.filter((item) => item.id !== oldDraftId);
-    state.activeThreadId = conversationId;
-    upsertThread({
-      id: conversationId,
-      kind: "phone",
-      title: phone,
-      subtitle: "SMS thread",
-      updatedAt: nowISO(),
-      participants: [state.auth.userId],
-      externalPhones: [phone],
-      messages: [],
-      loadedMessages: false,
-    });
-    saveConversationStore();
     await ensureMessagesLoaded(conversationId);
-  } catch (error) {
-    patchMessage(thread.id, pendingId, { status: "FAILED" });
-    throw error;
+  } catch {
+    try {
+      const smsPayload = await sendSMS(phone, text);
+      const conversationId = sanitizeText(smsPayload.conversation_id, 80);
+      if (conversationId) moveDraftToConversation(thread.id, conversationId, phone);
+      const targetThreadId = conversationId || thread.id;
+      patchMessage(targetThreadId, pendingId, {
+        id: sanitizeText(smsPayload.message_id, 80) || pendingId,
+        serverOrder: Number(smsPayload.server_order || 0),
+        status: SMS_DELIVERY_STATUSES.SENT,
+        transport: TRANSPORT_SMS,
+        createdAt: nowISO(),
+        statusUpdatedAt: nowISO(),
+      });
+      if (conversationId) await ensureMessagesLoaded(conversationId);
+    } catch (error) {
+      patchMessage(thread.id, pendingId, { status: SMS_DELIVERY_STATUSES.FAIL_SEND, transport: TRANSPORT_SMS });
+      throw error;
+    }
   }
 }
 
 async function handleComposerSend(text) {
   const thread = getActiveThread();
-  if (!thread) return;
-  if (thread.kind === "draft_phone") {
-    await sendInDraftPhoneConversation(thread, text);
-  } else {
-    await sendInConversation(thread, text);
-  }
+  if (!thread || thread.blocked) return;
+  if (thread.kind === "draft_phone") await sendInDraftPhoneConversation(thread, text);
+  else await sendInConversation(thread, text);
+}
+
+function updatePhonePreview() {
+  el.phoneInput.value = formatPhoneLocal(el.phoneInput.value);
+  const preview = toE164(el.countryCodeSelect.value, el.phoneInput.value);
+  el.phoneE164Preview.textContent = preview ? `Will send OTP to ${preview}` : "Enter at least 8 digits including country code";
+}
+
+function updateNewPhoneFormat() {
+  el.newPhoneInput.value = formatPhoneLocal(el.newPhoneInput.value);
 }
 
 async function startPhoneAuth(event) {
   event.preventDefault();
-  const phone = normalizePhone(el.phoneInput.value);
+  const phone = toE164(el.countryCodeSelect.value, el.phoneInput.value);
   if (!phone) {
-    setAuthStatus("Enter a valid E.164 phone number, e.g. +15551230001", true);
+    setAuthStatus("Enter a valid phone number.", true);
     return;
   }
   setAuthStatus("Requesting OTP...");
   try {
     const payload = await apiRequest("/v1/auth/phone/start", {
       method: "POST",
-      headers: { Authorization: "" },
       body: JSON.stringify({ phone_e164: phone, channel: "SMS" }),
     });
     state.challengeId = sanitizeText(payload.challenge_id, 80);
@@ -616,7 +1029,6 @@ async function verifyPhoneAuth(event) {
   try {
     const payload = await apiRequest("/v1/auth/phone/verify", {
       method: "POST",
-      headers: { Authorization: "" },
       body: JSON.stringify({
         challenge_id: state.challengeId,
         otp_code: otp,
@@ -625,9 +1037,7 @@ async function verifyPhoneAuth(event) {
     });
     const user = payload?.user || {};
     const tokens = payload?.tokens || {};
-    if (!tokens.access_token || !tokens.refresh_token || !user.user_id) {
-      throw new Error("invalid_auth_response");
-    }
+    if (!tokens.access_token || !tokens.refresh_token || !user.user_id) throw new Error("invalid_auth_response");
     authStoreSet({
       userId: sanitizeText(user.user_id, 80),
       phoneE164: sanitizeText(user.primary_phone_e164, 32),
@@ -638,6 +1048,7 @@ async function verifyPhoneAuth(event) {
     el.phoneVerifyForm.classList.add("hidden");
     el.phoneStartForm.reset();
     el.phoneVerifyForm.reset();
+    updatePhonePreview();
     await bootAfterAuth();
   } catch (error) {
     setAuthStatus(`Verify failed: ${error.message}`, true);
@@ -653,9 +1064,9 @@ async function bootAfterAuth() {
   renderAll();
   try {
     await loadConversationsFromApi();
-    if (state.activeThreadId) {
-      await ensureMessagesLoaded(state.activeThreadId);
-    }
+    if (state.activeThreadId) await ensureMessagesLoaded(state.activeThreadId);
+    stopEventStream();
+    void startEventStream();
     renderAll();
   } catch (error) {
     console.error(error);
@@ -663,10 +1074,12 @@ async function bootAfterAuth() {
 }
 
 function logout() {
+  stopEventStream();
   authStoreClear();
   state.threads = [];
   state.activeThreadId = null;
   state.query = "";
+  state.typingDraft = "";
   showAuthShell();
   setAuthStatus("Signed out.");
   renderAll();
@@ -677,11 +1090,18 @@ el.searchInput.addEventListener("input", (event) => {
   renderThreadList();
 });
 
+el.composerInput.addEventListener("input", () => {
+  state.typingDraft = sanitizeText(el.composerInput.value, 1000);
+  renderMessages();
+});
+
 el.composer.addEventListener("submit", async (event) => {
   event.preventDefault();
   const text = sanitizeText(el.composerInput.value, 1000);
   if (!text) return;
   el.composerInput.value = "";
+  state.typingDraft = "";
+  renderMessages();
   try {
     await handleComposerSend(text);
   } catch (error) {
@@ -694,14 +1114,12 @@ el.backBtn.addEventListener("click", () => closeMobileThread());
 
 el.newChatBtn.addEventListener("click", () => {
   el.newChatForm.classList.toggle("hidden");
-  if (!el.newChatForm.classList.contains("hidden")) {
-    el.newPhoneInput.focus();
-  }
+  if (!el.newChatForm.classList.contains("hidden")) el.newPhoneInput.focus();
 });
 
 el.newChatForm.addEventListener("submit", (event) => {
   event.preventDefault();
-  const phone = normalizePhone(el.newPhoneInput.value);
+  const phone = toE164(el.newCountryCodeSelect.value, el.newPhoneInput.value);
   if (!phone) {
     el.newPhoneInput.focus();
     return;
@@ -715,35 +1133,62 @@ el.newChatForm.addEventListener("submit", (event) => {
 
 el.logoutBtn.addEventListener("click", async () => {
   try {
-    await apiRequest("/v1/auth/logout", {
-      method: "POST",
-      body: JSON.stringify({}),
-    });
+    await apiRequest("/v1/auth/logout", { method: "POST", body: JSON.stringify({}) });
   } catch {
     // Best effort logout.
   }
   logout();
 });
 
+el.nicknameBtn.addEventListener("click", () => {
+  const thread = getActiveThread();
+  if (!thread) return;
+  const nickname = sanitizeText(window.prompt("Set a nickname for this user", thread.nickname || thread.title), 80);
+  if (!nickname) return;
+  upsertThread({ ...thread, nickname });
+  saveConversationStore();
+  renderAll();
+});
+
+el.blockBtn.addEventListener("click", () => {
+  const thread = getActiveThread();
+  if (!thread) return;
+  upsertThread({ ...thread, blocked: !thread.blocked });
+  saveConversationStore();
+  renderAll();
+});
+
+el.closeThreadBtn.addEventListener("click", () => {
+  const thread = getActiveThread();
+  if (!thread) return;
+  upsertThread({ ...thread, closed: true });
+  const remaining = visibleThreads();
+  state.activeThreadId = remaining.length ? remaining[0].id : null;
+  saveConversationStore();
+  renderAll();
+});
+
 el.phoneStartForm.addEventListener("submit", startPhoneAuth);
 el.phoneVerifyForm.addEventListener("submit", verifyPhoneAuth);
+el.phoneInput.addEventListener("input", updatePhonePreview);
+el.countryCodeSelect.addEventListener("change", updatePhonePreview);
+el.newPhoneInput.addEventListener("input", updateNewPhoneFormat);
 
 window.addEventListener("resize", () => {
-  if (!window.matchMedia("(max-width: 880px)").matches) {
-    closeMobileThread();
-  }
+  if (!window.matchMedia("(max-width: 880px)").matches) closeMobileThread();
 });
 
 async function init() {
+  updatePhonePreview();
   const session = authStoreLoad();
   if (session) {
     state.auth = session;
     await bootAfterAuth();
-  } else {
-    showAuthShell();
-    setAuthStatus("");
-    renderAll();
+    return;
   }
+  showAuthShell();
+  setAuthStatus("");
+  renderAll();
 }
 
 init();

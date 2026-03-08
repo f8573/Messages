@@ -3,3 +3,6 @@
 services/gateway/bin/
 services/gateway/.env
 services/gateway/coverage.out
+services/messages-processor/*.exe
+services/delivery-processor/*.exe
+services/sms-processor/*.exe

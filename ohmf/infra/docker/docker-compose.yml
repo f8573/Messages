@@ -27,6 +27,68 @@ services:
       timeout: 5s
       retries: 10
 
+  cassandra:
+    image: cassandra:5.0
+    container_name: ohmf-cassandra
+    ports:
+      - "9042:9042"
+    environment:
+      MAX_HEAP_SIZE: 512M
+      HEAP_NEWSIZE: 128M
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'describe keyspaces' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+    volumes:
+      - cassandra_data:/var/lib/cassandra
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: ohmf-kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://kafka:9092,CONTROLLER://kafka:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "/usr/bin/kafka-topics --bootstrap-server kafka:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: ohmf-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "/usr/bin/kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic msg.ingress.v1 --partitions 96 --replication-factor 1 &&
+      /usr/bin/kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic msg.persisted.v1 --partitions 96 --replication-factor 1 &&
+      /usr/bin/kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic msg.delivery.v1 --partitions 96 --replication-factor 1 &&
+      /usr/bin/kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic msg.sms.dispatch.v1 --partitions 24 --replication-factor 1 &&
+      /usr/bin/kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic presence.events.v1 --partitions 48 --replication-factor 1 &&
+      /usr/bin/kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic microservice.events.v1 --partitions 96 --replication-factor 1 &&
+      /usr/bin/kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic msg.ingress.dlq.v1 --partitions 24 --replication-factor 1 &&
+      /usr/bin/kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic msg.delivery.dlq.v1 --partitions 24 --replication-factor 1 &&
+      /usr/bin/kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic msg.sms.dlq.v1 --partitions 24 --replication-factor 1"
+    restart: "no"
+
   api:
     build:
       context: ../../services/gateway
@@ -37,17 +99,107 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      kafka:
+        condition: service_healthy
+      cassandra:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
     environment:
       APP_ENV: dev
       APP_ADDR: :8080
       APP_LOG_LEVEL: info
       APP_DB_DSN: postgres://${POSTGRES_USER:-ohmf}:${POSTGRES_PASSWORD:-ohmf}@db:5432/${POSTGRES_DB:-ohmf}?sslmode=disable
       APP_REDIS_ADDR: redis:6379
+      APP_REDIS_DB: "0"
       APP_JWT_SECRET: dev-only-change-me
       APP_ACCESS_TTL_MINUTES: "15"
       APP_REFRESH_TTL_HOURS: "720"
+      APP_USE_KAFKA_SEND: "true"
+      APP_USE_CASSANDRA_READS: "false"
+      APP_ENABLE_WS_SEND: "true"
+      APP_KAFKA_BROKERS: kafka:9092
+      APP_KAFKA_CLIENT_ID: ohmf-gateway
+      APP_KAFKA_INGRESS_TOPIC: msg.ingress.v1
+      APP_KAFKA_PERSISTED_TOPIC: msg.persisted.v1
+      APP_KAFKA_DELIVERY_TOPIC: msg.delivery.v1
+      APP_KAFKA_SMS_DISPATCH_TOPIC: msg.sms.dispatch.v1
+      APP_KAFKA_PRESENCE_TOPIC: presence.events.v1
+      APP_KAFKA_MICROSERVICE_TOPIC: microservice.events.v1
+      APP_ACK_TIMEOUT_MS: "2000"
+      APP_CASSANDRA_HOSTS: cassandra:9042
+      APP_CASSANDRA_KEYSPACE: ohmf_messages
+      APP_CASSANDRA_CONSISTENCY: quorum
     ports:
       - "18080:8080"
 
+  messages-processor:
+    build:
+      context: ../../services/messages-processor
+      dockerfile: Dockerfile
+    container_name: ohmf-messages-processor
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      cassandra:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      APP_DB_DSN: postgres://${POSTGRES_USER:-ohmf}:${POSTGRES_PASSWORD:-ohmf}@db:5432/${POSTGRES_DB:-ohmf}?sslmode=disable
+      APP_REDIS_ADDR: redis:6379
+      APP_KAFKA_BROKERS: kafka:9092
+      APP_KAFKA_GROUP_ID: messages-processor-v1
+      APP_KAFKA_INGRESS_TOPIC: msg.ingress.v1
+      APP_KAFKA_PERSISTED_TOPIC: msg.persisted.v1
+      APP_KAFKA_MICROSERVICE_TOPIC: microservice.events.v1
+      APP_KAFKA_SMS_DISPATCH_TOPIC: msg.sms.dispatch.v1
+      APP_KAFKA_DLQ_TOPIC: msg.ingress.dlq.v1
+      APP_CASSANDRA_HOSTS: cassandra:9042
+      APP_CASSANDRA_KEYSPACE: ohmf_messages
+      APP_SHADOW_POSTGRES_WRITE: "true"
+
+  delivery-processor:
+    build:
+      context: ../../services/delivery-processor
+      dockerfile: Dockerfile
+    container_name: ohmf-delivery-processor
+    depends_on:
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      APP_REDIS_ADDR: redis:6379
+      APP_KAFKA_BROKERS: kafka:9092
+      APP_KAFKA_GROUP_ID: delivery-processor-v1
+      APP_KAFKA_PERSISTED_TOPIC: msg.persisted.v1
+      APP_KAFKA_DELIVERY_TOPIC: msg.delivery.v1
+      APP_KAFKA_DELIVERY_DLQ_TOPIC: msg.delivery.dlq.v1
+
+  sms-processor:
+    build:
+      context: ../../services/sms-processor
+      dockerfile: Dockerfile
+    container_name: ohmf-sms-processor
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      APP_KAFKA_BROKERS: kafka:9092
+      APP_KAFKA_GROUP_ID: sms-processor-v1
+      APP_KAFKA_SMS_DISPATCH_TOPIC: msg.sms.dispatch.v1
+      APP_KAFKA_DELIVERY_TOPIC: msg.delivery.v1
+      APP_KAFKA_SMS_DLQ_TOPIC: msg.sms.dlq.v1
+
 volumes:
   db_data:
+  cassandra_data:
