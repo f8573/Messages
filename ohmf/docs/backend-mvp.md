@@ -7,9 +7,11 @@ Implemented in this milestone:
 - Messages send/list/read API surface
 - PostgreSQL migrations for MVP entities
 - Redis wiring for rate-limit/cache foundation
+- Kafka ingress + processor pipeline
+- Cassandra message persistence path
+- WebSocket gateway endpoint (`/v1/ws`)
+- Distributed token-bucket send/control rate limiting
 
 Excluded from MVP:
-- Websocket realtime
 - media pipeline
-- relay transport
 - mini-app runtime

@@ -1,5 +1,7 @@
 # OHMF Milestone 1 Foundation
 
+Setup guide: [`SETUP.md`](./SETUP.md)
+
 ## Local toolchain (non-admin)
 
 Because system-wide installs were blocked by permissions, local binaries were installed under `.tools`:
@@ -28,6 +30,22 @@ docker compose -f .\infra\docker\docker-compose.yml up -d --build
 ```
 
 API will be available at `http://localhost:18080`.
+
+This stack now includes:
+- Gateway (REST + WebSocket)
+- Kafka (KRaft) + topic bootstrap
+- Cassandra
+- Redis
+- `messages-processor`
+- `delivery-processor`
+- `sms-processor`
+
+WebSocket endpoint: `ws://localhost:18080/v1/ws?access_token=<JWT>`
+
+Feature flags (gateway):
+- `APP_USE_KAFKA_SEND` (`true` by default in compose)
+- `APP_USE_CASSANDRA_READS` (`false` by default in compose for phased rollout)
+- `APP_ENABLE_WS_SEND` (`true` by default in compose)
 
 ## API endpoints
 

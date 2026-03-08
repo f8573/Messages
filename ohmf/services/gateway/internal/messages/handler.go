@@ -3,10 +3,14 @@ package messages
 import (
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
+	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"ohmf/services/gateway/internal/httpx"
+	"ohmf/services/gateway/internal/limit"
 	"ohmf/services/gateway/internal/middleware"
 )
 
@@ -38,24 +42,41 @@ func (h *Handler) Send(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "idempotency_key required", nil)
 		return
 	}
-	msg, err := h.svc.Send(r.Context(), userID, req.ConversationID, req.IdempotencyKey, req.ContentType, req.Content)
+	traceID := buildTraceID(chimiddleware.GetReqID(r.Context()))
+	result, err := h.svc.Send(r.Context(), userID, req.ConversationID, req.IdempotencyKey, req.ContentType, req.Content, traceID, ipOnly(r.RemoteAddr))
 	if err != nil {
 		if errors.Is(err, ErrConversationAccess) {
 			httpx.WriteError(w, r, http.StatusForbidden, "forbidden", err.Error(), nil)
 			return
 		}
+		var rlErr RateLimitError
+		if errors.As(err, &rlErr) {
+			decision := limit.Decision{Allowed: false, RetryAfter: time.Duration(retryAfterOrDefault(rlErr.RetryAfter)) * time.Millisecond}
+			limit.SetHeaders(w, scopeLimit(rlErr.Scope), decision)
+			httpx.WriteError(w, r, http.StatusTooManyRequests, "rate_limited", err.Error(), map[string]any{
+				"scope":          rlErr.Scope,
+				"retry_after_ms": retryAfterOrDefault(rlErr.RetryAfter),
+			})
+			return
+		}
 		httpx.WriteError(w, r, http.StatusInternalServerError, "send_failed", err.Error(), nil)
 		return
 	}
-	httpx.WriteJSON(w, http.StatusCreated, map[string]any{
-		"message_id":   msg.MessageID,
-		"server_order": msg.ServerOrder,
-		"status": map[string]string{
-			"send":     "STORED",
-			"delivery": "PENDING",
-			"read":     "UNREAD",
-		},
-	})
+	status := http.StatusCreated
+	if result.Queued {
+		status = http.StatusAccepted
+	}
+	response := map[string]any{
+		"message_id":   result.Message.MessageID,
+		"server_order": result.Message.ServerOrder,
+		"transport":    "OHMF",
+		"status":       "SENT",
+		"queued":       result.Queued,
+	}
+	if result.Queued {
+		response["ack_timeout_ms"] = result.AckTimeoutMS
+	}
+	httpx.WriteJSON(w, status, response)
 }
 
 func (h *Handler) SendToPhone(w http.ResponseWriter, r *http.Request) {
@@ -78,17 +99,38 @@ func (h *Handler) SendToPhone(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "phone_e164 and idempotency_key required", nil)
 		return
 	}
-	msg, err := h.svc.SendToPhone(r.Context(), userID, req.PhoneE164, req.IdempotencyKey, req.ContentType, req.Content)
+	traceID := buildTraceID(chimiddleware.GetReqID(r.Context()))
+	result, err := h.svc.SendToPhone(r.Context(), userID, req.PhoneE164, req.IdempotencyKey, req.ContentType, req.Content, traceID, ipOnly(r.RemoteAddr))
 	if err != nil {
+		var rlErr RateLimitError
+		if errors.As(err, &rlErr) {
+			decision := limit.Decision{Allowed: false, RetryAfter: time.Duration(retryAfterOrDefault(rlErr.RetryAfter)) * time.Millisecond}
+			limit.SetHeaders(w, scopeLimit(rlErr.Scope), decision)
+			httpx.WriteError(w, r, http.StatusTooManyRequests, "rate_limited", err.Error(), map[string]any{
+				"scope":          rlErr.Scope,
+				"retry_after_ms": retryAfterOrDefault(rlErr.RetryAfter),
+			})
+			return
+		}
 		httpx.WriteError(w, r, http.StatusInternalServerError, "send_phone_failed", err.Error(), nil)
 		return
 	}
-	httpx.WriteJSON(w, http.StatusCreated, map[string]any{
-		"message_id":      msg.MessageID,
-		"conversation_id": msg.ConversationID,
-		"server_order":    msg.ServerOrder,
+	status := http.StatusCreated
+	if result.Queued {
+		status = http.StatusAccepted
+	}
+	response := map[string]any{
+		"message_id":      result.Message.MessageID,
+		"conversation_id": result.Message.ConversationID,
+		"server_order":    result.Message.ServerOrder,
 		"transport":       "SMS",
-	})
+		"status":          "SENT",
+		"queued":          result.Queued,
+	}
+	if result.Queued {
+		response["ack_timeout_ms"] = result.AckTimeoutMS
+	}
+	httpx.WriteJSON(w, status, response)
 }
 
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
@@ -133,4 +175,32 @@ func (h *Handler) MarkRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func retryAfterOrDefault(v time.Duration) int64 {
+	if v <= 0 {
+		return 1000
+	}
+	return v.Milliseconds()
+}
+
+func scopeLimit(scope string) int64 {
+	switch scope {
+	case "user":
+		return 60
+	case "conversation":
+		return 500
+	case "ip":
+		return 240
+	default:
+		return 0
+	}
+}
+
+func ipOnly(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return remoteAddr
+	}
+	return host
 }

@@ -72,3 +72,24 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	}
 	httpx.WriteJSON(w, http.StatusOK, c)
 }
+
+func (h *Handler) CreatePhone(w http.ResponseWriter, r *http.Request) {
+	actor, ok := middleware.UserIDFromContext(r.Context())
+	if !ok {
+		httpx.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing auth", nil)
+		return
+	}
+	var req struct {
+		PhoneE164 string `json:"phone_e164"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "invalid body", nil)
+		return
+	}
+	c, err := h.svc.FindOrCreatePhoneDM(r.Context(), actor, req.PhoneE164)
+	if err != nil {
+		httpx.WriteError(w, r, http.StatusBadRequest, "conversation_create_failed", err.Error(), nil)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusCreated, c)
+}

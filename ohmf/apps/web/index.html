@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self' http://localhost:18080 http://127.0.0.1:18080; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self' http://localhost:18080 http://127.0.0.1:18080; object-src 'none'; base-uri 'none'; form-action 'self'" />
     <meta name="referrer" content="no-referrer" />
     <meta http-equiv="Permissions-Policy" content="camera=(), microphone=(), geolocation=()" />
     <title>OHMF Messages</title>
@@ -14,12 +14,22 @@
     <section class="auth-shell" id="auth-shell">
       <div class="auth-card">
         <h1>Sign in to OHMF</h1>
-        <p class="auth-muted">Use your phone number. In local dev, OTP is <code>123456</code>.</p>
+        <p class="auth-muted">Choose your country code and enter your number. In local dev, OTP is <code>123456</code>.</p>
         <p class="status-msg" id="auth-status" role="status" aria-live="polite"></p>
 
         <form id="phone-start-form">
-          <label for="phone-input">Phone Number (E.164)</label>
-          <input id="phone-input" name="phone" type="tel" placeholder="+15551230001" required />
+          <label for="country-code-select">Phone Number</label>
+          <div class="phone-grid">
+            <select id="country-code-select" name="countryCode" aria-label="Country code">
+              <option value="+1">+1 (US/Canada)</option>
+              <option value="+44">+44 (UK)</option>
+              <option value="+61">+61 (Australia)</option>
+              <option value="+91">+91 (India)</option>
+              <option value="+81">+81 (Japan)</option>
+            </select>
+            <input id="phone-input" name="phone" type="tel" inputmode="numeric" placeholder="(555)-123-4567" required />
+          </div>
+          <p class="auth-muted tiny" id="phone-e164-preview"></p>
           <button type="submit" class="send-btn full">Send OTP</button>
         </form>
 
@@ -43,7 +53,14 @@
         <form class="new-chat-form hidden" id="new-chat-form">
           <label for="new-phone-input">Start new message</label>
           <div class="row">
-            <input id="new-phone-input" type="tel" placeholder="+15551239999" />
+            <select id="new-country-code-select" aria-label="New chat country code">
+              <option value="+1">+1</option>
+              <option value="+44">+44</option>
+              <option value="+61">+61</option>
+              <option value="+91">+91</option>
+              <option value="+81">+81</option>
+            </select>
+            <input id="new-phone-input" type="tel" inputmode="numeric" placeholder="(555)-123-4567" />
             <button type="submit" class="send-btn compact">Start</button>
           </div>
         </form>
@@ -59,6 +76,11 @@
           <div class="chat-title-wrap">
             <p class="chat-title" id="chat-title">Select a conversation</p>
             <p class="chat-subtitle" id="chat-subtitle">No active thread</p>
+          </div>
+          <div class="chat-actions">
+            <button class="icon-btn" id="nickname-btn" aria-label="Set nickname">Aa</button>
+            <button class="icon-btn" id="block-btn" aria-label="Block user">Block</button>
+            <button class="icon-btn" id="close-thread-btn" aria-label="Close conversation">Close</button>
           </div>
         </header>
 
