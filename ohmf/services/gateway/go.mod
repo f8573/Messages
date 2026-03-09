@@ -3,6 +3,7 @@ module ohmf/services/gateway
 go 1.25
 
 require (
+	github.com/alicebob/miniredis/v2 v2.35.0
 	github.com/go-chi/chi/v5 v5.2.3
 	github.com/go-chi/cors v1.2.0
 	github.com/gocql/gocql v1.7.0
@@ -12,11 +13,12 @@ require (
 	github.com/jackc/pgx/v5 v5.7.5
 	github.com/redis/go-redis/v9 v9.12.1
 	github.com/rs/zerolog v1.34.0
+	github.com/santhosh-tekuri/jsonschema/v5 v5.3.1
 	github.com/segmentio/kafka-go v0.4.49
 )
 
 require (
-	github.com/alicebob/miniredis/v2 v2.35.0 // indirect
+	github.com/Masterminds/semver/v3 v3.4.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
 	github.com/golang/snappy v0.0.3 // indirect

@@ -38,6 +38,7 @@ type ingressEvent struct {
 	SenderUserID    string         `json:"sender_user_id"`
 	IdempotencyKey  string         `json:"idempotency_key"`
 	Endpoint        string         `json:"endpoint"`
+	ClientGeneratedID string       `json:"client_generated_id,omitempty"`
 	ContentType     string         `json:"content_type"`
 	Content         map[string]any `json:"content"`
 	TransportIntent string         `json:"transport_intent"`
@@ -57,6 +58,7 @@ type persistedEvent struct {
 	PersistedAtMS   int64    `json:"persisted_at_ms"`
 	DeliveryTargets []string `json:"delivery_targets"`
 	TraceID         string   `json:"trace_id"`
+	ClientGeneratedID string `json:"client_generated_id,omitempty"`
 }
 
 type ackPayload struct {
@@ -67,6 +69,7 @@ type ackPayload struct {
 	Status         string `json:"status"`
 	Transport      string `json:"transport"`
 	PersistedAtMS  int64  `json:"persisted_at_ms"`
+	ClientGeneratedID string `json:"client_generated_id,omitempty"`
 }
 
 type processor struct {
@@ -217,10 +220,10 @@ func (p *processor) processMessage(ctx context.Context, msg kafka.Message) error
 		if p.cfg.ShadowPostgresWrite {
 			contentJSON, _ := json.Marshal(evt.Content)
 			_, err = tx.Exec(ctx, `
-				INSERT INTO messages (id, conversation_id, sender_user_id, content_type, content, transport, server_order, created_at)
-				VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5::jsonb, $6, $7, now())
+				INSERT INTO messages (id, conversation_id, sender_user_id, content_type, content, client_generated_id, transport, server_order, created_at)
+				VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5::jsonb, $6, $7, $8, now())
 				ON CONFLICT (id) DO NOTHING
-			`, messageID, evt.ConversationID, evt.SenderUserID, evt.ContentType, string(contentJSON), mapTransport(evt.TransportIntent), serverOrder)
+			`, messageID, evt.ConversationID, evt.SenderUserID, evt.ContentType, string(contentJSON), evt.ClientGeneratedID, mapTransport(evt.TransportIntent), serverOrder)
 			if err != nil {
 				return err
 			}
@@ -236,15 +239,16 @@ func (p *processor) processMessage(ctx context.Context, msg kafka.Message) error
 	}
 
 	payload, _ := json.Marshal(map[string]any{
-		"message_id":      messageID,
-		"conversation_id": evt.ConversationID,
-		"sender_user_id":  evt.SenderUserID,
-		"content_type":    evt.ContentType,
-		"content":         evt.Content,
-		"transport":       mapTransport(evt.TransportIntent),
-		"server_order":    serverOrder,
-		"status":          "SENT",
-		"created_at":      persistedAt.Format(time.RFC3339),
+		"message_id":         messageID,
+		"conversation_id":    evt.ConversationID,
+		"sender_user_id":     evt.SenderUserID,
+		"content_type":       evt.ContentType,
+		"content":            evt.Content,
+		"client_generated_id": evt.ClientGeneratedID,
+		"transport":          mapTransport(evt.TransportIntent),
+		"server_order":       serverOrder,
+		"status":             "SENT",
+		"created_at":         persistedAt.Format(time.RFC3339),
 	})
 	_, err = tx.Exec(ctx, `
 		INSERT INTO idempotency_keys (actor_user_id, endpoint, key, response_payload, status_code, expires_at)
@@ -270,13 +274,14 @@ func (p *processor) processMessage(ctx context.Context, msg kafka.Message) error
 	}
 
 	ackBody, _ := json.Marshal(ackPayload{
-		EventID:        evt.EventID,
-		MessageID:      messageID,
-		ConversationID: evt.ConversationID,
-		ServerOrder:    serverOrder,
-		Status:         "SENT",
-		Transport:      mapTransport(evt.TransportIntent),
-		PersistedAtMS:  persistedAt.UnixMilli(),
+		EventID:           evt.EventID,
+		MessageID:         messageID,
+		ConversationID:    evt.ConversationID,
+		ServerOrder:       serverOrder,
+		Status:            "SENT",
+		Transport:         mapTransport(evt.TransportIntent),
+		PersistedAtMS:     persistedAt.UnixMilli(),
+		ClientGeneratedID: evt.ClientGeneratedID,
 	})
 	if err := p.redis.Set(ctx, "msg:ack:"+evt.EventID, string(ackBody), 24*time.Hour).Err(); err != nil {
 		return err

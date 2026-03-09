@@ -8,6 +8,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"ohmf/services/gateway/internal/httpx"
 	"ohmf/services/gateway/internal/middleware"
+	"ohmf/services/gateway/internal/pagination"
 )
 
 type Handler struct {
@@ -46,12 +47,16 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing auth", nil)
 		return
 	}
-	items, err := h.svc.List(r.Context(), actor)
+	items, nextCursorValue, err := h.svc.List(r.Context(), actor, 100)
 	if err != nil {
 		httpx.WriteError(w, r, http.StatusInternalServerError, "list_failed", err.Error(), nil)
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"items": items, "next_cursor": nil})
+	var nextCursor string
+	if nextCursorValue != "" {
+		nextCursor = pagination.EncodeCursor(map[string]any{"updated_at": nextCursorValue})
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"items": items, "next_cursor": nextCursor})
 }
 
 func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
@@ -92,4 +97,59 @@ func (h *Handler) CreatePhone(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteJSON(w, http.StatusCreated, c)
+}
+
+func (h *Handler) UpdatePolicy(w http.ResponseWriter, r *http.Request) {
+	actor, ok := middleware.UserIDFromContext(r.Context())
+	if !ok {
+		httpx.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing auth", nil)
+		return
+	}
+	id := chi.URLParam(r, "id")
+	var req struct {
+		TransportPolicy string `json:"transport_policy"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "invalid body", nil)
+		return
+	}
+	c, err := h.svc.UpdateTransportPolicy(r.Context(), actor, id, req.TransportPolicy)
+	if err != nil {
+		if err == ErrNotFound {
+			httpx.WriteError(w, r, http.StatusForbidden, "forbidden", "not a member", nil)
+			return
+		}
+		if err.Error() == "invalid_transport_policy" {
+			httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "invalid transport_policy", nil)
+			return
+		}
+		httpx.WriteError(w, r, http.StatusInternalServerError, "update_failed", err.Error(), nil)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, c)
+}
+
+func (h *Handler) SetThreadKeys(w http.ResponseWriter, r *http.Request) {
+	actor, ok := middleware.UserIDFromContext(r.Context())
+	if !ok {
+		httpx.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing auth", nil)
+		return
+	}
+	id := chi.URLParam(r, "id")
+	var body struct {
+		ThreadKeys []map[string]string `json:"thread_keys"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "invalid body", nil)
+		return
+	}
+	if err := h.svc.SetThreadKeys(r.Context(), actor, id, body.ThreadKeys); err != nil {
+		if err == ErrNotFound {
+			httpx.WriteError(w, r, http.StatusForbidden, "forbidden", "not a member", nil)
+			return
+		}
+		httpx.WriteError(w, r, http.StatusInternalServerError, "set_failed", err.Error(), nil)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }

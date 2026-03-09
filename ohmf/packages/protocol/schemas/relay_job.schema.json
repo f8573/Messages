@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ohmf.local/schemas/relay_job.schema.json",
+  "title": "RelayJob",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["relay_job_id", "requested_by", "transport", "destination", "content", "status"],
+  "properties": {
+    "relay_job_id": { "type": "string" },
+    "requested_by": {
+      "type": "object",
+      "required": ["user_id", "device_id"],
+      "properties": {
+        "user_id": { "type": "string" },
+        "device_id": { "type": "string" }
+      }
+    },
+    "executing_device_id": { "type": "string" },
+    "transport": { "type": "string", "enum": ["RELAY_SMS", "RELAY_MMS"] },
+    "destination": { "type": "object", "properties": { "phone_e164": { "type": "string" } }, "required": ["phone_e164"] },
+    "content": { "type": "object", "additionalProperties": true },
+    "status": { "type": "string" },
+    "idempotency_key": { "type": "string" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" }
+  }
+}

@@ -1,0 +1,48 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Mini App Manifest",
+  "type": "object",
+  "required": ["app_id","name","version","entrypoint","permissions","capabilities","signature"],
+  "properties": {
+    "app_id": {"type":"string","minLength":1},
+    "name": {"type":"string","minLength":1},
+    "version": {"type":"string","pattern":"^\\d+\\.\\d+\\.\\d+(-[A-Za-z0-9.-]+)?$"},
+    "entrypoint": {
+      "type":"object",
+      "required":["type","url"],
+      "properties":{
+        "type":{"type":"string","enum":["url","inline"]},
+        "url":{"type":"string","format":"uri"},
+        "mime_type": {"type":"string"}
+      },
+      "additionalProperties": false
+    },
+    "icons": {
+      "type":"array",
+      "items":{
+        "type":"object",
+        "required":["src","sizes"],
+        "properties":{
+          "src":{"type":"string","format":"uri"},
+          "sizes":{"type":"string"},
+          "type":{"type":"string"}
+        },
+        "additionalProperties": false
+      }
+    },
+    "permissions": {"type":"array","items":{"type":"string"}},
+    "capabilities": {"type":"object","additionalProperties":true},
+    "metadata": {"type":"object","additionalProperties":true},
+    "signature": {
+      "type":"object",
+      "required":["alg","kid","sig"],
+      "properties":{
+        "alg":{"type":"string"},
+        "kid":{"type":"string"},
+        "sig":{"type":"string"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

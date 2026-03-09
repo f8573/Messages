@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"strings"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -18,6 +19,7 @@ import (
 	"ohmf/services/gateway/internal/otp"
 	"ohmf/services/gateway/internal/phone"
 	"ohmf/services/gateway/internal/token"
+	"ohmf/services/gateway/internal/config"
 )
 
 type StartRequest struct {
@@ -58,10 +60,11 @@ type Service struct {
 	tokens     *token.Service
 	accessTTL  time.Duration
 	refreshTTL time.Duration
+	cfg        config.Config
 }
 
-func NewService(db *pgxpool.Pool, redis *redis.Client, tokens *token.Service, accessTTL, refreshTTL time.Duration) *Service {
-	return &Service{db: db, redis: redis, tokens: tokens, accessTTL: accessTTL, refreshTTL: refreshTTL}
+func NewService(db *pgxpool.Pool, redis *redis.Client, tokens *token.Service, accessTTL, refreshTTL time.Duration, cfg config.Config) *Service {
+	return &Service{db: db, redis: redis, tokens: tokens, accessTTL: accessTTL, refreshTTL: refreshTTL, cfg: cfg}
 }
 
 func (s *Service) StartPhoneVerification(ctx context.Context, req StartRequest, ip string) (map[string]any, error) {
@@ -86,6 +89,21 @@ func (s *Service) StartPhoneVerification(ctx context.Context, req StartRequest, 
 		}
 	}
 
+	// rate limit by subnet (simple IPv4 /16 heuristic)
+	if ip != "" {
+		parts := strings.Split(ip, ".")
+		if len(parts) >= 2 {
+			subnet := parts[0] + "." + parts[1]
+			allowedSubnet, err := s.allowRate(ctx, "otp:start:subnet:"+subnet, 100, 10*time.Minute)
+			if err != nil {
+				return nil, err
+			}
+			if !allowedSubnet {
+				return nil, ErrRateLimited
+			}
+		}
+	}
+
 	id := uuid.New()
 	code := "123456"
 	_, err = s.db.Exec(ctx, `
@@ -95,11 +113,23 @@ func (s *Service) StartPhoneVerification(ctx context.Context, req StartRequest, 
 	if err != nil {
 		return nil, err
 	}
+	// If the phone or IP has elevated activity, signal escalation to client
+	escalated := false
+	if n, _ := s.redis.Get(ctx, "otp:start:"+phoneE164).Int64(); n > 3 {
+		escalated = true
+	}
+	if ip != "" {
+		if n, _ := s.redis.Get(ctx, "otp:start:ip:"+ip).Int64(); n > 10 {
+			escalated = true
+		}
+	}
+
 	return map[string]any{
 		"challenge_id":    id.String(),
 		"expires_in_sec":  300,
 		"retry_after_sec": 30,
 		"otp_strategy":    "SMS",
+		"escalated":       escalated,
 	}, nil
 }
 
@@ -117,6 +147,23 @@ func (s *Service) VerifyPhone(ctx context.Context, req VerifyRequest, ip string)
 			return nil, err
 		}
 		if !allowedIP {
+			return nil, ErrRateLimited
+		}
+	}
+
+	// device-based rate limiting (use public key or push token if present)
+	deviceFingerprint := ""
+	if req.Device.PublicKey != "" {
+		deviceFingerprint = fmt.Sprintf("pk:%x", sha256.Sum256([]byte(req.Device.PublicKey)))
+	} else if req.Device.PushToken != "" {
+		deviceFingerprint = "pt:" + req.Device.PushToken
+	}
+	if deviceFingerprint != "" {
+		allowedDevice, err := s.allowRate(ctx, "otp:verify:device:"+deviceFingerprint, 10, 10*time.Minute)
+		if err != nil {
+			return nil, err
+		}
+		if !allowedDevice {
 			return nil, ErrRateLimited
 		}
 	}
@@ -239,7 +286,9 @@ func (s *Service) VerifyPhone(ctx context.Context, req VerifyRequest, ip string)
 		return nil, err
 	}
 
-	access, err := s.tokens.IssueAccess(userID, s.accessTTL)
+	// determine feature profiles to include in the access token
+	profiles := s.decideProfilesForPlatform(req.Device.Platform)
+	access, err := s.tokens.IssueAccess(userID, s.accessTTL, profiles)
 	if err != nil {
 		return nil, err
 	}
@@ -299,11 +348,33 @@ func (s *Service) Refresh(ctx context.Context, req RefreshRequest) (map[string]a
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	access, err := s.tokens.IssueAccess(userID, s.accessTTL)
+	// determine profiles based on device platform if available
+	var profiles []string
+	if deviceID != "" {
+		var platform string
+		if err := tx.QueryRow(ctx, `SELECT platform FROM devices WHERE id = $1`, deviceID).Scan(&platform); err == nil {
+			profiles = s.decideProfilesForPlatform(platform)
+		}
+	}
+	access, err := s.tokens.IssueAccess(userID, s.accessTTL, profiles)
 	if err != nil {
 		return nil, err
 	}
 	return map[string]any{"access_token": access, "refresh_token": newRefresh}, nil
+}
+
+func (s *Service) decideProfilesForPlatform(platform string) []string {
+	profiles := []string{"CORE_OTT"}
+	switch strings.ToUpper(platform) {
+	case "ANDROID":
+		profiles = append(profiles, "MINIAPP_RUNTIME")
+		if s.cfg.ClaimAndroidCarrier {
+			profiles = append(profiles, "ANDROID_CARRIER")
+		}
+	case "WEB":
+		profiles = append(profiles, "WEB_RELAY")
+	}
+	return profiles
 }
 
 func (s *Service) Logout(ctx context.Context, userID string, req LogoutRequest) error {

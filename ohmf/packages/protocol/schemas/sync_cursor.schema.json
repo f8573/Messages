@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ohmf.local/schemas/sync_cursor.schema.json",
+  "title": "SyncCursor",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["cursor_version", "timestamp_ms"],
+  "properties": {
+    "cursor_version": { "type": "integer" },
+    "last_server_order": {
+      "type": "object",
+      "additionalProperties": { "type": "integer" }
+    },
+    "timestamp_ms": { "type": "integer" }
+  }
+}

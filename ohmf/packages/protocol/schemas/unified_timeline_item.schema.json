@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ohmf.local/schemas/unified_timeline_item.schema.json",
+  "title": "UnifiedTimelineItem",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["message_id", "conversation_id", "display_timestamp", "transport", "source", "content_type", "content"],
+  "properties": {
+    "message_id": { "type": "string" },
+    "conversation_id": { "type": "string" },
+    "server_order": { "type": "integer" },
+    "display_timestamp": { "type": "string", "format": "date-time" },
+    "sender": { "type": "object", "properties": { "user_id": { "type": "string" }, "device_id": { "type": "string" } }, "required": ["user_id"] },
+    "transport": { "type": "string", "enum": ["OTT", "SMS", "MMS", "RELAY_SMS", "RELAY_MMS"] },
+    "source": { "type": "string", "enum": ["server", "device", "mirror"] },
+    "content_type": { "type": "string" },
+    "content": { "type": "object", "additionalProperties": true },
+    "provider_metadata": { "type": ["object", "null"], "additionalProperties": true },
+    "visibility_state": { "type": "string" }
+  }
+}

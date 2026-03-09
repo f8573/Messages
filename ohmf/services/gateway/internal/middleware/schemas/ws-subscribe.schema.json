@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ohmf.local/schemas/ws-subscribe.schema.json",
+  "title": "WebSocketPresenceSubscribe",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["conversation_ids"],
+  "properties": {
+    "conversation_ids": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    }
+  }
+}

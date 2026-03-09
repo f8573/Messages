@@ -10,10 +10,18 @@ import (
 
 type ctxKey string
 
-const userIDKey ctxKey = "user_id"
+const (
+	userIDKey ctxKey = "user_id"
+	userProfilesKey ctxKey = "user_profiles"
+)
 
 func UserIDFromContext(ctx context.Context) (string, bool) {
 	v, ok := ctx.Value(userIDKey).(string)
+	return v, ok
+}
+
+func ProfilesFromContext(ctx context.Context) ([]string, bool) {
+	v, ok := ctx.Value(userProfilesKey).([]string)
 	return v, ok
 }
 
@@ -30,7 +38,11 @@ func RequireAuth(tokens *token.Service) func(http.Handler) http.Handler {
 				http.Error(w, "invalid token", http.StatusUnauthorized)
 				return
 			}
+			// attach user id and claimed profiles into the request context
 			ctx := context.WithValue(r.Context(), userIDKey, claims.UserID)
+			if len(claims.Profiles) > 0 {
+				ctx = context.WithValue(ctx, userProfilesKey, claims.Profiles)
+			}
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}

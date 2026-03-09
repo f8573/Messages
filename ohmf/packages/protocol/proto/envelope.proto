@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+package ohmf.protocol;
+
+option java_package = "io.ohmf.protocol";
+option java_multiple_files = true;
+option go_package = "ohmf/packages/protocol/proto;proto";
+
+// Envelope for events
+message Envelope {
+  string spec_version = 1;
+  string event_id = 2;
+  string event_type = 3;
+  string issued_at = 4;
+  string conversation_id = 5;
+  string transport = 6;
+  string idempotency_key = 7;
+  bytes payload = 8;
+}
+
+// Canonical message record
+message MessageRecord {
+  string message_id = 1;
+  string conversation_id = 2;
+  int64 server_order = 3;
+  string sender_user_id = 4;
+  string sender_device_id = 5;
+  string transport = 6;
+  string content_type = 7;
+  bytes content = 8;
+  int64 created_at_unix_ms = 9;
+  int64 edited_at_unix_ms = 10;
+  int64 deleted_at_unix_ms = 11;
+  int64 redacted_at_unix_ms = 12;
+  string visibility_state = 13;
+}
+
+// Read receipt
+message ReadReceipt {
+  string conversation_id = 1;
+  string user_id = 2;
+  int64 through_server_order = 3;
+}
+
+// Relay job
+message RelayJob {
+  string relay_job_id = 1;
+  string executing_device_id = 2;
+  string transport = 3;
+  string status = 4;
+  bytes destination = 5;
+  bytes content = 6;
+}
