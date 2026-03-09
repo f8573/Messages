@@ -57,7 +57,22 @@ func NewAsyncPipeline(producer bus.IngressProducer, redisClient *redis.Client) *
 }
 
 func (p *AsyncPipeline) PublishIngress(ctx context.Context, evt IngressEvent) error {
-	return p.producer.PublishIngress(ctx, evt.ConversationID, evt)
+	if p == nil || p.producer == nil {
+		return nil
+	}
+	env, err := BuildEnvelopeFromIngressEvent(evt)
+	if err != nil {
+		return err
+	}
+	return p.producer.PublishIngress(ctx, evt.ConversationID, env)
+}
+
+// PublishEnvelope publishes an already-built Envelope to the ingress topic.
+func (p *AsyncPipeline) PublishEnvelope(ctx context.Context, conversationID string, env Envelope) error {
+	if p == nil || p.producer == nil {
+		return nil
+	}
+	return p.producer.PublishIngress(ctx, conversationID, env)
 }
 
 func (p *AsyncPipeline) WaitAck(ctx context.Context, eventID string, timeout time.Duration) (PersistedAck, bool, error) {
@@ -87,7 +102,7 @@ func (p *AsyncPipeline) WaitAck(ctx context.Context, eventID string, timeout tim
 	return PersistedAck{}, false, nil
 }
 
-func NewIngressEvent(userID, conversationID, endpoint, idemKey, contentType, transportIntent, recipientPhone, traceID string, content map[string]any) IngressEvent {
+func NewIngressEvent(userID, conversationID, endpoint, idemKey, contentType, transportIntent, recipientPhone, clientGeneratedID, traceID string, content map[string]any) IngressEvent {
 	if traceID == "" {
 		traceID = uuid.NewString()
 	}
@@ -98,6 +113,7 @@ func NewIngressEvent(userID, conversationID, endpoint, idemKey, contentType, tra
 		SenderUserID:    userID,
 		IdempotencyKey:  idemKey,
 		Endpoint:        endpoint,
+		ClientGeneratedID: clientGeneratedID,
 		ContentType:     contentType,
 		Content:         content,
 		TransportIntent: transportIntent,
@@ -115,6 +131,7 @@ func (e IngressEvent) ProvisionalMessage() Message {
 		ContentType:    e.ContentType,
 		Content:        e.Content,
 		Transport:      e.TransportIntent,
+		ClientGeneratedID: e.ClientGeneratedID,
 		ServerOrder:    0,
 		Status:         "QUEUED",
 		CreatedAt:      time.UnixMilli(e.SentAtMS).UTC().Format(time.RFC3339),

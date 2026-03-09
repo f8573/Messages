@@ -2,15 +2,18 @@ package messages
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"ohmf/services/gateway/internal/limit"
+	"ohmf/services/gateway/internal/middleware"
 )
 
 type Message struct {
@@ -19,10 +22,12 @@ type Message struct {
 	SenderUserID   string         `json:"sender_user_id"`
 	ContentType    string         `json:"content_type"`
 	Content        map[string]any `json:"content"`
+	ClientGeneratedID string      `json:"client_generated_id,omitempty"`
 	Transport      string         `json:"transport"`
 	ServerOrder    int64          `json:"server_order"`
 	Status         string         `json:"status,omitempty"`
 	CreatedAt      string         `json:"created_at"`
+	Source         string         `json:"source,omitempty"`
 }
 
 type SendResult struct {
@@ -48,6 +53,269 @@ type Service struct {
 	async             *AsyncPipeline
 	cassandra         *CassandraStore
 	rateLimiter       *limit.TokenBucket
+}
+
+type DeliveryRecord struct {
+	ID                string `json:"id"`
+	MessageID         string `json:"message_id"`
+	RecipientUserID   string `json:"recipient_user_id,omitempty"`
+	RecipientDeviceID string `json:"recipient_device_id,omitempty"`
+	RecipientPhone    string `json:"recipient_phone_e164,omitempty"`
+	Transport         string `json:"transport"`
+	State             string `json:"state"`
+	Provider          string `json:"provider,omitempty"`
+	SubmittedAt       string `json:"submitted_at,omitempty"`
+	UpdatedAt         string `json:"updated_at"`
+	FailureCode       string `json:"failure_code,omitempty"`
+}
+
+// Redact removes personal content from a message while preserving identifiers
+// required for timeline integrity. Only the original sender may redact their
+// own message. Redaction replaces the message content with an empty JSON
+// object, sets `redacted_at` and `visibility_state` = 'REDACTED'.
+func (s *Service) Redact(ctx context.Context, actorUserID, messageID string) error {
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var senderID string
+	var convID string
+	err = tx.QueryRow(ctx, `SELECT sender_user_id::text, conversation_id::text FROM messages WHERE id = $1`, messageID).Scan(&senderID, &convID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("message_not_found")
+		}
+		return err
+	}
+	if senderID != actorUserID {
+		// Only sender may redact (policy). Future: allow admins or owners.
+		return fmt.Errorf("forbidden")
+	}
+
+	// Perform redaction: empty content, set redacted_at and visibility state.
+	_, err = tx.Exec(ctx, `
+		UPDATE messages
+		SET content = '{}'::jsonb,
+			redacted_at = now(),
+			visibility_state = 'REDACTED',
+			updated_at = now()
+		WHERE id = $1
+	`, messageID)
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.Exec(ctx, `UPDATE conversations SET updated_at = now() WHERE id = $1::uuid`, convID)
+	if err != nil {
+		return err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+// DeleteMessage performs a privacy-aware deletion flow for a message.
+// Only the original sender may delete their message.
+func (s *Service) DeleteMessage(ctx context.Context, actorUserID, messageID string) error {
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var senderID string
+	var convID string
+	err = tx.QueryRow(ctx, `SELECT sender_user_id::text, conversation_id::text FROM messages WHERE id = $1`, messageID).Scan(&senderID, &convID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("message_not_found")
+		}
+		return err
+	}
+	if senderID != actorUserID {
+		return fmt.Errorf("forbidden")
+	}
+
+	// mark deleted_at and redact content fields and set visibility to SOFT_DELETED
+	_, err = tx.Exec(ctx, `
+		UPDATE messages
+		SET content = NULL,
+			redacted_at = now(),
+			deleted_at = now(),
+			visibility_state = 'SOFT_DELETED',
+			updated_at = now()
+		WHERE id = $1
+	`, messageID)
+	if err != nil {
+		return err
+	}
+
+	// collect attachments to instruct media service to delete
+	rows, err := tx.Query(ctx, `SELECT attachment_id::text FROM attachments WHERE message_id = $1`, messageID)
+	if err != nil {
+		return err
+	}
+	var attachments []string
+	for rows.Next() {
+		var aid string
+		if err := rows.Scan(&aid); err != nil {
+			rows.Close()
+			return err
+		}
+		attachments = append(attachments, aid)
+	}
+	rows.Close()
+
+	if len(attachments) > 0 {
+		// delete attachment rows (actual object deletion handled by media service)
+		if _, err := tx.Exec(ctx, `DELETE FROM attachments WHERE message_id = $1`, messageID); err != nil {
+			return err
+		}
+	}
+
+	// update conversation updated_at
+	if _, err := tx.Exec(ctx, `UPDATE conversations SET updated_at = now() WHERE id = $1::uuid`, convID); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+
+	// emit a deletion envelope for downstream processors (media purge, index invalidation)
+	if s.async != nil {
+		env := Envelope{
+			SpecVersion:    "2026-03-01",
+			EventID:        messageID,
+			EventType:      "message.delete",
+			IssuedAt:       time.Now().UTC().Format(time.RFC3339Nano),
+			ConversationID: convID,
+			Transport:      "OTT",
+			IdempotencyKey: "",
+			Payload:        []byte(fmt.Sprintf(`{"message_id":"%s","attachments":%q}`, messageID, attachments)),
+			Actor:          &Actor{UserID: actorUserID},
+			Trace:          &Trace{},
+		}
+		_ = s.async.PublishEnvelope(context.Background(), convID, env)
+	}
+	return nil
+}
+
+// RecordDelivery inserts or updates a delivery record for a message.
+func (s *Service) RecordDelivery(ctx context.Context, messageID string, dr DeliveryRecord) error {
+	_, err := s.db.Exec(ctx, `
+		INSERT INTO message_deliveries (id, message_id, recipient_user_id, recipient_device_id, recipient_phone_e164, transport, state, provider, submitted_at, updated_at, failure_code)
+		VALUES (gen_random_uuid(), $1, NULLIF($2, '')::uuid, NULLIF($3, '')::uuid, NULLIF($4, ''), $5, $6, NULLIF($7, ''), NULLIF($8, '')::timestamptz, now(), NULLIF($9, ''))
+	`, messageID, dr.RecipientUserID, dr.RecipientDeviceID, dr.RecipientPhone, dr.Transport, dr.State, dr.Provider, nullableTimestamp(dr.SubmittedAt), dr.FailureCode)
+	return err
+}
+
+// AddReaction adds a reaction emoji by a user to a message. Reactions are
+// separate records and do not mutate the original message content.
+func (s *Service) AddReaction(ctx context.Context, actorUserID, messageID, emoji string) error {
+	// ensure membership
+	var convID string
+	if err := s.db.QueryRow(ctx, `SELECT conversation_id::text FROM messages WHERE id = $1`, messageID).Scan(&convID); err != nil {
+		return err
+	}
+	ok, err := s.hasMembership(ctx, s.db, actorUserID, convID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrConversationAccess
+	}
+	_, err = s.db.Exec(ctx, `
+		INSERT INTO message_reactions (message_id, user_id, emoji, created_at)
+		VALUES ($1, $2, $3, now())
+		ON CONFLICT DO NOTHING
+	`, messageID, actorUserID, emoji)
+	return err
+}
+
+// RemoveReaction deletes a reaction record.
+func (s *Service) RemoveReaction(ctx context.Context, actorUserID, messageID, emoji string) error {
+	var convID string
+	if err := s.db.QueryRow(ctx, `SELECT conversation_id::text FROM messages WHERE id = $1`, messageID).Scan(&convID); err != nil {
+		return err
+	}
+	ok, err := s.hasMembership(ctx, s.db, actorUserID, convID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrConversationAccess
+	}
+	_, err = s.db.Exec(ctx, `
+		DELETE FROM message_reactions WHERE message_id = $1 AND user_id = $2 AND emoji = $3
+	`, messageID, actorUserID, emoji)
+	return err
+}
+
+// ListReactions returns aggregated reaction counts for a message.
+func (s *Service) ListReactions(ctx context.Context, messageID string) (map[string]int64, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT emoji, count(*) FROM message_reactions WHERE message_id = $1 GROUP BY emoji
+	`, messageID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]int64)
+	for rows.Next() {
+		var emoji string
+		var cnt int64
+		if err := rows.Scan(&emoji, &cnt); err != nil {
+			return nil, err
+		}
+		out[emoji] = cnt
+	}
+	return out, rows.Err()
+}
+
+func nullableTimestamp(v string) any {
+	if v == "" {
+		return nil
+	}
+	return v
+}
+
+// ListDeliveries returns delivery records for a message.
+func (s *Service) ListDeliveries(ctx context.Context, messageID string) ([]DeliveryRecord, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT id::text, message_id::text, recipient_user_id::text, recipient_device_id::text, recipient_phone_e164, transport, state, provider, submitted_at, updated_at, failure_code
+		FROM message_deliveries WHERE message_id = $1::uuid ORDER BY updated_at ASC
+	`, messageID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]DeliveryRecord, 0)
+	for rows.Next() {
+		var d DeliveryRecord
+		var ru, rd sql.NullString
+		var submitted sql.NullTime
+		var updated time.Time
+		if err := rows.Scan(&d.ID, &d.MessageID, &ru, &rd, &d.RecipientPhone, &d.Transport, &d.State, &d.Provider, &submitted, &updated, &d.FailureCode); err != nil {
+			return nil, err
+		}
+		if ru.Valid {
+			d.RecipientUserID = ru.String
+		}
+		if rd.Valid {
+			d.RecipientDeviceID = rd.String
+		}
+		if submitted.Valid {
+			d.SubmittedAt = submitted.Time.UTC().Format(time.RFC3339)
+		}
+		d.UpdatedAt = updated.UTC().Format(time.RFC3339)
+		out = append(out, d)
+	}
+	return out, rows.Err()
 }
 
 var (
@@ -80,21 +348,21 @@ func NewService(db *pgxpool.Pool, opts Options) *Service {
 	}
 }
 
-func (s *Service) Send(ctx context.Context, userID, conversationID, idemKey, contentType string, content map[string]any, traceID string, ip string) (SendResult, error) {
+func (s *Service) Send(ctx context.Context, userID, conversationID, idemKey, contentType string, content map[string]any, clientGeneratedID string, traceID string, ip string) (SendResult, error) {
 	if err := s.enforceSendRate(ctx, userID, conversationID, ip); err != nil {
 		return SendResult{}, err
 	}
 	if s.useKafkaSend && s.async != nil {
-		return s.sendAsync(ctx, userID, conversationID, idemKey, contentType, content, "OHMF", "", "/v1/messages", traceID)
+		return s.sendAsync(ctx, userID, conversationID, idemKey, contentType, content, clientGeneratedID, "OHMF", "", "/v1/messages", traceID)
 	}
-	msg, err := s.sendSync(ctx, userID, conversationID, idemKey, contentType, content)
+	msg, err := s.sendSync(ctx, userID, conversationID, idemKey, contentType, content, clientGeneratedID)
 	if err != nil {
 		return SendResult{}, err
 	}
 	return SendResult{Message: msg}, nil
 }
 
-func (s *Service) SendToPhone(ctx context.Context, userID, phoneE164, idemKey, contentType string, content map[string]any, traceID string, ip string) (SendResult, error) {
+func (s *Service) SendToPhone(ctx context.Context, userID, phoneE164, idemKey, contentType string, content map[string]any, clientGeneratedID string, traceID string, ip string) (SendResult, error) {
 	conversationID, err := s.ensurePhoneConversation(ctx, userID, phoneE164)
 	if err != nil {
 		return SendResult{}, err
@@ -103,20 +371,27 @@ func (s *Service) SendToPhone(ctx context.Context, userID, phoneE164, idemKey, c
 		return SendResult{}, err
 	}
 	if s.useKafkaSend && s.async != nil {
-		return s.sendAsync(ctx, userID, conversationID, idemKey, contentType, content, "SMS", phoneE164, "/v1/messages/phone", traceID)
+		return s.sendAsync(ctx, userID, conversationID, idemKey, contentType, content, clientGeneratedID, "SMS", phoneE164, "/v1/messages/phone", traceID)
 	}
-	msg, err := s.sendToPhoneSync(ctx, userID, phoneE164, idemKey, contentType, content)
+	msg, err := s.sendToPhoneSync(ctx, userID, phoneE164, idemKey, contentType, content, clientGeneratedID)
 	if err != nil {
 		return SendResult{}, err
 	}
 	return SendResult{Message: msg}, nil
 }
 
-func (s *Service) sendAsync(ctx context.Context, userID, conversationID, idemKey, contentType string, content map[string]any, transportIntent, phoneE164, endpoint, traceID string) (SendResult, error) {
+func (s *Service) sendAsync(ctx context.Context, userID, conversationID, idemKey, contentType string, content map[string]any, clientGeneratedID, transportIntent, phoneE164, endpoint, traceID string) (SendResult, error) {
 	if ok, err := s.hasMembership(ctx, s.db, userID, conversationID); err != nil {
 		return SendResult{}, err
 	} else if !ok {
 		return SendResult{}, ErrConversationAccess
+	}
+
+	// Enforce block rules for async path as well
+	if blocked, blocker, err := s.checkBlockedRecipients(ctx, s.db, userID, conversationID); err != nil {
+		return SendResult{}, err
+	} else if blocked {
+		return SendResult{}, fmt.Errorf("blocked_by:%s", blocker)
 	}
 
 	cached, cachedStatus, err := s.loadIdempotency(ctx, userID, endpoint, idemKey)
@@ -134,7 +409,7 @@ func (s *Service) sendAsync(ctx context.Context, userID, conversationID, idemKey
 		return SendResult{Message: *cached}, nil
 	}
 
-	evt := NewIngressEvent(userID, conversationID, endpoint, idemKey, contentType, transportIntent, phoneE164, traceID, content)
+	evt := NewIngressEvent(userID, conversationID, endpoint, idemKey, contentType, transportIntent, phoneE164, clientGeneratedID, traceID, content)
 	provisional := evt.ProvisionalMessage()
 
 	if err := s.upsertIdempotency(ctx, userID, endpoint, idemKey, provisional, 202); err != nil {
@@ -157,15 +432,16 @@ func (s *Service) sendAsync(ctx context.Context, userID, conversationID, idemKey
 	}
 
 	msg := Message{
-		MessageID:      ack.MessageID,
-		ConversationID: ack.ConversationID,
-		SenderUserID:   userID,
-		ContentType:    contentType,
-		Content:        content,
-		Transport:      ack.Transport,
-		ServerOrder:    ack.ServerOrder,
-		Status:         ack.Status,
-		CreatedAt:      time.UnixMilli(ack.PersistedAtMS).UTC().Format(time.RFC3339),
+		MessageID:         ack.MessageID,
+		ConversationID:    ack.ConversationID,
+		SenderUserID:      userID,
+		ContentType:       contentType,
+		Content:           content,
+		ClientGeneratedID: provisional.ClientGeneratedID,
+		Transport:         ack.Transport,
+		ServerOrder:       ack.ServerOrder,
+		Status:            ack.Status,
+		CreatedAt:         time.UnixMilli(ack.PersistedAtMS).UTC().Format(time.RFC3339),
 	}
 	if err := s.upsertIdempotency(ctx, userID, endpoint, idemKey, msg, 201); err != nil {
 		return SendResult{}, err
@@ -194,6 +470,7 @@ func (s *Service) List(ctx context.Context, actor, conversationID string) ([]Mes
 			m.sender_user_id::text,
 			m.content_type,
 			m.content,
+			m.client_generated_id,
 			m.transport,
 			m.server_order,
 			CASE
@@ -231,12 +508,16 @@ func (s *Service) List(ctx context.Context, actor, conversationID string) ([]Mes
 	for rows.Next() {
 		var m Message
 		var contentRaw []byte
+		var clientGenID sql.NullString
 		var status string
 		var created time.Time
-		if err := rows.Scan(&m.MessageID, &m.ConversationID, &m.SenderUserID, &m.ContentType, &contentRaw, &m.Transport, &m.ServerOrder, &status, &created); err != nil {
+		if err := rows.Scan(&m.MessageID, &m.ConversationID, &m.SenderUserID, &m.ContentType, &contentRaw, &clientGenID, &m.Transport, &m.ServerOrder, &status, &created); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal(contentRaw, &m.Content)
+		if clientGenID.Valid {
+			m.ClientGeneratedID = clientGenID.String
+		}
 		if status != "" {
 			m.Status = status
 		}
@@ -244,6 +525,149 @@ func (s *Service) List(ctx context.Context, actor, conversationID string) ([]Mes
 		items = append(items, m)
 	}
 	return items, rows.Err()
+}
+
+// ListUnified returns a merged timeline combining canonical server messages and
+// optional mirrored carrier messages for a conversation. Items are ordered by
+// created_at ascending to preserve display chronology.
+func (s *Service) ListUnified(ctx context.Context, actor, conversationID string, limit int) ([]Message, error) {
+	if ok, err := s.hasMembership(ctx, s.db, actor, conversationID); err != nil {
+		return nil, err
+	} else if !ok {
+		return nil, ErrConversationAccess
+	}
+
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+
+	// load canonical messages (up to limit)
+	rows, err := s.db.Query(ctx, `
+		SELECT
+			m.id::text,
+			m.conversation_id::text,
+			m.sender_user_id::text,
+			m.content_type,
+			m.content,
+			m.client_generated_id,
+			m.transport,
+			m.server_order,
+			m.created_at
+		FROM messages m
+		WHERE m.conversation_id = $1::uuid
+		ORDER BY server_order ASC
+		LIMIT $2
+	`, conversationID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := make([]Message, 0, 32)
+	var messageIDs []string
+	for rows.Next() {
+		var m Message
+		var contentRaw []byte
+		var clientGenID sql.NullString
+		var created time.Time
+		if err := rows.Scan(&m.MessageID, &m.ConversationID, &m.SenderUserID, &m.ContentType, &contentRaw, &clientGenID, &m.Transport, &m.ServerOrder, &created); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal(contentRaw, &m.Content)
+		if clientGenID.Valid {
+			m.ClientGeneratedID = clientGenID.String
+		}
+		m.CreatedAt = created.UTC().Format(time.RFC3339)
+		m.Source = "SERVER"
+		items = append(items, m)
+		messageIDs = append(messageIDs, m.MessageID)
+	}
+
+	// fetch thread keys for this conversation
+	tkRows, err := s.db.Query(ctx, `SELECT value FROM conversation_thread_keys WHERE conversation_id = $1::uuid`, conversationID)
+	if err == nil {
+		defer tkRows.Close()
+		var keys []string
+		for tkRows.Next() {
+			var v string
+			if err := tkRows.Scan(&v); err == nil {
+				keys = append(keys, v)
+			}
+		}
+		// query carrier messages matching thread keys or linked to server messages
+		if len(keys) > 0 || len(messageIDs) > 0 {
+			// build query dynamically
+			query := `SELECT id::text, device_id::text, thread_key, carrier_message_id, direction, transport, text, media_json, created_at, device_authoritative, server_message_id::text, raw_payload FROM carrier_messages WHERE `
+			args := []any{}
+			clauses := []string{}
+			idx := 1
+			if len(keys) > 0 {
+				clauses = append(clauses, "thread_key = ANY($"+fmt.Sprint(idx)+"::text[])")
+				args = append(args, keys)
+				idx++
+			}
+			if len(messageIDs) > 0 {
+				clauses = append(clauses, "server_message_id = ANY($"+fmt.Sprint(idx)+"::uuid[])")
+				args = append(args, messageIDs)
+				idx++
+			}
+			query += "(" + clauses[0]
+			for i := 1; i < len(clauses); i++ {
+				query += " OR " + clauses[i]
+			}
+			query += ") ORDER BY created_at ASC LIMIT $" + fmt.Sprint(idx)
+			args = append(args, limit)
+
+			crows, err := s.db.Query(ctx, query, args...)
+			if err == nil {
+				defer crows.Close()
+				for crows.Next() {
+					var id, deviceID, threadKey, carrierMessageID, direction, transport, text string
+					var mediaJSON []byte
+					var created time.Time
+					var deviceAuth bool
+					var serverMsgID sql.NullString
+					var rawPayload []byte
+					if err := crows.Scan(&id, &deviceID, &threadKey, &carrierMessageID, &direction, &transport, &text, &mediaJSON, &created, &deviceAuth, &serverMsgID, &rawPayload); err != nil {
+						return nil, err
+					}
+					// build content map
+					content := make(map[string]any)
+					if text != "" {
+						content["text"] = text
+					}
+					if len(mediaJSON) > 0 {
+						var mj any
+						_ = json.Unmarshal(mediaJSON, &mj)
+						content["media"] = mj
+					}
+					m := Message{
+						MessageID:      id,
+						ConversationID: conversationID,
+						SenderUserID:   "", // carrier origin does not map to server user
+						ContentType:    "media",
+						Content:        content,
+						Transport:      transport,
+						ServerOrder:    0,
+						CreatedAt:      created.UTC().Format(time.RFC3339),
+						Source:         "CARRIER",
+					}
+					items = append(items, m)
+				}
+			}
+		}
+	}
+
+	// sort by created_at ascending
+	sort.SliceStable(items, func(i, j int) bool {
+		ti, _ := time.Parse(time.RFC3339, items[i].CreatedAt)
+		tj, _ := time.Parse(time.RFC3339, items[j].CreatedAt)
+		return ti.Before(tj)
+	})
+
+	if len(items) > limit {
+		items = items[:limit]
+	}
+	return items, nil
 }
 
 func (s *Service) MarkRead(ctx context.Context, actor, conversationID string, through int64) error {
@@ -354,7 +778,55 @@ func (s *Service) ensurePhoneConversation(ctx context.Context, userID, phoneE164
 	return conversationID, nil
 }
 
-func (s *Service) sendSync(ctx context.Context, userID, conversationID, idemKey, contentType string, content map[string]any) (Message, error) {
+// decideTransport selects the transport for a send operation based on the
+// conversation's transport_policy, the presence of other OHMF identities,
+// and client profiles present in the request context.
+func (s *Service) decideTransport(ctx context.Context, tx pgx.Tx, conversationID, senderUserID string) (string, error) {
+	var policy string
+	if err := tx.QueryRow(ctx, `SELECT transport_policy FROM conversations WHERE id = $1::uuid`, conversationID).Scan(&policy); err != nil {
+		return "", err
+	}
+	switch policy {
+	case "FORCE_OTT":
+		return "OTT", nil
+	case "FORCE_SMS":
+		return "SMS", nil
+	case "FORCE_MMS":
+		return "MMS", nil
+	case "BLOCK_CARRIER_RELAY":
+		// treat as AUTO but disallow RELAY transports (we don't select RELAY here)
+	}
+
+	// AUTO-like decision: if there are other member users in the conversation,
+	// prefer OTT unless policy forces SMS.
+	var otherCount int
+	if err := tx.QueryRow(ctx, `SELECT COUNT(1) FROM conversation_members WHERE conversation_id = $1::uuid AND user_id <> $2::uuid`, conversationID, senderUserID).Scan(&otherCount); err != nil {
+		return "", err
+	}
+	if otherCount > 0 {
+		return "OTT", nil
+	}
+
+	// If no other member users, check for external phone membership (PHONE_DM)
+	var hasExternal int
+	if err := tx.QueryRow(ctx, `SELECT COUNT(1) FROM conversation_external_members WHERE conversation_id = $1::uuid`, conversationID).Scan(&hasExternal); err == nil && hasExternal > 0 {
+		return "SMS", nil
+	}
+
+	// Inspect client profiles from context (e.g., DEFAULT_SMS_HANDLER)
+	if profiles, ok := middleware.ProfilesFromContext(ctx); ok {
+		for _, p := range profiles {
+			if p == "DEFAULT_SMS_HANDLER" {
+				return "SMS", nil
+			}
+		}
+	}
+
+	// Fallback to OTT
+	return "OTT", nil
+}
+
+func (s *Service) sendSync(ctx context.Context, userID, conversationID, idemKey, contentType string, content map[string]any, clientGeneratedID string) (Message, error) {
 	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return Message{}, err
@@ -365,6 +837,13 @@ func (s *Service) sendSync(ctx context.Context, userID, conversationID, idemKey,
 		return Message{}, err
 	} else if !ok {
 		return Message{}, ErrConversationAccess
+	}
+
+	// Enforce block rules: if any other member has blocked the sender, forbid sending.
+	if blocked, blocker, err := s.checkBlockedRecipients(ctx, tx, userID, conversationID); err != nil {
+		return Message{}, err
+	} else if blocked {
+		return Message{}, fmt.Errorf("blocked_by:%s", blocker)
 	}
 
 	var cached []byte
@@ -401,13 +880,19 @@ func (s *Service) sendSync(ctx context.Context, userID, conversationID, idemKey,
 		return Message{}, err
 	}
 
+	// decide transport according to conversation policy and client profiles
+	chosenTransport, err := s.decideTransport(ctx, tx, conversationID, userID)
+	if err != nil {
+		return Message{}, err
+	}
+
 	var msgID string
 	var created time.Time
 	err = tx.QueryRow(ctx, `
-		INSERT INTO messages (conversation_id, sender_user_id, content_type, content, server_order)
-		VALUES ($1::uuid, $2::uuid, $3, $4::jsonb, $5)
+		INSERT INTO messages (conversation_id, sender_user_id, content_type, content, client_generated_id, transport, server_order)
+		VALUES ($1::uuid, $2::uuid, $3, $4::jsonb, $5, $6, $7)
 		RETURNING id::text, created_at
-	`, conversationID, userID, contentType, string(contentJSON), next).Scan(&msgID, &created)
+	`, conversationID, userID, contentType, string(contentJSON), clientGeneratedID, chosenTransport, next).Scan(&msgID, &created)
 	if err != nil {
 		return Message{}, err
 	}
@@ -427,7 +912,8 @@ func (s *Service) sendSync(ctx context.Context, userID, conversationID, idemKey,
 		SenderUserID:   userID,
 		ContentType:    contentType,
 		Content:        content,
-		Transport:      "OTT",
+		ClientGeneratedID: clientGeneratedID,
+		Transport:      chosenTransport,
 		ServerOrder:    next,
 		CreatedAt:      created.UTC().Format(time.RFC3339),
 	}
@@ -448,7 +934,7 @@ func (s *Service) sendSync(ctx context.Context, userID, conversationID, idemKey,
 	return msg, nil
 }
 
-func (s *Service) sendToPhoneSync(ctx context.Context, userID, phoneE164, idemKey, contentType string, content map[string]any) (Message, error) {
+func (s *Service) sendToPhoneSync(ctx context.Context, userID, phoneE164, idemKey, contentType string, content map[string]any, clientGeneratedID string) (Message, error) {
 	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return Message{}, err
@@ -458,6 +944,13 @@ func (s *Service) sendToPhoneSync(ctx context.Context, userID, phoneE164, idemKe
 	conversationID, err := s.findOrCreatePhoneConversation(ctx, tx, userID, phoneE164)
 	if err != nil {
 		return Message{}, err
+	}
+
+	// Enforce block rules: if the (user) target has blocked sender, forbid send
+	if blocked, blocker, err := s.checkBlockedRecipients(ctx, tx, userID, conversationID); err != nil {
+		return Message{}, err
+	} else if blocked {
+		return Message{}, fmt.Errorf("blocked_by:%s", blocker)
 	}
 
 	var cached []byte
@@ -497,10 +990,10 @@ func (s *Service) sendToPhoneSync(ctx context.Context, userID, phoneE164, idemKe
 	var msgID string
 	var created time.Time
 	err = tx.QueryRow(ctx, `
-		INSERT INTO messages (conversation_id, sender_user_id, content_type, content, transport, server_order)
-		VALUES ($1::uuid, $2::uuid, $3, $4::jsonb, 'SMS', $5)
+		INSERT INTO messages (conversation_id, sender_user_id, content_type, content, client_generated_id, transport, server_order)
+		VALUES ($1::uuid, $2::uuid, $3, $4::jsonb, $5, 'SMS', $6)
 		RETURNING id::text, created_at
-	`, conversationID, userID, contentType, string(contentJSON), next).Scan(&msgID, &created)
+	`, conversationID, userID, contentType, string(contentJSON), clientGeneratedID, next).Scan(&msgID, &created)
 	if err != nil {
 		return Message{}, err
 	}
@@ -520,6 +1013,7 @@ func (s *Service) sendToPhoneSync(ctx context.Context, userID, phoneE164, idemKe
 		SenderUserID:   userID,
 		ContentType:    contentType,
 		Content:        content,
+		ClientGeneratedID: clientGeneratedID,
 		Transport:      "SMS",
 		ServerOrder:    next,
 		CreatedAt:      created.UTC().Format(time.RFC3339),
@@ -543,6 +1037,7 @@ func (s *Service) sendToPhoneSync(ctx context.Context, userID, phoneE164, idemKe
 
 type querier interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
+	Query(context.Context, string, ...any) (pgx.Rows, error)
 }
 
 func (s *Service) hasMembership(ctx context.Context, q querier, userID, conversationID string) (bool, error) {
@@ -559,6 +1054,38 @@ func (s *Service) hasMembership(ctx context.Context, q querier, userID, conversa
 		return false, err
 	}
 	return true, nil
+}
+
+// checkBlockedRecipients returns true and the blocking user id if any member of the
+// conversation has blocked the sender.
+func (s *Service) checkBlockedRecipients(ctx context.Context, q querier, senderUserID, conversationID string) (bool, string, error) {
+	// iterate all other members and check user_blocks
+	rows2, err := q.Query(ctx, `SELECT user_id::text FROM conversation_members WHERE conversation_id = $1::uuid AND user_id <> $2::uuid`, conversationID, senderUserID)
+	if err != nil {
+		return false, "", err
+	}
+	defer rows2.Close()
+	for rows2.Next() {
+		var uid string
+		if err := rows2.Scan(&uid); err != nil {
+			return false, "", err
+		}
+		var one int
+		err := q.QueryRow(ctx, `SELECT 1 FROM user_blocks WHERE blocker_user_id = $1::uuid AND blocked_user_id = $2::uuid`, uid, senderUserID).Scan(&one)
+		if err == nil {
+			return true, uid, nil
+		}
+		if err != nil && err != pgx.ErrNoRows {
+			return false, "", err
+		}
+	}
+	return false, "", nil
+}
+
+// IsMember checks whether a user is a member of a conversation using the
+// service's configured DB pool.
+func (s *Service) IsMember(ctx context.Context, userID, conversationID string) (bool, error) {
+	return s.hasMembership(ctx, s.db, userID, conversationID)
 }
 
 func (s *Service) findOrCreatePhoneConversation(ctx context.Context, tx pgx.Tx, userID, phoneE164 string) (string, error) {

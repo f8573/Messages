@@ -1,0 +1,23 @@
+{
+  "app_id": "com.example.eightball",
+  "name": "EightBall",
+  "version": "1.0.0",
+  "entrypoint": {
+    "type": "url",
+    "url": "https://example.com/miniapps/eightball/index.html",
+    "mime_type": "text/html"
+  },
+  "icons": [
+    { "src": "https://example.com/miniapps/eightball/icon-128.png", "sizes": "128x128", "type": "image/png" }
+  ],
+  "permissions": ["network","vibrate"],
+  "capabilities": {
+    "ui": { "dialogs": true },
+    "storage": { "quota": "5MB" }
+  },
+  "signature": {
+    "alg": "RS256",
+    "kid": "registry-key-1",
+    "sig": "MEUCIQDnExampleSignatureBase64..."
+  }
+}

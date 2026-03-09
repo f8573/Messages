@@ -36,6 +36,16 @@ type Config struct {
 	CassandraUsername      string
 	CassandraPassword      string
 	CassandraConsistency   string
+	SupportedProfiles      string
+	ClaimAndroidCarrier    bool
+	DiscoveryPepper        string
+	// Optional headers for API deprecation and sunset information.
+	// When non-empty these values will be emitted as `Deprecation` and
+	// `Sunset` response headers by the API versioning middleware.
+	APIDeprecation string
+	APISunset      string
+	// Optional PEM-encoded RSA public key for verifying mini-app manifests.
+	MiniappPublicKeyPEM string
 }
 
 func Load() Config {
@@ -69,6 +79,12 @@ func Load() Config {
 		CassandraUsername:      get("APP_CASSANDRA_USERNAME", ""),
 		CassandraPassword:      get("APP_CASSANDRA_PASSWORD", ""),
 		CassandraConsistency:   get("APP_CASSANDRA_CONSISTENCY", "quorum"),
+		SupportedProfiles:      get("APP_SUPPORTED_PROFILES", "CORE_OTT"),
+		ClaimAndroidCarrier:    getBool("APP_CLAIM_ANDROID_CARRIER", false),
+		DiscoveryPepper:        get("APP_DISCOVERY_PEPPER", ""),
+		APIDeprecation:         get("APP_API_DEPRECATION", ""),
+		APISunset:              get("APP_API_SUNSET", ""),
+		MiniappPublicKeyPEM:   get("APP_MINIAPP_PUBLIC_KEY_PEM", ""),
 	}
 }
 

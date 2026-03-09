@@ -16,6 +16,7 @@ type Conversation struct {
 	Participants   []string `json:"participants"`
 	ExternalPhones []string `json:"external_phones,omitempty"`
 	UpdatedAt      string   `json:"updated_at"`
+	ThreadKeys     []map[string]string `json:"thread_keys,omitempty"`
 }
 
 var ErrNotFound = errors.New("conversation_not_found")
@@ -132,17 +133,24 @@ func (s *Service) FindOrCreatePhoneDM(ctx context.Context, actor, phoneE164 stri
 	return s.Get(ctx, actor, conversationID)
 }
 
-func (s *Service) List(ctx context.Context, actor string) ([]Conversation, error) {
-	rows, err := s.db.Query(ctx, `
+// List returns up to `limit` conversations for the actor, ordered by updated_at
+// Desc; it also returns a nextCursor string (empty when no further pages).
+func (s *Service) List(ctx context.Context, actor string, limit int) ([]Conversation, string, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	// fetch one extra row to detect whether more pages exist
+	q := `
 		SELECT c.id::text, c.type, c.updated_at
 		FROM conversations c
 		JOIN conversation_members cm ON cm.conversation_id = c.id
 		WHERE cm.user_id = $1::uuid
 		ORDER BY c.updated_at DESC
-		LIMIT 100
-	`, actor)
+		LIMIT $2
+	`
+	rows, err := s.db.Query(ctx, q, actor, limit+1)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer rows.Close()
 
@@ -151,15 +159,31 @@ func (s *Service) List(ctx context.Context, actor string) ([]Conversation, error
 		var id, typ string
 		var updated time.Time
 		if err := rows.Scan(&id, &typ, &updated); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		parts, externalPhones, err := s.participants(ctx, id)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
-		out = append(out, Conversation{ConversationID: id, Type: typ, Participants: parts, ExternalPhones: externalPhones, UpdatedAt: updated.UTC().Format(time.RFC3339)})
+		tkeys, err := s.threadKeys(ctx, id)
+		if err != nil {
+			return nil, "", err
+		}
+		out = append(out, Conversation{ConversationID: id, Type: typ, Participants: parts, ExternalPhones: externalPhones, UpdatedAt: updated.UTC().Format(time.RFC3339), ThreadKeys: tkeys})
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, "", err
+	}
+
+	// if we fetched more than limit, compute cursor from the (limit)th item
+	if len(out) > limit {
+		// there is at least one more page; produce cursor from the last returned item's UpdatedAt
+		last := out[limit-1]
+		// trim to limit
+		out = out[:limit]
+		return out, last.UpdatedAt, nil
+	}
+	return out, "", nil
 }
 
 func (s *Service) Get(ctx context.Context, actor, id string) (Conversation, error) {
@@ -181,7 +205,103 @@ func (s *Service) Get(ctx context.Context, actor, id string) (Conversation, erro
 	if err != nil {
 		return Conversation{}, err
 	}
-	return Conversation{ConversationID: id, Type: typ, Participants: parts, ExternalPhones: externalPhones, UpdatedAt: updated.UTC().Format(time.RFC3339)}, nil
+	tkeys, err := s.threadKeys(ctx, id)
+	if err != nil {
+		return Conversation{}, err
+	}
+	return Conversation{ConversationID: id, Type: typ, Participants: parts, ExternalPhones: externalPhones, UpdatedAt: updated.UTC().Format(time.RFC3339), ThreadKeys: tkeys}, nil
+}
+
+// threadKeys returns a slice of thread key maps like {"kind":"...","value":"..."}
+func (s *Service) threadKeys(ctx context.Context, conversationID string) ([]map[string]string, error) {
+	rows, err := s.db.Query(ctx, `SELECT kind, value FROM conversation_thread_keys WHERE conversation_id = $1::uuid ORDER BY created_at`, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]map[string]string, 0)
+	for rows.Next() {
+		var kind, value string
+		if err := rows.Scan(&kind, &value); err != nil {
+			return nil, err
+		}
+		out = append(out, map[string]string{"kind": kind, "value": value})
+	}
+	return out, rows.Err()
+}
+
+// SetThreadKeys upserts thread keys for a conversation. Actor must be a member.
+func (s *Service) SetThreadKeys(ctx context.Context, actor, conversationID string, keys []map[string]string) error {
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var exists bool
+	err = tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM conversation_members WHERE conversation_id = $1::uuid AND user_id = $2::uuid)`, conversationID, actor).Scan(&exists)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return ErrNotFound
+	}
+
+	// delete existing keys for this conversation
+	if _, err := tx.Exec(ctx, `DELETE FROM conversation_thread_keys WHERE conversation_id = $1::uuid`, conversationID); err != nil {
+		return err
+	}
+	// insert provided keys
+	for _, k := range keys {
+		kind := k["kind"]
+		value := k["value"]
+		if kind == "" || value == "" {
+			continue
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO conversation_thread_keys (conversation_id, kind, value) VALUES ($1::uuid, $2, $3)`, conversationID, kind, value); err != nil {
+			return err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Service) UpdateTransportPolicy(ctx context.Context, actor, conversationID, policy string) (Conversation, error) {
+	// validate policy
+	switch policy {
+	case "AUTO", "FORCE_OTT", "FORCE_SMS", "FORCE_MMS", "BLOCK_CARRIER_RELAY":
+		// ok
+	default:
+		return Conversation{}, errors.New("invalid_transport_policy")
+	}
+
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return Conversation{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	// check membership
+	var exists bool
+	err = tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM conversation_members WHERE conversation_id = $1::uuid AND user_id = $2::uuid)`, conversationID, actor).Scan(&exists)
+	if err != nil {
+		return Conversation{}, err
+	}
+	if !exists {
+		return Conversation{}, ErrNotFound
+	}
+
+	_, err = tx.Exec(ctx, `UPDATE conversations SET transport_policy = $2, updated_at = now() WHERE id = $1::uuid`, conversationID, policy)
+	if err != nil {
+		return Conversation{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Conversation{}, err
+	}
+	return s.Get(ctx, actor, conversationID)
 }
 
 func (s *Service) participants(ctx context.Context, conversationID string) ([]string, []string, error) {

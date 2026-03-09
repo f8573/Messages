@@ -15,6 +15,7 @@ import (
 	"ohmf/services/gateway/internal/limit"
 	"ohmf/services/gateway/internal/messages"
 	"ohmf/services/gateway/internal/token"
+	appmw "ohmf/services/gateway/internal/middleware"
 )
 
 const presenceTTL = 90 * time.Second
@@ -163,6 +164,30 @@ func (h *Handler) readLoop(c *client, ip string) {
 			continue
 		}
 		switch env.Event {
+		// Support legacy/spec alias: "subscribe" maps to presence_subscribe
+		case "subscribe":
+			var raw interface{}
+			if err := json.Unmarshal(env.Data, &raw); err != nil {
+				h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": "invalid subscribe payload"})
+				continue
+			}
+			if err := appmw.ValidateData("ws-subscribe", raw); err != nil {
+				h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": err.Error()})
+				continue
+			}
+			var req presenceSubscribePayload
+			if err := json.Unmarshal(env.Data, &req); err != nil {
+				h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": "invalid subscribe payload"})
+				continue
+			}
+			for _, convID := range req.ConversationIDs {
+				if convID == "" {
+					continue
+				}
+				_ = h.redis.Set(context.Background(), "presence:conv:"+convID+":user:"+c.userID, "1", presenceTTL).Err()
+			}
+			h.sendJSON(c, "subscribe_ack", map[string]any{"status": "ok", "conversation_ids": req.ConversationIDs})
+
 		case "auth":
 			h.sendJSON(c, "auth", map[string]any{"status": "ok", "user_id": c.userID})
 		case "send_message":
@@ -170,12 +195,22 @@ func (h *Handler) readLoop(c *client, ip string) {
 				h.sendJSON(c, "error", map[string]any{"code": "ws_send_disabled", "message": "ws send disabled"})
 				continue
 			}
+			// validate payload against schema
+			var raw interface{}
+			if err := json.Unmarshal(env.Data, &raw); err != nil {
+				h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": "invalid send_message payload"})
+				continue
+			}
+			if err := appmw.ValidateData("ws-send_message", raw); err != nil {
+				h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": err.Error()})
+				continue
+			}
 			var req sendMessagePayload
 			if err := json.Unmarshal(env.Data, &req); err != nil {
 				h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": "invalid send_message payload"})
 				continue
 			}
-			result, err := h.messages.Send(context.Background(), c.userID, req.ConversationID, req.IdempotencyKey, req.ContentType, req.Content, "ws-"+time.Now().UTC().Format(time.RFC3339Nano), ip)
+			result, err := h.messages.Send(context.Background(), c.userID, req.ConversationID, req.IdempotencyKey, req.ContentType, req.Content, req.ClientGeneratedID, "ws-"+time.Now().UTC().Format(time.RFC3339Nano), ip)
 			if err != nil {
 				h.sendJSON(c, "error", map[string]any{"code": "send_failed", "message": err.Error()})
 				continue
@@ -189,6 +224,15 @@ func (h *Handler) readLoop(c *client, ip string) {
 				"ack_timeout_ms":  result.AckTimeoutMS,
 			})
 		case "presence_subscribe":
+			var raw interface{}
+			if err := json.Unmarshal(env.Data, &raw); err != nil {
+				h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": "invalid presence_subscribe payload"})
+				continue
+			}
+			if err := appmw.ValidateData("ws-subscribe", raw); err != nil {
+				h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": err.Error()})
+				continue
+			}
 			var req presenceSubscribePayload
 			if err := json.Unmarshal(env.Data, &req); err != nil {
 				h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": "invalid presence_subscribe payload"})
@@ -201,6 +245,88 @@ func (h *Handler) readLoop(c *client, ip string) {
 				_ = h.redis.Set(context.Background(), "presence:conv:"+convID+":user:"+c.userID, "1", presenceTTL).Err()
 			}
 			h.sendJSON(c, "presence_update", map[string]any{"status": "online", "user_id": c.userID})
+
+		case "resync":
+			// Minimal resync acknowledgement: clients may request a resync cursor
+			// for a conversation after reconnect. Full resync requires fetching
+			// missing events/messages which is out of scope for this lightweight
+			// handler; respond with an ack so clients can fallback to REST sync.
+			var payload map[string]any
+			if err := json.Unmarshal(env.Data, &payload); err != nil {
+				h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": "invalid resync payload"})
+				continue
+			}
+			// echo back any conversation ids provided
+			conv, _ := payload["conversation_id"]
+			h.sendJSON(c, "resync_ack", map[string]any{"conversation_id": conv})
+
+		case "typing.started":
+			var p struct{ ConversationID string `json:"conversation_id"` }
+			if err := json.Unmarshal(env.Data, &p); err != nil {
+				h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": "invalid typing payload"})
+				continue
+			}
+			if p.ConversationID == "" {
+				h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": "conversation_id required"})
+				continue
+			}
+			// ensure actor is a member
+			if ok, err := h.messages.IsMember(context.Background(), c.userID, p.ConversationID); err != nil || !ok {
+				if err != nil {
+					h.sendJSON(c, "error", map[string]any{"code": "server_error", "message": "membership_check_failed"})
+				} else {
+					h.sendJSON(c, "error", map[string]any{"code": "forbidden", "message": "not a member"})
+				}
+				continue
+			}
+			// set ephemeral typing key and publish
+			if h.redis != nil {
+				_ = h.redis.Set(context.Background(), "typing:conv:"+p.ConversationID+":user:"+c.userID, "1", 5*time.Second).Err()
+				_ = h.redis.Publish(context.Background(), "typing:conv:"+p.ConversationID, map[string]any{"type": "typing.started", "conversation_id": p.ConversationID, "user_id": c.userID}).Err()
+			}
+			// local fanout to connected members
+			h.mu.RLock()
+			for uid, bucket := range h.clients {
+				if uid == c.userID {
+					continue
+				}
+				// check membership for recipient
+				if ok, _ := h.messages.IsMember(context.Background(), uid, p.ConversationID); !ok {
+					continue
+				}
+				for cli := range bucket {
+					h.sendJSON(cli, "typing.started", map[string]any{"conversation_id": p.ConversationID, "user_id": c.userID})
+				}
+			}
+			h.mu.RUnlock()
+
+		case "typing.stopped":
+			var p struct{ ConversationID string `json:"conversation_id"` }
+			if err := json.Unmarshal(env.Data, &p); err != nil {
+				h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": "invalid typing payload"})
+				continue
+			}
+			if p.ConversationID == "" {
+				h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": "conversation_id required"})
+				continue
+			}
+			if h.redis != nil {
+				_ = h.redis.Del(context.Background(), "typing:conv:"+p.ConversationID+":user:"+c.userID).Err()
+				_ = h.redis.Publish(context.Background(), "typing:conv:"+p.ConversationID, map[string]any{"type": "typing.stopped", "conversation_id": p.ConversationID, "user_id": c.userID}).Err()
+			}
+			h.mu.RLock()
+			for uid, bucket := range h.clients {
+				if uid == c.userID {
+					continue
+				}
+				if ok, _ := h.messages.IsMember(context.Background(), uid, p.ConversationID); !ok {
+					continue
+				}
+				for cli := range bucket {
+					h.sendJSON(cli, "typing.stopped", map[string]any{"conversation_id": p.ConversationID, "user_id": c.userID})
+				}
+			}
+			h.mu.RUnlock()
 		default:
 			h.sendJSON(c, "error", map[string]any{"code": "unsupported_event", "message": env.Event})
 		}
