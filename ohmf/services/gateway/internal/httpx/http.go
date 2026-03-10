@@ -19,6 +19,8 @@ func WriteJSON(w http.ResponseWriter, code int, payload any) {
 }
 
 func WriteError(w http.ResponseWriter, r *http.Request, status int, code, message string, details map[string]any) {
+	// chi middleware sets header `X-Request-ID` (capitalization may vary).
+	// HTTP headers are case-insensitive; we accept `X-Request-ID`/`X-Request-Id`.
 	reqID := r.Header.Get("X-Request-Id")
 	WriteJSON(w, status, ErrorEnvelope{
 		Code:      code,

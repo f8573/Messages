@@ -20,9 +20,27 @@ func UserIDFromContext(ctx context.Context) (string, bool) {
 	return v, ok
 }
 
+// WithUserID returns a new context with the provided user id set. This is
+// convenient for tests to simulate an authenticated request.
+func WithUserID(ctx context.Context, userID string) context.Context {
+	return context.WithValue(ctx, userIDKey, userID)
+}
+
 func ProfilesFromContext(ctx context.Context) ([]string, bool) {
 	v, ok := ctx.Value(userProfilesKey).([]string)
 	return v, ok
+}
+
+// HasProfile reports whether the context contains the given profile.
+func HasProfile(ctx context.Context, profile string) bool {
+	if ps, ok := ProfilesFromContext(ctx); ok {
+		for _, p := range ps {
+			if p == profile {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func RequireAuth(tokens *token.Service) func(http.Handler) http.Handler {
