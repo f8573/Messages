@@ -37,4 +37,27 @@ jobs:
           go list -m all || true
       - name: Run go tests
         run: |
-          go test ./... -v
+          set -euo pipefail
+          mods="$(find . -name go.mod -not -path './ohmf/.tools/*' -print | sort)"
+          if [ -z "$mods" ]; then
+            echo "No go.mod files found; skipping."
+            exit 0
+          fi
+
+          ran_any=0
+          while IFS= read -r mod; do
+            dir="$(dirname "$mod")"
+            echo "== Testing module: $dir =="
+            pkgs="$(cd "$dir" && go list ./... 2>/dev/null || true)"
+            if [ -z "$pkgs" ]; then
+              echo "No Go packages in $dir; skipping."
+              continue
+            fi
+
+            ran_any=1
+            (cd "$dir" && go test ./... -v)
+          done <<< "$mods"
+
+          if [ "$ran_any" -eq 0 ]; then
+            echo "No Go packages found in any module; skipping."
+          fi
