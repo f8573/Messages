@@ -1,6 +1,6 @@
 module validate_openapi
 
-go 1.22
+go 1.22.5
 
 require github.com/getkin/kin-openapi v0.133.0
 
