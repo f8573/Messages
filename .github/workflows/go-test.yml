@@ -15,6 +15,18 @@ jobs:
         uses: actions/setup-go@v4
         with:
           go-version: '1.25'
+      - name: Diagnostic
+        run: |
+          echo "CWD: $(pwd)"
+          echo "=== ls -la ==="
+          ls -la
+          echo "=== ls -R (truncated) ==="
+          ls -R . | sed -n '1,200p' || true
+          echo "=== go version / env ==="
+          go version || true
+          go env || true
+          echo "=== openapi file check ==="
+          ls -l ohmf/packages/protocol/openapi/openapi.yaml || true
       - name: Run go tests
         run: |
           go test ./... -v
