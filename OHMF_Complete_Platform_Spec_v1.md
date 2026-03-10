@@ -144,6 +144,12 @@ A conversation timeline MUST be modeled independently from the transport used to
 
 Android SMS/MMS state MUST be device-local authoritative. Server state MUST NOT overwrite telephony provider truth.
 
+### Clarification — carrier mirror and reconciliation
+
+The server MAY maintain an optional mirrored store of carrier-origin messages (for example, a `carrier_messages` table) that is explicitly marked as device-authoritative. Mirror records represent the telephony provider's view and MUST be treated as read-only authoritative representations of carrier-origin data. The server MUST NOT overwrite carrier-origin fields such as `created_at`, `raw_payload`, or delivery metadata based solely on server-originated messages.
+
+A `server_message_id` field MAY be used to record a link between a server-originated message and a carrier mirror entry for reconciliation or user-facing correlation. Setting `server_message_id` MUST be explicit, idempotent, and logged; it MUST NOT be used to change carrier-origin authoritative fields without a documented confirmation flow (for example, device confirmation or an administrative reconciliation action). Any code paths that reconcile or modify carrier mirror records SHOULD require elevated privileges or a clear audit trail to prevent accidental overwrites of telephony provider truth.
+
 ## 3.3 Deterministic ordering
 
 Every canonical conversation MUST maintain a monotonic ordering key for replay, sync, and deletion reconciliation.

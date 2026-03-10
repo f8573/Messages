@@ -55,6 +55,29 @@ components:
       properties:
         access_token: { type: string }
         refresh_token: { type: string }
+    VerifyPhoneResponse:
+      type: object
+      required: [user, device, tokens]
+      properties:
+        user:
+          type: object
+          required: [user_id]
+          properties:
+            user_id: { type: string }
+            primary_phone_e164: { type: string }
+        device:
+          type: object
+          required: [device_id]
+          properties:
+            device_id: { type: string }
+            platform: { type: string }
+        tokens:
+          $ref: '#/components/schemas/TokenPair'
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token: { type: string }
     CreateConversationRequest:
       type: object
       required: [type, participants]
@@ -97,7 +120,10 @@ components:
       properties:
         message_id: { type: string }
         server_order: { type: integer }
-        transport: { type: string, enum: [OHMF] }
+        transport:
+          type: string
+          enum: [OHMF]
+          description: "API-facing transport value; handler normalizes internal transport names (e.g. OTT) to this API enum (OHMF)."
         status: { $ref: '#/components/schemas/OHMFDeliveryStatus' }
         queued: { type: boolean }
         ack_timeout_ms: { type: integer, nullable: true }
@@ -112,11 +138,51 @@ components:
         status: { $ref: '#/components/schemas/SMSDeliveryStatus' }
         queued: { type: boolean }
         ack_timeout_ms: { type: integer, nullable: true }
+    CarrierMessage:
+      type: object
+      properties:
+        id: { type: string }
+        device_id: { type: string }
+        thread_key: { type: string }
+        carrier_message_id: { type: string }
+        direction: { type: string }
+        transport: { type: string }
+        text: { type: string }
+        media_json:
+          type: object
+          additionalProperties: true
+        created_at:
+          type: string
+          format: date-time
+        device_authoritative: { type: boolean }
+        server_message_id:
+          type: string
+          nullable: true
+        raw_payload:
+          type: object
+          additionalProperties: true
+    CarrierLinkRequest:
+      type: object
+      required: [server_message_id]
+      properties:
+        server_message_id: { type: string }
+    CarrierMessageLinkAudit:
+      type: object
+      properties:
+        id: { type: string }
+        carrier_message_id: { type: string }
+        server_message_id: { type: string, nullable: true }
+        set_at:
+          type: string
+          format: date-time
+        actor: { type: string }
 security:
   - bearerAuth: []
 paths:
   /v1/auth/phone/start:
     post:
+      summary: Start phone verification (send OTP)
+      operationId: StartPhoneVerification
       security: []
       requestBody:
         required: true
@@ -131,6 +197,8 @@ paths:
               schema: { $ref: '#/components/schemas/PhoneStartResponse' }
   /v1/auth/phone/verify:
     post:
+      summary: Verify phone OTP and create device session
+      operationId: VerifyPhoneOTP
       security: []
       requestBody:
         required: true
@@ -140,17 +208,117 @@ paths:
       responses:
         '200':
           description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VerifyPhoneResponse' }
   /v1/auth/refresh:
     post:
+      summary: Refresh access and refresh tokens using a refresh token
+      operationId: RefreshToken
       security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefreshRequest' }
       responses:
         '200':
           description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenPair' }
   /v1/auth/logout:
     post:
+      summary: Logout current device/session
+      operationId: Logout
       responses:
         '204':
           description: No Content
+  /v1/carrier/messages/{id}/link:
+    post:
+      summary: Link a carrier message to a server message
+      operationId: LinkCarrierMessage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CarrierLinkRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CarrierMessage' }
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+  /v1/carrier/messages/{id}/links:
+    get:
+      summary: List link audit entries for a carrier message
+      operationId: ListCarrierMessageLinks
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  links:
+                    type: array
+                    items: { $ref: '#/components/schemas/CarrierMessageLinkAudit' }
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+  /v1/admin/carrier_message_links:
+    get:
+      summary: Admin search for carrier message link audit entries
+      operationId: AdminListCarrierMessageLinks
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: actor
+          description: Filter audit entries by actor identity (exact match)
+          schema: { type: string }
+        - in: query
+          name: limit
+          description: Maximum number of audit entries to return (default server-side limit applies)
+          schema: { type: integer }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  links:
+                    type: array
+                    items: { $ref: '#/components/schemas/CarrierMessageLinkAudit' }
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
   /v1/conversations:
     post:
       requestBody:

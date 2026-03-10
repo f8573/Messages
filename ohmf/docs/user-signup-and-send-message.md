@@ -10,6 +10,8 @@ This guide walks through a real API flow:
 - API is running at `http://localhost:18080`
 - Docker stack is up
 
+Note: the examples in this guide assume you're running the Docker development stack, which maps host port `18080` to the gateway container's `8080`. If you run the gateway binary directly (without Docker) it defaults to listening on `:8080` — adjust the examples accordingly.
+
 ```powershell
 docker compose -f C:\Users\James\Downloads\Messages\ohmf\infra\docker\docker-compose.yml up -d --build
 ```
