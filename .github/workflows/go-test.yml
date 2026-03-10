@@ -27,6 +27,14 @@ jobs:
           go env || true
           echo "=== openapi file check ==="
           ls -l ohmf/packages/protocol/openapi/openapi.yaml || true
+      - name: Repo module diagnostics
+        run: |
+          echo "=== repo go files and modules ==="
+          find . -maxdepth 4 -name go.mod -print || true
+          echo "=== go env GOMOD ==="
+          go env GOMOD || true
+          echo "=== list modules (if any) ==="
+          go list -m all || true
       - name: Run go tests
         run: |
           go test ./... -v
