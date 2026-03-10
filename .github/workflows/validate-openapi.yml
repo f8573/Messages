@@ -34,4 +34,6 @@ jobs:
           (cd tools/validate_openapi && go mod tidy -v) || true
           (cd tools/validate_openapi && go list -m all) || true
       - name: Run OpenAPI validator
-        run: go run tools/validate_openapi/main.go
+        run: |
+          cd tools/validate_openapi
+          go run .
