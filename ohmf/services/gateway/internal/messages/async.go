@@ -107,34 +107,34 @@ func NewIngressEvent(userID, conversationID, endpoint, idemKey, contentType, tra
 		traceID = uuid.NewString()
 	}
 	return IngressEvent{
-		EventID:         uuid.NewString(),
-		MessageID:       uuid.NewString(),
-		ConversationID:  conversationID,
-		SenderUserID:    userID,
-		IdempotencyKey:  idemKey,
-		Endpoint:        endpoint,
+		EventID:           uuid.NewString(),
+		MessageID:         uuid.NewString(),
+		ConversationID:    conversationID,
+		SenderUserID:      userID,
+		IdempotencyKey:    idemKey,
+		Endpoint:          endpoint,
 		ClientGeneratedID: clientGeneratedID,
-		ContentType:     contentType,
-		Content:         content,
-		TransportIntent: transportIntent,
-		RecipientPhone:  recipientPhone,
-		SentAtMS:        time.Now().UTC().UnixMilli(),
-		TraceID:         traceID,
+		ContentType:       contentType,
+		Content:           content,
+		TransportIntent:   transportIntent,
+		RecipientPhone:    recipientPhone,
+		SentAtMS:          time.Now().UTC().UnixMilli(),
+		TraceID:           traceID,
 	}
 }
 
 func (e IngressEvent) ProvisionalMessage() Message {
 	return Message{
-		MessageID:      e.MessageID,
-		ConversationID: e.ConversationID,
-		SenderUserID:   e.SenderUserID,
-		ContentType:    e.ContentType,
-		Content:        e.Content,
-		Transport:      e.TransportIntent,
+		MessageID:         e.MessageID,
+		ConversationID:    e.ConversationID,
+		SenderUserID:      e.SenderUserID,
+		ContentType:       e.ContentType,
+		Content:           e.Content,
+		Transport:         e.TransportIntent,
 		ClientGeneratedID: e.ClientGeneratedID,
-		ServerOrder:    0,
-		Status:         "QUEUED",
-		CreatedAt:      time.UnixMilli(e.SentAtMS).UTC().Format(time.RFC3339),
+		ServerOrder:       0,
+		Status:            "QUEUED",
+		CreatedAt:         time.UnixMilli(e.SentAtMS).UTC().Format(time.RFC3339),
 	}
 }
 
