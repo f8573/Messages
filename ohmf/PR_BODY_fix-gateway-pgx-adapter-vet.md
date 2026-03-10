@@ -68,3 +68,4 @@ Reviewer notes
 - The core behavior of the carrier service is unchanged; these edits are
   interface/adaptor adjustments and test shims to maintain compatibility with
   `pgxmock` and to satisfy static analysis (`go vet`).
+\nCI rerun: 2026-03-10T01:06:32.5193256-05:00
