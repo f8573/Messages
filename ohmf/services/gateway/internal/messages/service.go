@@ -17,17 +17,17 @@ import (
 )
 
 type Message struct {
-	MessageID      string         `json:"message_id"`
-	ConversationID string         `json:"conversation_id"`
-	SenderUserID   string         `json:"sender_user_id"`
-	ContentType    string         `json:"content_type"`
-	Content        map[string]any `json:"content"`
-	ClientGeneratedID string      `json:"client_generated_id,omitempty"`
-	Transport      string         `json:"transport"`
-	ServerOrder    int64          `json:"server_order"`
-	Status         string         `json:"status,omitempty"`
-	CreatedAt      string         `json:"created_at"`
-	Source         string         `json:"source,omitempty"`
+	MessageID         string         `json:"message_id"`
+	ConversationID    string         `json:"conversation_id"`
+	SenderUserID      string         `json:"sender_user_id"`
+	ContentType       string         `json:"content_type"`
+	Content           map[string]any `json:"content"`
+	ClientGeneratedID string         `json:"client_generated_id,omitempty"`
+	Transport         string         `json:"transport"`
+	ServerOrder       int64          `json:"server_order"`
+	Status            string         `json:"status,omitempty"`
+	CreatedAt         string         `json:"created_at"`
+	Source            string         `json:"source,omitempty"`
 }
 
 type SendResult struct {
@@ -907,15 +907,15 @@ func (s *Service) sendSync(ctx context.Context, userID, conversationID, idemKey,
 	}
 
 	msg := Message{
-		MessageID:      msgID,
-		ConversationID: conversationID,
-		SenderUserID:   userID,
-		ContentType:    contentType,
-		Content:        content,
+		MessageID:         msgID,
+		ConversationID:    conversationID,
+		SenderUserID:      userID,
+		ContentType:       contentType,
+		Content:           content,
 		ClientGeneratedID: clientGeneratedID,
-		Transport:      chosenTransport,
-		ServerOrder:    next,
-		CreatedAt:      created.UTC().Format(time.RFC3339),
+		Transport:         chosenTransport,
+		ServerOrder:       next,
+		CreatedAt:         created.UTC().Format(time.RFC3339),
 	}
 	msgPayload, _ := json.Marshal(msg)
 	_, err = tx.Exec(ctx, `
@@ -1008,15 +1008,15 @@ func (s *Service) sendToPhoneSync(ctx context.Context, userID, phoneE164, idemKe
 	}
 
 	msg := Message{
-		MessageID:      msgID,
-		ConversationID: conversationID,
-		SenderUserID:   userID,
-		ContentType:    contentType,
-		Content:        content,
+		MessageID:         msgID,
+		ConversationID:    conversationID,
+		SenderUserID:      userID,
+		ContentType:       contentType,
+		Content:           content,
 		ClientGeneratedID: clientGeneratedID,
-		Transport:      "SMS",
-		ServerOrder:    next,
-		CreatedAt:      created.UTC().Format(time.RFC3339),
+		Transport:         "SMS",
+		ServerOrder:       next,
+		CreatedAt:         created.UTC().Format(time.RFC3339),
 	}
 	msgPayload, _ := json.Marshal(msg)
 	_, err = tx.Exec(ctx, `

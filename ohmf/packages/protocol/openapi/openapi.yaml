@@ -235,6 +235,13 @@ paths:
         '204':
           description: No Content
   /v1/carrier/messages/{id}/link:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
     post:
       summary: Link a carrier message to a server message
       operationId: LinkCarrierMessage
@@ -260,6 +267,13 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorEnvelope' }
   /v1/carrier/messages/{id}/links:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
     get:
       summary: List link audit entries for a carrier message
       operationId: ListCarrierMessageLinks

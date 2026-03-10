@@ -11,11 +11,11 @@ import (
 )
 
 type Conversation struct {
-	ConversationID string   `json:"conversation_id"`
-	Type           string   `json:"type"`
-	Participants   []string `json:"participants"`
-	ExternalPhones []string `json:"external_phones,omitempty"`
-	UpdatedAt      string   `json:"updated_at"`
+	ConversationID string              `json:"conversation_id"`
+	Type           string              `json:"type"`
+	Participants   []string            `json:"participants"`
+	ExternalPhones []string            `json:"external_phones,omitempty"`
+	UpdatedAt      string              `json:"updated_at"`
 	ThreadKeys     []map[string]string `json:"thread_keys,omitempty"`
 }
 

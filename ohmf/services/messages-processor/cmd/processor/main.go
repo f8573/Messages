@@ -32,43 +32,43 @@ type config struct {
 }
 
 type ingressEvent struct {
-	EventID         string         `json:"event_id"`
-	MessageID       string         `json:"message_id"`
-	ConversationID  string         `json:"conversation_id"`
-	SenderUserID    string         `json:"sender_user_id"`
-	IdempotencyKey  string         `json:"idempotency_key"`
-	Endpoint        string         `json:"endpoint"`
-	ClientGeneratedID string       `json:"client_generated_id,omitempty"`
-	ContentType     string         `json:"content_type"`
-	Content         map[string]any `json:"content"`
-	TransportIntent string         `json:"transport_intent"`
-	RecipientPhone  string         `json:"recipient_phone"`
-	SentAtMS        int64          `json:"sent_at_ms"`
-	TraceID         string         `json:"trace_id"`
+	EventID           string         `json:"event_id"`
+	MessageID         string         `json:"message_id"`
+	ConversationID    string         `json:"conversation_id"`
+	SenderUserID      string         `json:"sender_user_id"`
+	IdempotencyKey    string         `json:"idempotency_key"`
+	Endpoint          string         `json:"endpoint"`
+	ClientGeneratedID string         `json:"client_generated_id,omitempty"`
+	ContentType       string         `json:"content_type"`
+	Content           map[string]any `json:"content"`
+	TransportIntent   string         `json:"transport_intent"`
+	RecipientPhone    string         `json:"recipient_phone"`
+	SentAtMS          int64          `json:"sent_at_ms"`
+	TraceID           string         `json:"trace_id"`
 }
 
 type persistedEvent struct {
-	EventID         string   `json:"event_id"`
-	MessageID       string   `json:"message_id"`
-	ConversationID  string   `json:"conversation_id"`
-	SenderUserID    string   `json:"sender_user_id"`
-	ServerOrder     int64    `json:"server_order"`
-	Transport       string   `json:"transport"`
-	Status          string   `json:"status"`
-	PersistedAtMS   int64    `json:"persisted_at_ms"`
-	DeliveryTargets []string `json:"delivery_targets"`
-	TraceID         string   `json:"trace_id"`
-	ClientGeneratedID string `json:"client_generated_id,omitempty"`
+	EventID           string   `json:"event_id"`
+	MessageID         string   `json:"message_id"`
+	ConversationID    string   `json:"conversation_id"`
+	SenderUserID      string   `json:"sender_user_id"`
+	ServerOrder       int64    `json:"server_order"`
+	Transport         string   `json:"transport"`
+	Status            string   `json:"status"`
+	PersistedAtMS     int64    `json:"persisted_at_ms"`
+	DeliveryTargets   []string `json:"delivery_targets"`
+	TraceID           string   `json:"trace_id"`
+	ClientGeneratedID string   `json:"client_generated_id,omitempty"`
 }
 
 type ackPayload struct {
-	EventID        string `json:"event_id"`
-	MessageID      string `json:"message_id"`
-	ConversationID string `json:"conversation_id"`
-	ServerOrder    int64  `json:"server_order"`
-	Status         string `json:"status"`
-	Transport      string `json:"transport"`
-	PersistedAtMS  int64  `json:"persisted_at_ms"`
+	EventID           string `json:"event_id"`
+	MessageID         string `json:"message_id"`
+	ConversationID    string `json:"conversation_id"`
+	ServerOrder       int64  `json:"server_order"`
+	Status            string `json:"status"`
+	Transport         string `json:"transport"`
+	PersistedAtMS     int64  `json:"persisted_at_ms"`
 	ClientGeneratedID string `json:"client_generated_id,omitempty"`
 }
 
@@ -239,16 +239,16 @@ func (p *processor) processMessage(ctx context.Context, msg kafka.Message) error
 	}
 
 	payload, _ := json.Marshal(map[string]any{
-		"message_id":         messageID,
-		"conversation_id":    evt.ConversationID,
-		"sender_user_id":     evt.SenderUserID,
-		"content_type":       evt.ContentType,
-		"content":            evt.Content,
+		"message_id":          messageID,
+		"conversation_id":     evt.ConversationID,
+		"sender_user_id":      evt.SenderUserID,
+		"content_type":        evt.ContentType,
+		"content":             evt.Content,
 		"client_generated_id": evt.ClientGeneratedID,
-		"transport":          mapTransport(evt.TransportIntent),
-		"server_order":       serverOrder,
-		"status":             "SENT",
-		"created_at":         persistedAt.Format(time.RFC3339),
+		"transport":           mapTransport(evt.TransportIntent),
+		"server_order":        serverOrder,
+		"status":              "SENT",
+		"created_at":          persistedAt.Format(time.RFC3339),
 	})
 	_, err = tx.Exec(ctx, `
 		INSERT INTO idempotency_keys (actor_user_id, endpoint, key, response_payload, status_code, expires_at)
