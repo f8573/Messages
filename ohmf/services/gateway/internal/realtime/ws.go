@@ -14,8 +14,8 @@ import (
 	"github.com/redis/go-redis/v9"
 	"ohmf/services/gateway/internal/limit"
 	"ohmf/services/gateway/internal/messages"
-	"ohmf/services/gateway/internal/token"
 	appmw "ohmf/services/gateway/internal/middleware"
+	"ohmf/services/gateway/internal/token"
 )
 
 const presenceTTL = 90 * time.Second
@@ -261,7 +261,9 @@ func (h *Handler) readLoop(c *client, ip string) {
 			h.sendJSON(c, "resync_ack", map[string]any{"conversation_id": conv})
 
 		case "typing.started":
-			var p struct{ ConversationID string `json:"conversation_id"` }
+			var p struct {
+				ConversationID string `json:"conversation_id"`
+			}
 			if err := json.Unmarshal(env.Data, &p); err != nil {
 				h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": "invalid typing payload"})
 				continue
@@ -301,7 +303,9 @@ func (h *Handler) readLoop(c *client, ip string) {
 			h.mu.RUnlock()
 
 		case "typing.stopped":
-			var p struct{ ConversationID string `json:"conversation_id"` }
+			var p struct {
+				ConversationID string `json:"conversation_id"`
+			}
 			if err := json.Unmarshal(env.Data, &p); err != nil {
 				h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": "invalid typing payload"})
 				continue

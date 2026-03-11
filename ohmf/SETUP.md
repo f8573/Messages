@@ -66,7 +66,8 @@ Tail API logs:
 ```powershell
 $env:PATH="$PWD\.tools\go\bin;$env:PATH"
 cd .\services\gateway
-go test ./... -run '^$'
+go test ./...
+$env:OHMF_RUN_INTEGRATION="1"
 go test .\integration -v
 ```
 

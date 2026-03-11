@@ -17,6 +17,7 @@ cd C:\Users\James\Downloads\Messages\ohmf\services\gateway
 go mod tidy
 go build ./...
 go test ./...
+$env:OHMF_RUN_INTEGRATION="1"
 go test ./integration -v
 ```
 

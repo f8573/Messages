@@ -6,8 +6,8 @@ package interfaces
 // composition and wiring.
 
 type AuthService interface {
-    // marker: implements auth flows
-    StartPhoneVerification(any) (any, error)
+	// marker: implements auth flows
+	StartPhoneVerification(any) (any, error)
 }
 
 type UserService interface{}

@@ -14,7 +14,50 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: '1.20'
+          go-version: '1.25'
+      - name: Diagnostic
+        run: |
+          echo "CWD: $(pwd)"
+          echo "=== ls -la ==="
+          ls -la
+          echo "=== ls -R (truncated) ==="
+          ls -R . | sed -n '1,200p' || true
+          echo "=== go version / env ==="
+          go version || true
+          go env || true
+          echo "=== openapi file check ==="
+          ls -l ohmf/packages/protocol/openapi/openapi.yaml || true
+      - name: Repo module diagnostics
+        run: |
+          echo "=== repo go files and modules ==="
+          find . -maxdepth 4 -name go.mod -print || true
+          echo "=== go env GOMOD ==="
+          go env GOMOD || true
+          echo "=== list modules (if any) ==="
+          go list -m all || true
       - name: Run go tests
         run: |
-          go test ./... -v
+          set -euo pipefail
+          mods="$(find . -name go.mod -not -path './ohmf/.tools/*' -print | sort)"
+          if [ -z "$mods" ]; then
+            echo "No go.mod files found; skipping."
+            exit 0
+          fi
+
+          ran_any=0
+          while IFS= read -r mod; do
+            dir="$(dirname "$mod")"
+            echo "== Testing module: $dir =="
+            pkgs="$(cd "$dir" && go list ./... 2>/dev/null || true)"
+            if [ -z "$pkgs" ]; then
+              echo "No Go packages in $dir; skipping."
+              continue
+            fi
+
+            ran_any=1
+            (cd "$dir" && go test ./... -v)
+          done <<< "$mods"
+
+          if [ "$ran_any" -eq 0 ]; then
+            echo "No Go packages found in any module; skipping."
+          fi

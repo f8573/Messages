@@ -9,11 +9,33 @@ on:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    env:
+      OPENAPI_SPEC: ohmf/packages/protocol/openapi/openapi.yaml
     steps:
       - uses: actions/checkout@v4
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: '1.20'
+          go-version: '1.25'
+      - name: Diagnostic
+        run: |
+          echo "CWD: $(pwd)"
+          echo "=== ls -la ==="
+          ls -la
+          echo "=== go version ==="
+          go version || true
+          echo "=== openapi file check ==="
+          ls -l "$OPENAPI_SPEC" || true
+      - name: Validator module prep
+        run: |
+          echo "=== tools/validate_openapi/go.mod ==="
+          if [ -f tools/validate_openapi/go.mod ]; then cat tools/validate_openapi/go.mod; fi
+          echo "=== go env ==="
+          go env GOPROXY GOMOD || true
+          echo "=== tidy and list modules ==="
+          (cd tools/validate_openapi && go mod tidy -v) || true
+          (cd tools/validate_openapi && go list -m all) || true
       - name: Run OpenAPI validator
-        run: go run tools/validate_openapi/main.go
+        run: |
+          cd tools/validate_openapi
+          go run . -spec ../../$OPENAPI_SPEC

@@ -9,7 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-type Service struct{
+type Service struct {
 	db *pgxpool.Pool
 }
 
