@@ -7,7 +7,7 @@ import (
 )
 
 func TestOpenAPIServe(t *testing.T) {
-	baseURL := getenv("OHMF_BASE_URL", "http://localhost:18080")
+	baseURL := requireIntegrationEnv(t)
 	waitForHealth(t, baseURL)
 
 	req, _ := http.NewRequest(http.MethodGet, baseURL+"/openapi.yaml", nil)

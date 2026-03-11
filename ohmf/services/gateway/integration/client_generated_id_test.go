@@ -7,7 +7,7 @@ import (
 )
 
 func TestClientGeneratedIDRoundtrip(t *testing.T) {
-	baseURL := getenv("OHMF_BASE_URL", "http://localhost:18080")
+	baseURL := requireIntegrationEnv(t)
 	runID := fmt.Sprintf("%d", time.Now().UnixNano())
 	waitForHealth(t, baseURL)
 
