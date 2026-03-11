@@ -11,7 +11,7 @@ import (
 type ctxKey string
 
 const (
-	userIDKey ctxKey = "user_id"
+	userIDKey       ctxKey = "user_id"
 	userProfilesKey ctxKey = "user_profiles"
 )
 
@@ -24,6 +24,12 @@ func UserIDFromContext(ctx context.Context) (string, bool) {
 // convenient for tests to simulate an authenticated request.
 func WithUserID(ctx context.Context, userID string) context.Context {
 	return context.WithValue(ctx, userIDKey, userID)
+}
+
+// WithProfiles returns a new context with the provided user profiles set.
+// This is useful for tests to simulate users with specific profiles.
+func WithProfiles(ctx context.Context, profiles []string) context.Context {
+	return context.WithValue(ctx, userProfilesKey, profiles)
 }
 
 func ProfilesFromContext(ctx context.Context) ([]string, bool) {

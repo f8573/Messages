@@ -5,9 +5,9 @@ import (
 	"errors"
 	"net"
 	"net/http"
-	"time"
-	"strconv"
 	"ohmf/services/gateway/internal/observability"
+	"strconv"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
@@ -31,11 +31,11 @@ func (h *Handler) Send(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		ConversationID string         `json:"conversation_id"`
-		IdempotencyKey string         `json:"idempotency_key"`
-		ContentType    string         `json:"content_type"`
-		Content        map[string]any `json:"content"`
-		ClientGeneratedID string      `json:"client_generated_id,omitempty"`
+		ConversationID    string         `json:"conversation_id"`
+		IdempotencyKey    string         `json:"idempotency_key"`
+		ContentType       string         `json:"content_type"`
+		Content           map[string]any `json:"content"`
+		ClientGeneratedID string         `json:"client_generated_id,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "invalid body", nil)
@@ -110,11 +110,11 @@ func (h *Handler) Send(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, httpStatus, response)
 	// Emit structured event for observability
 	observability.EmitEvent("message.created", map[string]any{
-		"message_id": result.Message.MessageID,
+		"message_id":      result.Message.MessageID,
 		"conversation_id": req.ConversationID,
-		"sender_user_id": userID,
-		"transport": result.Message.Transport,
-		"server_order": result.Message.ServerOrder,
+		"sender_user_id":  userID,
+		"transport":       result.Message.Transport,
+		"server_order":    result.Message.ServerOrder,
 	})
 }
 
@@ -125,11 +125,11 @@ func (h *Handler) SendToPhone(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		PhoneE164      string         `json:"phone_e164"`
-		IdempotencyKey string         `json:"idempotency_key"`
-		ContentType    string         `json:"content_type"`
-		Content        map[string]any `json:"content"`
-		ClientGeneratedID string      `json:"client_generated_id,omitempty"`
+		PhoneE164         string         `json:"phone_e164"`
+		IdempotencyKey    string         `json:"idempotency_key"`
+		ContentType       string         `json:"content_type"`
+		Content           map[string]any `json:"content"`
+		ClientGeneratedID string         `json:"client_generated_id,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "invalid body", nil)
@@ -409,7 +409,7 @@ func (h *Handler) AddReaction(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "message id required", nil)
 		return
 	}
-	var body struct{
+	var body struct {
 		Emoji string `json:"emoji"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -442,7 +442,7 @@ func (h *Handler) RemoveReaction(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "message id required", nil)
 		return
 	}
-	var body struct{
+	var body struct {
 		Emoji string `json:"emoji"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {

@@ -11,7 +11,7 @@ import (
 )
 
 func TestMVPFlow(t *testing.T) {
-	baseURL := getenv("OHMF_BASE_URL", "http://localhost:18080")
+	baseURL := requireIntegrationEnv(t)
 	runID := fmt.Sprintf("%d", time.Now().UnixNano())
 	waitForHealth(t, baseURL)
 
@@ -80,7 +80,7 @@ func TestMVPFlow(t *testing.T) {
 }
 
 func TestRefreshAndLogout(t *testing.T) {
-	baseURL := getenv("OHMF_BASE_URL", "http://localhost:18080")
+	baseURL := requireIntegrationEnv(t)
 	runID := fmt.Sprintf("%d", time.Now().UnixNano())
 	waitForHealth(t, baseURL)
 
@@ -113,7 +113,7 @@ func TestRefreshAndLogout(t *testing.T) {
 }
 
 func TestInvalidOTP(t *testing.T) {
-	baseURL := getenv("OHMF_BASE_URL", "http://localhost:18080")
+	baseURL := requireIntegrationEnv(t)
 	runID := fmt.Sprintf("%d", time.Now().UnixNano())
 	waitForHealth(t, baseURL)
 
@@ -136,7 +136,7 @@ func TestInvalidOTP(t *testing.T) {
 }
 
 func TestRateLimitOTPStart(t *testing.T) {
-	baseURL := getenv("OHMF_BASE_URL", "http://localhost:18080")
+	baseURL := requireIntegrationEnv(t)
 	runID := fmt.Sprintf("%d", time.Now().UnixNano())
 	waitForHealth(t, baseURL)
 	phone := "+1555" + runID[len(runID)-6:] + "12"
@@ -154,7 +154,7 @@ func TestRateLimitOTPStart(t *testing.T) {
 }
 
 func TestUnauthorizedProtectedRoutes(t *testing.T) {
-	baseURL := getenv("OHMF_BASE_URL", "http://localhost:18080")
+	baseURL := requireIntegrationEnv(t)
 	waitForHealth(t, baseURL)
 
 	status := postStatus(t, baseURL+"/v1/conversations", map[string]any{"type": "DM", "participants": []string{}}, "")
@@ -164,7 +164,7 @@ func TestUnauthorizedProtectedRoutes(t *testing.T) {
 }
 
 func TestForbiddenConversationAccess(t *testing.T) {
-	baseURL := getenv("OHMF_BASE_URL", "http://localhost:18080")
+	baseURL := requireIntegrationEnv(t)
 	runID := fmt.Sprintf("%d", time.Now().UnixNano())
 	waitForHealth(t, baseURL)
 
@@ -193,7 +193,7 @@ func TestForbiddenConversationAccess(t *testing.T) {
 }
 
 func TestInvalidRefreshToken(t *testing.T) {
-	baseURL := getenv("OHMF_BASE_URL", "http://localhost:18080")
+	baseURL := requireIntegrationEnv(t)
 	waitForHealth(t, baseURL)
 
 	status, body := postJSONWithStatus(t, baseURL+"/v1/auth/refresh", map[string]any{"refresh_token": "definitely-invalid"}, "")
@@ -206,7 +206,7 @@ func TestInvalidRefreshToken(t *testing.T) {
 }
 
 func TestTwoWayMessaging(t *testing.T) {
-	baseURL := getenv("OHMF_BASE_URL", "http://localhost:18080")
+	baseURL := requireIntegrationEnv(t)
 	runID := fmt.Sprintf("%d", time.Now().UnixNano())
 	waitForHealth(t, baseURL)
 
@@ -250,7 +250,7 @@ func TestTwoWayMessaging(t *testing.T) {
 }
 
 func TestMessageNonRegisteredPhone(t *testing.T) {
-	baseURL := getenv("OHMF_BASE_URL", "http://localhost:18080")
+	baseURL := requireIntegrationEnv(t)
 	runID := fmt.Sprintf("%d", time.Now().UnixNano())
 	waitForHealth(t, baseURL)
 
@@ -299,6 +299,14 @@ func waitForHealth(t *testing.T, baseURL string) {
 		time.Sleep(500 * time.Millisecond)
 	}
 	t.Fatalf("service not healthy at %s", baseURL)
+}
+
+func requireIntegrationEnv(t *testing.T) string {
+	t.Helper()
+	if os.Getenv("OHMF_RUN_INTEGRATION") != "1" {
+		t.Skip("set OHMF_RUN_INTEGRATION=1 to run gateway integration tests against a live service")
+	}
+	return getenv("OHMF_BASE_URL", "http://localhost:18080")
 }
 
 func postJSON(t *testing.T, url string, body map[string]any, bearer string) map[string]any {

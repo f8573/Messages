@@ -5,25 +5,25 @@ package serviceregistry
 // Architecture into a discoverable runtime artifact.
 
 type Registry struct {
-    available map[string]bool
+	available map[string]bool
 }
 
 func New(m map[string]bool) *Registry {
-    if m == nil {
-        m = map[string]bool{}
-    }
-    return &Registry{available: m}
+	if m == nil {
+		m = map[string]bool{}
+	}
+	return &Registry{available: m}
 }
 
 func (r *Registry) Available() map[string]bool {
-    // return a shallow copy to avoid external mutation
-    out := make(map[string]bool, len(r.available))
-    for k, v := range r.available {
-        out[k] = v
-    }
-    return out
+	// return a shallow copy to avoid external mutation
+	out := make(map[string]bool, len(r.available))
+	for k, v := range r.available {
+		out[k] = v
+	}
+	return out
 }
 
 func (r *Registry) Set(name string, present bool) {
-    r.available[name] = present
+	r.available[name] = present
 }

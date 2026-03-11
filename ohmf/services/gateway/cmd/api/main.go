@@ -10,32 +10,33 @@ import (
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	cors "github.com/go-chi/cors"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
-	openapipkg "ohmf/services/gateway/internal/openapi"
+	"ohmf/services/gateway/internal/abuse"
 	"ohmf/services/gateway/internal/auth"
 	"ohmf/services/gateway/internal/bus"
+	"ohmf/services/gateway/internal/carrier"
 	"ohmf/services/gateway/internal/config"
 	"ohmf/services/gateway/internal/conversations"
 	"ohmf/services/gateway/internal/db"
 	"ohmf/services/gateway/internal/devices"
+	"ohmf/services/gateway/internal/discovery"
 	"ohmf/services/gateway/internal/events"
 	"ohmf/services/gateway/internal/limit"
+	"ohmf/services/gateway/internal/media"
 	"ohmf/services/gateway/internal/messages"
 	appmw "ohmf/services/gateway/internal/middleware"
-	"ohmf/services/gateway/internal/observability"
-	"ohmf/services/gateway/internal/realtime"
-	"ohmf/services/gateway/internal/token"
-	"ohmf/services/gateway/internal/users"
-	"ohmf/services/gateway/internal/discovery"
-	"ohmf/services/gateway/internal/media"
-	"ohmf/services/gateway/internal/presence"
 	"ohmf/services/gateway/internal/miniapp"
 	"ohmf/services/gateway/internal/notification"
-	"ohmf/services/gateway/internal/abuse"
+	"ohmf/services/gateway/internal/observability"
+	openapipkg "ohmf/services/gateway/internal/openapi"
+	"ohmf/services/gateway/internal/presence"
+	"ohmf/services/gateway/internal/realtime"
 	"ohmf/services/gateway/internal/relay"
-	"ohmf/services/gateway/internal/carrier"
 	"ohmf/services/gateway/internal/serviceregistry"
-    "ohmf/services/gateway/internal/sync"
+	"ohmf/services/gateway/internal/sync"
+	"ohmf/services/gateway/internal/token"
+	"ohmf/services/gateway/internal/users"
 )
 
 func main() {
@@ -133,7 +134,7 @@ func main() {
 	convSvc := conversations.NewService(pool)
 	devSvc := devices.NewService(pool)
 	mediaSvc := media.NewService(pool)
-	carrierSvc := carrier.NewService(pool)
+	carrierSvc := carrier.NewService(&pgxAdapter{p: pool})
 	presenceSvc := presence.NewService(rdb)
 	notificationSvc := notification.NewService(pool)
 	miniappSvc := miniapp.NewService(pool, cfg)
@@ -156,7 +157,7 @@ func main() {
 	convHandler := conversations.NewHandler(convSvc)
 	devHandler := devices.NewHandler(devSvc)
 	mediaHandler := media.NewHandler(mediaSvc)
-	carrierHandler := carrier.NewHandler(carrierSvc, pool)
+	carrierHandler := carrier.NewHandler(carrierSvc, &pgxAdapter{p: pool})
 	presenceHandler := presence.NewHandler(presenceSvc)
 	notificationHandler := notification.NewHandler(notificationSvc)
 	miniappHandler := miniapp.NewHandler(miniappSvc)
@@ -270,7 +271,7 @@ func main() {
 			protected.Post("/apps/sessions/{id}/events", miniappHandler.AppendEvent)
 			protected.Post("/apps/sessions/{id}/snapshot", miniappHandler.Snapshot)
 			protected.Get("/apps", miniappHandler.ListApps)
-        
+
 			protected.Post("/notifications/send", notificationHandler.Send)
 			protected.Post("/relay/messages", relayHandler.CreateMessage)
 			protected.Get("/relay/jobs/{id}", relayHandler.GetJob)
@@ -309,4 +310,19 @@ func main() {
 	if err := http.ListenAndServe(cfg.Addr, r); err != nil {
 		logger.Fatal().Err(err).Msg("server stopped")
 	}
+}
+
+// pgxAdapter adapts a *pgxpool.Pool to the package-local `carrier.DB` interface.
+type pgxAdapter struct{ p *pgxpool.Pool }
+
+func (a *pgxAdapter) QueryRow(ctx context.Context, sql string, args ...any) carrier.RowScanner {
+	return a.p.QueryRow(ctx, sql, args...)
+}
+
+func (a *pgxAdapter) Query(ctx context.Context, sql string, args ...any) (carrier.Rows, error) {
+	return a.p.Query(ctx, sql, args...)
+}
+
+func (a *pgxAdapter) Exec(ctx context.Context, sql string, args ...any) (any, error) {
+	return a.p.Exec(ctx, sql, args...)
 }
