@@ -9,6 +9,8 @@ on:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    env:
+      OPENAPI_SPEC: ohmf/packages/protocol/openapi/openapi.yaml
     steps:
       - uses: actions/checkout@v4
       - name: Set up Go
@@ -23,7 +25,7 @@ jobs:
           echo "=== go version ==="
           go version || true
           echo "=== openapi file check ==="
-          ls -l ohmf/packages/protocol/openapi/openapi.yaml || true
+          ls -l "$OPENAPI_SPEC" || true
       - name: Validator module prep
         run: |
           echo "=== tools/validate_openapi/go.mod ==="
@@ -36,4 +38,4 @@ jobs:
       - name: Run OpenAPI validator
         run: |
           cd tools/validate_openapi
-          go run .
+          go run . -spec ../../$OPENAPI_SPEC
