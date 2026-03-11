@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"strings"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -10,16 +9,17 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
+	"ohmf/services/gateway/internal/config"
 	"ohmf/services/gateway/internal/otp"
 	"ohmf/services/gateway/internal/phone"
 	"ohmf/services/gateway/internal/token"
-	"ohmf/services/gateway/internal/config"
 )
 
 type StartRequest struct {

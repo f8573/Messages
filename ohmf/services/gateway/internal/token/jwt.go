@@ -8,7 +8,7 @@ import (
 )
 
 type Claims struct {
-	UserID string `json:"uid"`
+	UserID   string   `json:"uid"`
 	Profiles []string `json:"profiles,omitempty"`
 	jwt.RegisteredClaims
 }
@@ -23,7 +23,7 @@ func NewService(secret string) *Service {
 
 func (s *Service) IssueAccess(userID string, ttl time.Duration, profiles []string) (string, error) {
 	claims := Claims{
-		UserID: userID,
+		UserID:   userID,
 		Profiles: profiles,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(ttl)),

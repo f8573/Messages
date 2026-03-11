@@ -10,7 +10,7 @@ test:
 	go test ./...
 
 integration-test:
-	go test ./integration -v
+	OHMF_RUN_INTEGRATION=1 go test ./integration -v
 
 sqlc:
 	sqlc generate

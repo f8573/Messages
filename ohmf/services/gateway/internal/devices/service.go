@@ -8,19 +8,19 @@ import (
 )
 
 type Device struct {
-	ID           string    `json:"device_id"`
-	UserID       string    `json:"user_id"`
-	Platform     string    `json:"platform"`
-	DeviceName   string    `json:"device_name"`
-	ClientVersion string   `json:"client_version"`
-	Capabilities []string  `json:"capabilities"`
-	SMSRoleState string    `json:"sms_role_state"`
-	PushToken    string    `json:"push_token"`
-	PublicKey    string    `json:"public_key"`
-	LastSeenAt   time.Time `json:"last_seen_at"`
+	ID            string    `json:"device_id"`
+	UserID        string    `json:"user_id"`
+	Platform      string    `json:"platform"`
+	DeviceName    string    `json:"device_name"`
+	ClientVersion string    `json:"client_version"`
+	Capabilities  []string  `json:"capabilities"`
+	SMSRoleState  string    `json:"sms_role_state"`
+	PushToken     string    `json:"push_token"`
+	PublicKey     string    `json:"public_key"`
+	LastSeenAt    time.Time `json:"last_seen_at"`
 }
 
-type Service struct{
+type Service struct {
 	db *pgxpool.Pool
 }
 

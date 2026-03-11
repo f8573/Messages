@@ -84,7 +84,7 @@ func Load() Config {
 		DiscoveryPepper:        get("APP_DISCOVERY_PEPPER", ""),
 		APIDeprecation:         get("APP_API_DEPRECATION", ""),
 		APISunset:              get("APP_API_SUNSET", ""),
-		MiniappPublicKeyPEM:   get("APP_MINIAPP_PUBLIC_KEY_PEM", ""),
+		MiniappPublicKeyPEM:    get("APP_MINIAPP_PUBLIC_KEY_PEM", ""),
 	}
 }
 
