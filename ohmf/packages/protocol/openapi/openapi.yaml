@@ -458,47 +458,6 @@ paths:
         '200':
           description: OK
   /v1/conversations/{id}/read:
-      /v1/contacts/discover:
-        post:
-          summary: Privacy-preserving contact discovery
-          operationId: DiscoverContacts
-          requestBody:
-            required: true
-            content:
-              application/json:
-                schema: { $ref: '#/components/schemas/ContactDiscoverRequest' }
-          responses:
-            '200':
-              description: OK
-              content:
-                application/json:
-                  schema: { $ref: '#/components/schemas/ContactDiscoverResponse' }
-            '400':
-              description: Bad Request
-              content:
-                application/json:
-                  schema: { $ref: '#/components/schemas/ErrorEnvelope' }
-
-      /v1/media/uploads:
-        post:
-          summary: Initialize media upload and get an upload URL
-          operationId: InitMediaUpload
-          requestBody:
-            required: true
-            content:
-              application/json:
-                schema: { $ref: '#/components/schemas/MediaUploadInitRequest' }
-          responses:
-            '201':
-              description: Created
-              content:
-                application/json:
-                  schema: { $ref: '#/components/schemas/MediaUploadInitResponse' }
-            '400':
-              description: Bad Request
-              content:
-                application/json:
-                  schema: { $ref: '#/components/schemas/ErrorEnvelope' }
     post:
       parameters:
         - in: path
@@ -508,3 +467,45 @@ paths:
       responses:
         '204':
           description: No Content
+
+  /v1/contacts/discover:
+    post:
+      summary: Privacy-preserving contact discovery
+      operationId: DiscoverContacts
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ContactDiscoverRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ContactDiscoverResponse' }
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /v1/media/uploads:
+    post:
+      summary: Initialize media upload and get an upload URL
+      operationId: InitMediaUpload
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MediaUploadInitRequest' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MediaUploadInitResponse' }
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
