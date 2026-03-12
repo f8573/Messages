@@ -100,6 +100,23 @@ function makeIdempotencyKey(prefix = "msg") {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+async function uploadMediaFile(file) {
+  if (!file) throw new Error("no file");
+  // Initialize upload
+  const init = await apiRequest(`/v1/media/uploads`, {
+    method: "POST",
+    body: JSON.stringify({ items: [{ mime_type: file.type, size_bytes: file.size, kind: "media" }] }),
+  });
+  const uploadUrl = init?.upload_url;
+  const uploadId = init?.upload_id;
+  if (!uploadUrl) throw new Error("no upload url returned");
+
+  // Perform upload (placeholder, assumes PUT to upload_url)
+  await fetch(uploadUrl, { method: "PUT", body: file });
+
+  return { upload_id: uploadId, upload_url: uploadUrl };
+}
+
 function initials(name) {
   return sanitizeText(name, 24)
     .split(/\s+/)
