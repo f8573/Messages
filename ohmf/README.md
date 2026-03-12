@@ -21,6 +21,29 @@ $env:OHMF_RUN_INTEGRATION="1"
 go test ./integration -v
 ```
 
+Preferred (repo-local Go and integrated test runner)
+
+If you have a repo-local Go binary under `ohmf/.tools/go/bin`, you can prefer it by setting the `GO_CMD` env var or by using the provided setup scripts. This is useful when system-wide Go is not installed.
+
+Bash (Linux / macOS / WSL):
+
+```bash
+source ./scripts/setup-go.sh   # sets GO_CMD and prepends local go to PATH if present
+./scripts/run-tests.sh --integration
+```
+
+PowerShell (Windows):
+
+```powershell
+. .\scripts\setup-go.ps1      # dot-source into current session to set GO_CMD
+!.\scripts\run-tests.ps1 -Integration
+```
+
+The test runner will start a temporary Postgres Docker container and set `TEST_DATABASE_URL` when `--integration`/`-Integration` is used and `TEST_DATABASE_URL` is not already set.
+
+CI note: Prefer using `GO_CMD` in CI jobs (or installing the same Go version) so test behavior is consistent across environments.
+
+
 ## Run with Docker Compose
 
 1. Start Docker Desktop.

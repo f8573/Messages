@@ -17,7 +17,8 @@ import (
 func TestRefreshRotatesToken(t *testing.T) {
     dsn := os.Getenv("TEST_DATABASE_URL")
     if dsn == "" {
-        t.Skip("skipping DB integration test; set TEST_DATABASE_URL to run")
+        // Default to the compose postgres service used by CI/local itest
+        dsn = "postgres://dev:dev@postgres:5432/ohmf_dev?sslmode=disable"
     }
     ctx := context.Background()
     pool, err := pgxpool.New(ctx, dsn)
