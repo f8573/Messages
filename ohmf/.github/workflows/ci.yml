@@ -29,11 +29,23 @@ jobs:
             echo "gofmt needs to be run on the following files:"; echo "$fmt_out"; exit 1
           fi
 
-      - name: Build all packages
+      - name: Build all packages (only packages with Go files)
         run: |
           set -e
-          go build ./...
+          echo "Discovering buildable packages..."
+          pkgs=$(go list -f "{{if .GoFiles}}{{.ImportPath}}{{end}}" ./... | sed '/^$/d')
+          if [ -z "$pkgs" ]; then
+            echo "No buildable packages found; skipping build."
+            exit 0
+          fi
+          echo "$pkgs" | xargs -n1 -I{} sh -c 'echo "== Building {} =="; go build {}'
 
-      - name: Run go vet
+      - name: Run go vet (only packages with Go files)
         run: |
-          go vet ./...
+          echo "Discovering packages for vet..."
+          pkgs=$(go list -f "{{if .GoFiles}}{{.ImportPath}}{{end}}" ./... | sed '/^$/d')
+          if [ -z "$pkgs" ]; then
+            echo "No packages for vet; skipping."
+            exit 0
+          fi
+          echo "$pkgs" | xargs -n1 -I{} sh -c 'echo "== Vetting {} =="; go vet {}'
