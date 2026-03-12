@@ -1,0 +1,101 @@
+package auth
+
+import (
+    "context"
+    "crypto/sha256"
+    "database/sql"
+    "encoding/hex"
+    "os"
+    "testing"
+    "time"
+
+    "github.com/jackc/pgx/v5/pgxpool"
+    "ohmf/services/gateway/internal/config"
+    "ohmf/services/gateway/internal/token"
+)
+
+func TestRefreshRotatesToken(t *testing.T) {
+    dsn := os.Getenv("TEST_DATABASE_URL")
+    if dsn == "" {
+        t.Skip("skipping DB integration test; set TEST_DATABASE_URL to run")
+    }
+    ctx := context.Background()
+    pool, err := pgxpool.New(ctx, dsn)
+    if err != nil {
+        t.Fatalf("connect: %v", err)
+    }
+    defer pool.Close()
+
+    // apply baseline migrations (idempotent)
+    mig, err := os.ReadFile("../migrations/000001_init.up.sql")
+    if err != nil {
+        mig, err = os.ReadFile("migrations/000001_init.up.sql")
+        if err != nil {
+            t.Fatalf("read migration: %v", err)
+        }
+    }
+    if _, err := pool.Exec(ctx, string(mig)); err != nil {
+        t.Fatalf("apply migration: %v", err)
+    }
+
+    // create user
+    var userID string
+    if err := pool.QueryRow(ctx, `INSERT INTO users (primary_phone_e164) VALUES ($1) ON CONFLICT DO NOTHING RETURNING id::text`, "+10000000000").Scan(&userID); err != nil {
+        // if returning fails because row existed, select it
+        if err == sql.ErrNoRows {
+            if err := pool.QueryRow(ctx, `SELECT id::text FROM users WHERE primary_phone_e164 = $1`, "+10000000000").Scan(&userID); err != nil {
+                t.Fatalf("select user: %v", err)
+            }
+        } else {
+            t.Fatalf("insert user: %v", err)
+        }
+    }
+
+    // create device
+    var deviceID string
+    if err := pool.QueryRow(ctx, `INSERT INTO devices (user_id, platform, device_name, created_at) VALUES ($1, 'TEST', 'ci-device', now()) RETURNING id::text`, userID).Scan(&deviceID); err != nil {
+        t.Fatalf("insert device: %v", err)
+    }
+
+    // insert a refresh token for "oldtoken"
+    old := "oldtoken"
+    h := sha256.Sum256([]byte(old))
+    oldHash := hex.EncodeToString(h[:])
+    if _, err := pool.Exec(ctx, `INSERT INTO refresh_tokens (user_id, device_id, token_hash, expires_at) VALUES ($1, $2::uuid, $3, now() + interval '1 hour')`, userID, deviceID, oldHash); err != nil {
+        t.Fatalf("insert refresh token: %v", err)
+    }
+
+    tokSvc := token.NewService("test-secret")
+    svc := NewService(pool, nil, tokSvc, 15*time.Minute, 30*24*time.Hour, config.Config{})
+
+    out, err := svc.Refresh(ctx, RefreshRequest{RefreshToken: old})
+    if err != nil {
+        t.Fatalf("refresh failed: %v", err)
+    }
+    if out["access_token"] == nil || out["refresh_token"] == nil {
+        t.Fatalf("expected access and refresh tokens; got %#v", out)
+    }
+
+    // verify old token was revoked
+    var revoked sql.NullTime
+    if err := pool.QueryRow(ctx, `SELECT revoked_at FROM refresh_tokens WHERE token_hash = $1`, oldHash).Scan(&revoked); err != nil {
+        t.Fatalf("query old token: %v", err)
+    }
+    if !revoked.Valid {
+        t.Fatalf("expected old token revoked_at to be set")
+    }
+
+    // call Logout to revoke all for device
+    if err := svc.Logout(ctx, userID, LogoutRequest{DeviceID: deviceID}); err != nil {
+        t.Fatalf("logout failed: %v", err)
+    }
+
+    // ensure any remaining tokens for user are revoked
+    var cnt int
+    if err := pool.QueryRow(ctx, `SELECT count(1) FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL`, userID).Scan(&cnt); err != nil {
+        t.Fatalf("count tokens: %v", err)
+    }
+    if cnt != 0 {
+        t.Fatalf("expected 0 active tokens after logout; got %d", cnt)
+    }
+}
