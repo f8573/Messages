@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"time"
 
-	"encoding/json"
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	cors "github.com/go-chi/cors"
@@ -52,6 +54,36 @@ func main() {
 		r.Use(chimiddleware.RealIP)
 		r.Use(chimiddleware.Recoverer)
 		r.Use(chimiddleware.Timeout(30 * time.Second))
+
+		// Lightweight reverse-proxy handlers for local dev and integration tests.
+		// These proxy /v1/contacts, /v1/apps, /v1/media to configured backend addresses.
+		makeProxy := func(target string) http.Handler {
+			u, err := url.Parse(target)
+			if err != nil {
+				// fallback to a handler that returns 502
+				return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					http.Error(w, "bad backend url", http.StatusBadGateway)
+				})
+			}
+			proxy := httputil.NewSingleHostReverseProxy(u)
+			// Ensure request uses target host/scheme but keep original path
+			origDirector := proxy.Director
+			proxy.Director = func(req *http.Request) {
+				origDirector(req)
+				req.URL.Scheme = u.Scheme
+				req.URL.Host = u.Host
+				// leave req.URL.Path unchanged so backends see /v1/.. paths
+			}
+			return proxy
+		}
+
+		// Mount both exact and wildcard paths for proxies so chi routing matches.
+		r.Handle("/v1/contacts", makeProxy(cfg.ContactsAddr))
+		r.Handle("/v1/contacts/*", makeProxy(cfg.ContactsAddr))
+		r.Handle("/v1/apps", makeProxy(cfg.AppsAddr))
+		r.Handle("/v1/apps/*", makeProxy(cfg.AppsAddr))
+		r.Handle("/v1/media", makeProxy(cfg.MediaAddr))
+		r.Handle("/v1/media/*", makeProxy(cfg.MediaAddr))
 		r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("ok"))
