@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"ohmf/services/gateway/internal/httpx"
@@ -89,6 +90,29 @@ func (h *Handler) Accept(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "invalid body", nil)
+		return
+	}
+	// device must provide a signature of the accept action to prove identity
+	sig := r.Header.Get("X-Device-Signature")
+	ts := r.Header.Get("X-Device-Timestamp")
+	if sig == "" || ts == "" {
+		httpx.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing device signature headers", nil)
+		return
+	}
+	// validate timestamp (seconds) to avoid replay attacks
+	tsec, err := strconv.ParseInt(ts, 10, 64)
+	if err != nil {
+		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "invalid timestamp", nil)
+		return
+	}
+	now := time.Now().Unix()
+	if tsec < now-60 || tsec > now+60 {
+		httpx.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "stale timestamp", nil)
+		return
+	}
+	payload := []byte("relay_accept:" + id + ":" + ts)
+	if err := h.svc.verifyDeviceSignature(r.Context(), req.DeviceID, payload, sig); err != nil {
+		httpx.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "invalid device signature", nil)
 		return
 	}
 	if err := h.svc.AcceptJob(r.Context(), id, req.DeviceID); err != nil {

@@ -2,7 +2,10 @@ package relay
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"time"
@@ -119,6 +122,37 @@ func (s *Service) GetJob(ctx context.Context, id string) (*RelayJob, error) {
 func (s *Service) AcceptJob(ctx context.Context, id, deviceID string) error {
 	_, err := s.db.Exec(ctx, `UPDATE relay_jobs SET executing_device_id = $2::uuid, status = 'accepted', updated_at = now() WHERE id = $1::uuid`, id, deviceID)
 	return err
+}
+
+var ErrInvalidDeviceSignature = errors.New("invalid_device_signature")
+
+// verifyDeviceSignature verifies a base64-encoded ed25519 signature against the
+// stored public key for the given device. The payload should be the exact bytes
+// that were signed by the device (for example: "relay_accept:<jobID>:<timestamp>").
+func (s *Service) verifyDeviceSignature(ctx context.Context, deviceID string, payload []byte, sigB64 string) error {
+	var pubKeyB64 string
+	err := s.db.QueryRow(ctx, `SELECT public_key FROM devices WHERE id = $1::uuid`, deviceID).Scan(&pubKeyB64)
+	if err != nil {
+		return err
+	}
+	if pubKeyB64 == "" {
+		return ErrInvalidDeviceSignature
+	}
+	pubBytes, err := base64.StdEncoding.DecodeString(pubKeyB64)
+	if err != nil {
+		return err
+	}
+	sig, err := base64.StdEncoding.DecodeString(sigB64)
+	if err != nil {
+		return err
+	}
+	if len(pubBytes) != ed25519.PublicKeySize || len(sig) != ed25519.SignatureSize {
+		return ErrInvalidDeviceSignature
+	}
+	if !ed25519.Verify(ed25519.PublicKey(pubBytes), payload, sig) {
+		return ErrInvalidDeviceSignature
+	}
+	return nil
 }
 
 func (s *Service) FinishJob(ctx context.Context, id string, result any, status string) error {
