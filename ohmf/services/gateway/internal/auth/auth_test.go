@@ -12,13 +12,13 @@ import (
     "github.com/jackc/pgx/v5/pgxpool"
     "ohmf/services/gateway/internal/config"
     "ohmf/services/gateway/internal/token"
+    "ohmf/services/gateway/internal/testutil"
 )
 
 func TestRefreshRotatesToken(t *testing.T) {
     dsn := os.Getenv("TEST_DATABASE_URL")
     if dsn == "" {
-        // Default to the compose postgres service used by CI/local itest
-        dsn = "postgres://dev:dev@postgres:5432/ohmf_dev?sslmode=disable"
+        t.Skip("skipping DB integration test; set TEST_DATABASE_URL to run")
     }
     ctx := context.Background()
     pool, err := pgxpool.New(ctx, dsn)
@@ -28,12 +28,9 @@ func TestRefreshRotatesToken(t *testing.T) {
     defer pool.Close()
 
     // apply baseline migrations (idempotent)
-    mig, err := os.ReadFile("../migrations/000001_init.up.sql")
+    mig, err := testutil.ReadMigration("000001_init.up.sql")
     if err != nil {
-        mig, err = os.ReadFile("migrations/000001_init.up.sql")
-        if err != nil {
-            t.Fatalf("read migration: %v", err)
-        }
+        t.Fatalf("read migration: %v", err)
     }
     if _, err := pool.Exec(ctx, string(mig)); err != nil {
         t.Fatalf("apply migration: %v", err)
