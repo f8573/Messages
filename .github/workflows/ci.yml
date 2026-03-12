@@ -40,7 +40,13 @@ jobs:
       - name: Run unit tests (ohmf module)
         run: |
           cd ohmf
-          go test ./... -v
+          echo "Discovering packages with Go files..."
+          pkgs=$(go list -f "{{if or .GoFiles .TestGoFiles}}{{.ImportPath}}{{end}}" ./... | sed '/^$/d')
+          if [ -z "$pkgs" ]; then
+            echo "No testable packages found in ohmf; skipping tests."
+            exit 0
+          fi
+          echo "$pkgs" | xargs -n1 -I{} sh -c 'echo "== Testing {} =="; go test -v {}'
 
       - name: Build docker images
         run: |
@@ -104,7 +110,13 @@ jobs:
       - name: Run unit tests (ohmf module)
         run: |
           cd ohmf
-          go test ./... -v
+          echo "Discovering packages with Go files..."
+          pkgs=$(go list -f "{{if or .GoFiles .TestGoFiles}}{{.ImportPath}}{{end}}" ./... | sed '/^$/d')
+          if [ -z "$pkgs" ]; then
+            echo "No testable packages found in ohmf; skipping tests."
+            exit 0
+          fi
+          echo "$pkgs" | xargs -n1 -I{} sh -c 'echo "== Testing {} =="; go test -v {}'
 
       - name: Build docker images
         run: |
@@ -131,7 +143,8 @@ jobs:
         env:
           INTEGRATION: 1
         run: |
-          go test ./ohmf/integration -v
+          set -euo pipefail
+          bash ./scripts/run-tests.sh --integration
 
       - name: Collect docker-compose logs on failure
         if: failure()

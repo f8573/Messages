@@ -54,6 +54,8 @@ services:
       - APP_CONTACTS_ADDR=http://contacts:18085
       - APP_APPS_ADDR=http://apps:18086
       - APP_MEDIA_ADDR=http://media:18087
+      - APP_DB_DSN=postgres://dev:dev@postgres:5432/ohmf_dev?sslmode=disable
+      - APP_REDIS_ADDR=redis:6379
     depends_on:
       - contacts
       - apps
@@ -75,8 +77,36 @@ services:
       - apps
       - media
       - gateway
+      - postgres
+      - redis
     environment:
       - INTEGRATION=1
       - GATEWAY_ADDR=http://gateway:8080
       - CONTACTS_ADDR=http://contacts:18085
-    command: sh -c "apk add --no-cache curl ca-certificates >/dev/null 2>&1 || true; sleep 3; cd ohmf; INTEGRATION=1 GATEWAY_ADDR=http://gateway:8080 CONTACTS_ADDR=http://contacts:18085 go test ./integration -run TestGatewayIntegration -v"
+      - TEST_DATABASE_URL=postgres://dev:dev@postgres:5432/ohmf_dev?sslmode=disable
+      - TEST_REDIS_ADDR=redis:6379
+    command: sh -c "apk add --no-cache curl ca-certificates postgresql-client redis >/dev/null 2>&1 || true; sleep 3; cd /src/ohmf/services/gateway; INTEGRATION=1 TEST_DATABASE_URL=$TEST_DATABASE_URL TEST_REDIS_ADDR=$TEST_REDIS_ADDR GATEWAY_ADDR=http://gateway:8080 CONTACTS_ADDR=http://contacts:18085 go test ./... -v && cd /src/ohmf; INTEGRATION=1 GATEWAY_ADDR=http://gateway:8080 CONTACTS_ADDR=http://contacts:18085 go test ./integration -run TestGatewayIntegration -v"
+
+  postgres:
+    image: postgres:15
+    container_name: ohmf_postgres
+    environment:
+      POSTGRES_USER: dev
+      POSTGRES_PASSWORD: dev
+      POSTGRES_DB: ohmf_dev
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "dev"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: ohmf_redis
+    ports:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
