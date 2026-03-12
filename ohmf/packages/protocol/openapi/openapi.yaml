@@ -11,6 +11,46 @@ components:
       scheme: bearer
       bearerFormat: JWT
   schemas:
+    ContactDiscoverRequest:
+      type: object
+      required: [algorithm, contacts]
+      properties:
+        algorithm: { type: string }
+        contacts:
+          type: array
+          items:
+            type: object
+            properties:
+              hash: { type: string }
+              label: { type: string }
+    ContactDiscoverResponse:
+      type: object
+      properties:
+        matches:
+          type: array
+          items:
+            type: object
+            properties:
+              hash: { type: string }
+              user_id: { type: string }
+              display_name: { type: string }
+    MediaUploadInitRequest:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              mime_type: { type: string }
+              size_bytes: { type: integer }
+              kind: { type: string }
+    MediaUploadInitResponse:
+      type: object
+      properties:
+        upload_id: { type: string }
+        upload_url: { type: string }
     ErrorEnvelope:
       type: object
       required: [code, message, request_id]
@@ -427,3 +467,45 @@ paths:
       responses:
         '204':
           description: No Content
+
+  /v1/contacts/discover:
+    post:
+      summary: Privacy-preserving contact discovery
+      operationId: DiscoverContacts
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ContactDiscoverRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ContactDiscoverResponse' }
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /v1/media/uploads:
+    post:
+      summary: Initialize media upload and get an upload URL
+      operationId: InitMediaUpload
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MediaUploadInitRequest' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MediaUploadInitResponse' }
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
