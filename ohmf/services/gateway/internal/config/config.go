@@ -46,6 +46,10 @@ type Config struct {
 	APISunset      string
 	// Optional PEM-encoded RSA public key for verifying mini-app manifests.
 	MiniappPublicKeyPEM string
+	// Addresses for lightweight dev service proxies
+	ContactsAddr string
+	AppsAddr     string
+	MediaAddr    string
 }
 
 func Load() Config {
@@ -85,6 +89,9 @@ func Load() Config {
 		APIDeprecation:         get("APP_API_DEPRECATION", ""),
 		APISunset:              get("APP_API_SUNSET", ""),
 		MiniappPublicKeyPEM:    get("APP_MINIAPP_PUBLIC_KEY_PEM", ""),
+		ContactsAddr:           get("APP_CONTACTS_ADDR", "http://localhost:18085"),
+		AppsAddr:               get("APP_APPS_ADDR", "http://localhost:18086"),
+		MediaAddr:              get("APP_MEDIA_ADDR", "http://localhost:18087"),
 	}
 }
 

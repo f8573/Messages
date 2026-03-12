@@ -1,0 +1,82 @@
+version: "3.8"
+
+services:
+  contacts:
+    build:
+      context: .
+      dockerfile: ohmf/services/contacts/Dockerfile
+    container_name: ohmf_contacts
+    expose:
+      - "18085"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:18085/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  apps:
+    build:
+      context: .
+      dockerfile: ohmf/services/apps/Dockerfile
+    container_name: ohmf_apps
+    expose:
+      - "18086"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:18086/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  media:
+    build:
+      context: .
+      dockerfile: ohmf/services/media/Dockerfile
+    container_name: ohmf_media
+    expose:
+      - "18087"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:18087/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  gateway:
+    build:
+      context: ./ohmf/services/gateway
+      dockerfile: Dockerfile
+    container_name: ohmf_gateway
+    expose:
+      - "8080"
+    environment:
+      - APP_ADDR=:8080
+      - APP_SMOKE_MODE=1
+      - APP_LOG_LEVEL=debug
+      - APP_CONTACTS_ADDR=http://contacts:18085
+      - APP_APPS_ADDR=http://apps:18086
+      - APP_MEDIA_ADDR=http://media:18087
+    depends_on:
+      - contacts
+      - apps
+      - media
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  itest:
+    image: golang:1.25-alpine
+    container_name: ohmf_itest
+    working_dir: /src
+    volumes:
+      - ./:/src:ro
+    depends_on:
+      - contacts
+      - apps
+      - media
+      - gateway
+    environment:
+      - INTEGRATION=1
+      - GATEWAY_ADDR=http://gateway:8080
+      - CONTACTS_ADDR=http://contacts:18085
+    command: sh -c "apk add --no-cache curl ca-certificates >/dev/null 2>&1 || true; sleep 3; cd ohmf; INTEGRATION=1 GATEWAY_ADDR=http://gateway:8080 CONTACTS_ADDR=http://contacts:18085 go test ./integration -run TestGatewayIntegration -v"
