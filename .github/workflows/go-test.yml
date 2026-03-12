@@ -61,3 +61,17 @@ jobs:
           if [ "$ran_any" -eq 0 ]; then
             echo "No Go packages found in any module; skipping."
           fi
+
+  integration:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.25'
+      - name: Run integration tests (dockerized Postgres)
+        run: |
+          set -euo pipefail
+          bash ./scripts/run-tests.sh --integration
