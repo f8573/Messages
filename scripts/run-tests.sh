@@ -86,6 +86,27 @@ for mod in $mods; do
     continue
   fi
 
+  # Detect host GOOS and Android capability to skip platform-incompatible packages
+  HOST_GOOS=$($GO_CMD env GOOS 2>/dev/null || true)
+  HOST_GOARCH=$($GO_CMD env GOARCH 2>/dev/null || true)
+  HAS_ANDROID=0
+  if command -v adb >/dev/null 2>&1 || [[ -n "${ANDROID_HOME:-}" ]] || [[ "$HOST_GOOS" == "android" ]]; then
+    HAS_ANDROID=1
+  fi
+
+  if [[ "$HOST_GOOS" == "windows" ]]; then
+    # skip iOS-specific packages on Windows
+    pkgs=$(echo "$pkgs" | grep -v '/ios' | grep -v '/darwin' || true)
+  fi
+  if [[ "$HOST_GOOS" == "darwin" || "$HOST_GOOS" == "ios" ]]; then
+    # skip Windows-specific packages on mac/iOS
+    pkgs=$(echo "$pkgs" | grep -v '/windows' | grep -v '/win' || true)
+  fi
+  if [[ "$HAS_ANDROID" -eq 0 ]]; then
+    # exclude android packages if no android tooling present
+    pkgs=$(echo "$pkgs" | grep -v '/android' || true)
+  fi
+
   if [[ $INTEGRATION -eq 1 ]]; then
     echo "Running integration-enabled tests for $dir"
     # Set user-specified env vars expected by tests.

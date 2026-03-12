@@ -17,8 +17,32 @@ foreach ($m in $mods) {
   $dir = Split-Path $m.FullName -Parent
   Write-Host "== Module: $dir =="
   Push-Location $dir
-  $pkgs = & $go list -f "{{if or .GoFiles .TestGoFiles}}{{.ImportPath}}{{end}}" ./... 2>$null | Where-Object { $_ -ne '' }
+  $pkgs = @()
+  try {
+    $out = & $go list -f "{{if or .GoFiles .TestGoFiles}}{{.ImportPath}}{{end}}" ./... 2>$null
+    if ($out) { $pkgs = $out | Where-Object { $_ -ne '' } }
+  } catch {
+    $pkgs = @()
+  }
   if (-not $pkgs) { Write-Host "No testable packages in $dir; skipping."; Pop-Location; continue }
+
+  # Detect host GOOS and Android capability, then filter platform-specific packages
+  $hostGoOs = & $go env GOOS 2>$null 2>$null
+  $hostGoArch = & $go env GOARCH 2>$null 2>$null
+  $hasAndroid = $false
+  if (Get-Command adb -ErrorAction SilentlyContinue) { $hasAndroid = $true }
+  if ($env:ANDROID_HOME) { $hasAndroid = $true }
+  if ($hostGoOs -eq 'android') { $hasAndroid = $true }
+
+  if ($hostGoOs -eq 'windows') {
+    $pkgs = $pkgs | Where-Object { $_ -notlike '*\/ios*' -and $_ -notlike '*\/darwin*' }
+  }
+  if ($hostGoOs -eq 'darwin' -or $hostGoOs -eq 'ios') {
+    $pkgs = $pkgs | Where-Object { $_ -notlike '*\/windows*' -and $_ -notlike '*\/win*' }
+  }
+  if (-not $hasAndroid) {
+    $pkgs = $pkgs | Where-Object { $_ -notlike '*\/android*' }
+  }
 
   if ($Integration) {
     Write-Host "Running integration-enabled tests for $dir"
@@ -38,7 +62,7 @@ foreach ($m in $mods) {
         $isRunning = (& docker inspect -f '{{.State.Running}}' $containerName) -eq 'true'
         if (-not $isRunning) {
           Write-Host "Removing existing container $containerName"
-          & docker rm -f $containerName > $null 2>&1 || true
+          & docker rm -f $containerName > $null 2>&1
         }
       }
 
@@ -84,7 +108,7 @@ foreach ($m in $mods) {
     } finally {
       if ($startedContainer) {
         Write-Host "Stopping and removing temporary container $containerName"
-        & docker rm -f $containerName > $null 2>&1 || true
+        & docker rm -f $containerName > $null 2>&1
       }
     }
   } else {
