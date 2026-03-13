@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'self'"
+    />
+    <meta name="referrer" content="no-referrer" />
+    <title>Counter Lab Mini-App</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="app-header">
+        <div>
+          <p class="eyebrow">Sandboxed Mini-App</p>
+          <h1>Counter Lab</h1>
+          <p class="subcopy">Exercises launch context, session storage, realtime state updates, and projected conversation messages.</p>
+        </div>
+        <p id="status-pill" class="status-pill">Booting bridge...</p>
+      </header>
+
+      <section class="grid">
+        <article class="card stat-card">
+          <p class="label">Shared counter</p>
+          <p id="counter-value" class="counter-value">0</p>
+          <div class="button-strip">
+            <button id="decrement-btn" type="button">-1</button>
+            <button id="increment-btn" type="button">+1</button>
+            <button id="reset-btn" type="button">Reset</button>
+          </div>
+        </article>
+
+        <article class="card">
+          <p class="label">Session note</p>
+          <label class="sr-only" for="note-input">Session note</label>
+          <textarea id="note-input" rows="5" maxlength="240" placeholder="This gets stored through storage.session.*"></textarea>
+          <div class="button-strip">
+            <button id="load-note-btn" type="button">Load</button>
+            <button id="save-note-btn" type="button">Save</button>
+          </div>
+        </article>
+
+        <article class="card">
+          <p class="label">Context</p>
+          <p id="viewer-line" class="meta-line">Viewer: ...</p>
+          <p id="participants-line" class="meta-line">Participants: ...</p>
+          <p id="permissions-line" class="meta-line">Permissions: ...</p>
+          <div class="button-strip">
+            <button id="refresh-context-btn" type="button">Refresh Context</button>
+            <button id="send-summary-btn" type="button">Send Summary</button>
+          </div>
+        </article>
+      </section>
+
+      <section class="bottom-grid">
+        <article class="card">
+          <p class="label">Recent thread context</p>
+          <ul id="recent-messages" class="message-list"></ul>
+        </article>
+
+        <article class="card">
+          <p class="label">App log</p>
+          <ul id="app-log" class="log-list"></ul>
+        </article>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

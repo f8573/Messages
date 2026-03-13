@@ -2,6 +2,7 @@ package miniapp
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 
@@ -31,6 +32,10 @@ func (h *Handler) RegisterManifest(w http.ResponseWriter, r *http.Request) {
 	}
 	id, err := h.svc.RegisterManifest(r.Context(), userID, req.Manifest)
 	if err != nil {
+		if errors.Is(err, ErrManifestRequired) || errors.Is(err, ErrManifestInvalid) || errors.Is(err, ErrManifestSignatureRequired) || errors.Is(err, ErrManifestSignatureInvalid) {
+			httpx.WriteError(w, r, http.StatusBadRequest, "invalid_manifest", err.Error(), nil)
+			return
+		}
 		httpx.WriteError(w, r, http.StatusInternalServerError, "register_failed", err.Error(), nil)
 		return
 	}

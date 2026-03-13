@@ -9,13 +9,24 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
+	"regexp"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"ohmf/services/gateway/internal/config"
 )
+
+var (
+	ErrManifestRequired          = errors.New("manifest_required")
+	ErrManifestInvalid           = errors.New("manifest_invalid")
+	ErrManifestSignatureRequired = errors.New("manifest_signature_required")
+	ErrManifestSignatureInvalid  = errors.New("manifest_signature_invalid")
+)
+
+var semverPattern = regexp.MustCompile(`^\d+\.\d+\.\d+(-[A-Za-z0-9.-]+)?$`)
 
 type Service struct {
 	db        *pgxpool.Pool
@@ -39,25 +50,26 @@ func NewService(db *pgxpool.Pool, cfg config.Config) *Service {
 
 // RegisterManifest stores a mini-app manifest JSON and returns its id.
 func (s *Service) RegisterManifest(ctx context.Context, ownerID string, manifest any) (string, error) {
+	if manifest == nil {
+		return "", ErrManifestRequired
+	}
 	id := uuid.New().String()
-	// Ensure manifest contains a signature block per spec (must be signed).
-	// Expect manifest to be a JSON object with a top-level "signature" field.
 	var mmap map[string]any
 	b, err := json.Marshal(manifest)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: marshal failed", ErrManifestInvalid)
 	}
 	if err := json.Unmarshal(b, &mmap); err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: object required", ErrManifestInvalid)
 	}
-	if _, ok := mmap["signature"]; !ok {
-		return "", fmt.Errorf("manifest_signature_required")
+	if err := validateManifest(mmap); err != nil {
+		return "", err
 	}
 
 	// If a public key is configured, verify the manifest signature.
 	if s.publicKey != nil {
 		if err := s.verifyManifestSignature(mmap); err != nil {
-			return "", fmt.Errorf("manifest_signature_invalid: %w", err)
+			return "", fmt.Errorf("%w: %v", ErrManifestSignatureInvalid, err)
 		}
 	}
 	_, err = s.db.Exec(ctx, `INSERT INTO miniapp_manifests (id, owner_user_id, manifest, created_at) VALUES ($1::uuid, $2::uuid, $3::jsonb, now())`, id, ownerID, string(b))
@@ -67,17 +79,91 @@ func (s *Service) RegisterManifest(ctx context.Context, ownerID string, manifest
 	return id, nil
 }
 
-// verifyManifestSignature verifies a manifest map contains a base64-encoded
-// RSA PKCS1v15 SHA256 signature in `signature` over the manifest JSON with the
-// `signature` field removed.
-func (s *Service) verifyManifestSignature(mmap map[string]any) error {
-	sigVal, ok := mmap["signature"]
-	if !ok {
-		return fmt.Errorf("signature field missing")
+func validateManifest(mmap map[string]any) error {
+	if len(mmap) == 0 {
+		return ErrManifestRequired
 	}
-	sigStr, ok := sigVal.(string)
-	if !ok || sigStr == "" {
-		return fmt.Errorf("signature not a string")
+	if !nonEmptyStringField(mmap, "app_id") {
+		return fmt.Errorf("%w: app_id required", ErrManifestInvalid)
+	}
+	if !nonEmptyStringField(mmap, "name") {
+		return fmt.Errorf("%w: name required", ErrManifestInvalid)
+	}
+	version, ok := mmap["version"].(string)
+	if !ok || !semverPattern.MatchString(version) {
+		return fmt.Errorf("%w: version must be semver", ErrManifestInvalid)
+	}
+	entrypoint, ok := mmap["entrypoint"].(map[string]any)
+	if !ok {
+		return fmt.Errorf("%w: entrypoint object required", ErrManifestInvalid)
+	}
+	entryType, ok := entrypoint["type"].(string)
+	if !ok || (entryType != "url" && entryType != "inline") {
+		return fmt.Errorf("%w: entrypoint.type invalid", ErrManifestInvalid)
+	}
+	if !nonEmptyStringField(entrypoint, "url") {
+		return fmt.Errorf("%w: entrypoint.url required", ErrManifestInvalid)
+	}
+	if _, ok := mmap["permissions"].([]any); !ok {
+		return fmt.Errorf("%w: permissions array required", ErrManifestInvalid)
+	}
+	if _, ok := mmap["capabilities"].(map[string]any); !ok {
+		return fmt.Errorf("%w: capabilities object required", ErrManifestInvalid)
+	}
+	if _, err := manifestSignatureFromMap(mmap); err != nil {
+		return err
+	}
+	return nil
+}
+
+type manifestSignature struct {
+	Alg string
+	KID string
+	Sig string
+}
+
+func manifestSignatureFromMap(mmap map[string]any) (manifestSignature, error) {
+	rawSignature, ok := mmap["signature"]
+	if !ok {
+		return manifestSignature{}, ErrManifestSignatureRequired
+	}
+	sigMap, ok := rawSignature.(map[string]any)
+	if !ok {
+		return manifestSignature{}, fmt.Errorf("%w: signature object required", ErrManifestInvalid)
+	}
+	sig := manifestSignature{
+		Alg: stringField(sigMap, "alg"),
+		KID: stringField(sigMap, "kid"),
+		Sig: stringField(sigMap, "sig"),
+	}
+	if sig.Alg == "" || sig.KID == "" || sig.Sig == "" {
+		return manifestSignature{}, fmt.Errorf("%w: signature.alg, signature.kid, and signature.sig are required", ErrManifestInvalid)
+	}
+	return sig, nil
+}
+
+func nonEmptyStringField(m map[string]any, key string) bool {
+	return stringField(m, key) != ""
+}
+
+func stringField(m map[string]any, key string) string {
+	value, ok := m[key].(string)
+	if !ok {
+		return ""
+	}
+	return value
+}
+
+// verifyManifestSignature verifies a manifest map contains a base64-encoded
+// RSA PKCS1v15 SHA256 signature in `signature.sig` over the manifest JSON with
+// the `signature` field removed.
+func (s *Service) verifyManifestSignature(mmap map[string]any) error {
+	signature, err := manifestSignatureFromMap(mmap)
+	if err != nil {
+		return err
+	}
+	if signature.Alg != "RS256" {
+		return fmt.Errorf("unsupported signature algorithm %q", signature.Alg)
 	}
 
 	// Build payload without the signature field
@@ -93,7 +179,7 @@ func (s *Service) verifyManifestSignature(mmap map[string]any) error {
 		return err
 	}
 
-	sigBytes, err := base64.StdEncoding.DecodeString(sigStr)
+	sigBytes, err := base64.StdEncoding.DecodeString(signature.Sig)
 	if err != nil {
 		return err
 	}
