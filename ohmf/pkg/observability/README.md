@@ -1,9 +1,11 @@
-Observability helpers (scaffold)
+Observability helpers
 
-This package provides a lightweight scaffolding for initializing tracing and metrics across services.
+This package provides shared request correlation and Prometheus export for the lightweight OHMF services in the root module.
 
 Contents:
-- `observability.go`: minimal init helpers and an HTTP middleware placeholder.
+- `observability.go`: logger initialization, request ID and traceparent propagation, request metrics, and `/metrics` handler support.
 
-Next steps:
-- Wire OpenTelemetry exporter configuration and add Prometheus metrics.
+Current metrics:
+- `ohmf_http_requests_total`
+- `ohmf_http_request_duration_seconds`
+- `ohmf_http_requests_in_flight`

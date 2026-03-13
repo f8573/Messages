@@ -1,0 +1,18 @@
+Counter Lab example mini-app
+
+This example adds a concrete, runnable test app for the web mini-app runtime.
+
+Files
+- `manifest.json`: canonical sample manifest for the app.
+- `../../../apps/web/miniapps/counter/`: static assets served by the web demo runtime.
+
+Behavior covered
+- launch context bootstrap
+- bounded conversation read access
+- projected message send through the host
+- session-scoped key/value storage
+- session state updates with host-pushed `session.stateUpdated` events
+
+Local run
+- Serve `ohmf/apps/web` with a static server on `http://localhost:5173`.
+- Open `http://localhost:5173/miniapp-runtime.html`.

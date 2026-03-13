@@ -1,12 +1,12 @@
 ---
-name: ask-opus
-description: Run a query in a subagent that uses the Opus-4.6 model.
+name: ask-codex
+description: Run a query in a subagent that uses the GPT-5.3-Codex model.
 model: GPT-5 mini (copilot)
 agent: agent
 ---
 <USER_REQUEST_INSTRUCTIONS>
 Call #tool:agent/runSubagent - include the following args:
-- agentName: "opus-agent"
+- agentName: "codex-agent"
 - prompt: $USER_QUERY
 </USER_REQUEST_INSTRUCTIONS>
 

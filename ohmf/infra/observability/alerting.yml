@@ -1,0 +1,20 @@
+groups:
+  - name: ohmf-gateway
+    rules:
+      - alert: OHMFGatewayDown
+        expr: up{job="ohmf-gateway"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: OHMF gateway is down
+          description: Prometheus cannot scrape the OHMF gateway metrics endpoint.
+
+      - alert: OHMFGatewayWSConnectionsHigh
+        expr: ohmf_gateway_ws_connections_active > 500
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: OHMF gateway websocket load is elevated
+          description: Active websocket connections stayed above 500 for five minutes.

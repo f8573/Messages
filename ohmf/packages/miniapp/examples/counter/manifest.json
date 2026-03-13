@@ -1,0 +1,32 @@
+{
+  "app_id": "app.ohmf.counter-lab",
+  "name": "Counter Lab",
+  "version": "1.0.0",
+  "entrypoint": {
+    "type": "url",
+    "url": "http://localhost:5173/miniapps/counter/index.html",
+    "mime_type": "text/html"
+  },
+  "permissions": [
+    "conversation.read_context",
+    "conversation.send_message",
+    "storage.session",
+    "realtime.session"
+  ],
+  "capabilities": {
+    "turn_based": true,
+    "offline_resume": true,
+    "host_message_projection": true
+  },
+  "metadata": {
+    "category": "test",
+    "declared_origins": [
+      "http://localhost:5173"
+    ]
+  },
+  "signature": {
+    "alg": "RS256",
+    "kid": "dev-registry-key",
+    "sig": "DEV_SIGNATURE_PLACEHOLDER"
+  }
+}

@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -279,6 +281,40 @@ func TestMessageNonRegisteredPhone(t *testing.T) {
 	items := mustSlice(t, msgs["items"])
 	if len(items) != 1 {
 		t.Fatalf("expected 1 message in phone conversation, got %d", len(items))
+	}
+}
+
+func TestObservabilityEndpoints(t *testing.T) {
+	baseURL := requireIntegrationEnv(t)
+	waitForHealth(t, baseURL)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	readyReq, _ := http.NewRequest(http.MethodGet, baseURL+"/readyz", nil)
+	readyResp, err := client.Do(readyReq)
+	if err != nil {
+		t.Fatalf("readyz request failed: %v", err)
+	}
+	defer readyResp.Body.Close()
+	if readyResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from readyz, got %d", readyResp.StatusCode)
+	}
+
+	metricsReq, _ := http.NewRequest(http.MethodGet, baseURL+"/metrics", nil)
+	metricsResp, err := client.Do(metricsReq)
+	if err != nil {
+		t.Fatalf("metrics request failed: %v", err)
+	}
+	defer metricsResp.Body.Close()
+	if metricsResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from metrics, got %d", metricsResp.StatusCode)
+	}
+	body, err := io.ReadAll(metricsResp.Body)
+	if err != nil {
+		t.Fatalf("reading metrics failed: %v", err)
+	}
+	if !strings.Contains(string(body), "ohmf_gateway_http_requests_total") {
+		t.Fatalf("expected gateway http metrics in response body")
 	}
 }
 

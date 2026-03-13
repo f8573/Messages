@@ -22,9 +22,10 @@ Security considerations
 
 Observability and operational notes
 - Centralized logs (ELK/Opensearch), metrics (Prometheus), traces (OTel collector).
+- Local Prometheus and Grafana assets now live under `infra/observability`.
 
 Testing requirements
 - Infrastructure integration tests (smoke tests) in CI.
 
 References
-- infra/docker for compose, infra/docker/README.md for examples.
+- infra/docker for compose, infra/docker/README.md for examples, infra/observability for metrics and dashboards.
