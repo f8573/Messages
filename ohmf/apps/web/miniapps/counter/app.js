@@ -1,8 +1,4 @@
-"use strict";
-
-const params = new URLSearchParams(window.location.search);
-const channelId = params.get("channel") || "";
-const parentOrigin = params.get("parent_origin") || "";
+import { createMiniAppClientFromLocation } from "../../miniapp-sdk.js";
 
 const state = {
   counter: 0,
@@ -28,6 +24,8 @@ const el = {
   refreshContextBtn: document.getElementById("refresh-context-btn"),
   sendSummaryBtn: document.getElementById("send-summary-btn"),
 };
+
+const bridge = createMiniAppClientFromLocation();
 
 function sanitizeText(value, limit = 240) {
   return String(value || "").replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, limit);
@@ -129,76 +127,25 @@ function renderRecentMessages() {
   });
 }
 
-class HostBridge {
-  constructor(channel, targetOrigin) {
-    this.channel = channel;
-    this.targetOrigin = targetOrigin;
-    this.pending = new Map();
-    window.addEventListener("message", (event) => this.onMessage(event));
-  }
-
-  onMessage(event) {
-    if (event.source !== window.parent) return;
-    if (event.origin !== this.targetOrigin) return;
-    const message = event.data;
-    if (!message || typeof message !== "object") return;
-    if (message.channel !== this.channel) return;
-
-    if (message.bridge_event) {
-      this.onBridgeEvent?.(message.bridge_event, message.payload);
-      return;
-    }
-
-    const pending = this.pending.get(message.request_id);
-    if (!pending) return;
-    this.pending.delete(message.request_id);
-    if (message.ok) {
-      pending.resolve(message.result);
-    } else {
-      const err = new Error(message.error?.message || "Bridge call failed");
-      err.code = message.error?.code || "bridge_error";
-      err.details = message.error?.details;
-      pending.reject(err);
-    }
-  }
-
-  call(method, params = {}) {
-    const requestId = randomId("req");
-    return new Promise((resolve, reject) => {
-      this.pending.set(requestId, { resolve, reject });
-      window.parent.postMessage(
-        {
-          bridge_version: "1.0",
-          channel: this.channel,
-          request_id: requestId,
-          method,
-          params,
-        },
-        this.targetOrigin
-      );
-    });
-  }
-}
-
-const bridge = new HostBridge(channelId, parentOrigin);
-
-bridge.onBridgeEvent = (name, payload) => {
-  addLog(`event ${name}`, payload);
-  if (name === "session.stateUpdated" && payload?.state_snapshot) {
+bridge.on("session.stateUpdated", (payload) => {
+  addLog("event session.stateUpdated", payload);
+  if (payload?.state_snapshot) {
     state.counter = Number(payload.state_snapshot.counter) || 0;
     renderCounter();
     setStatus(`Shared counter updated to ${state.counter}.`);
   }
-  if (name === "session.permissionsUpdated") {
-    if (!state.launchContext) state.launchContext = {};
-    state.launchContext.capabilities_granted = Array.isArray(payload?.capabilities_granted) ? payload.capabilities_granted : [];
-    renderContext();
-    setStatus("Host permission grants changed.");
-  }
-};
+});
+
+bridge.on("session.permissionsUpdated", (payload) => {
+  addLog("event session.permissionsUpdated", payload);
+  if (!state.launchContext) state.launchContext = {};
+  state.launchContext.capabilities_granted = Array.isArray(payload?.capabilities_granted) ? payload.capabilities_granted : [];
+  renderContext();
+  setStatus("Host permission grants changed.");
+});
 
 async function refreshLaunchContext() {
-  const launchContext = await bridge.call("host.getLaunchContext");
+  const launchContext = await bridge.getLaunchContext();
   state.launchContext = launchContext;
   state.counter = Number(launchContext?.state_snapshot?.counter) || 0;
   renderCounter();
@@ -207,14 +154,14 @@ async function refreshLaunchContext() {
 }
 
 async function refreshThreadContext() {
-  const context = await bridge.call("conversation.readContext");
+  const context = await bridge.readConversationContext();
   state.recentMessages = Array.isArray(context?.recent_messages) ? context.recent_messages : [];
   renderRecentMessages();
   addLog("conversation.readContext", context);
 }
 
 async function loadNote() {
-  const result = await bridge.call("storage.session.get", { key: "session_note" });
+  const result = await bridge.getSessionStorage("session_note");
   el.noteInput.value = typeof result?.value === "string" ? result.value : "";
   addLog("storage.session.get", result);
   setStatus("Loaded session note.");
@@ -222,13 +169,13 @@ async function loadNote() {
 
 async function saveNote() {
   const value = sanitizeText(el.noteInput.value, 240);
-  const result = await bridge.call("storage.session.set", { key: "session_note", value });
+  const result = await bridge.setSessionStorage("session_note", value);
   addLog("storage.session.set", result);
   setStatus("Saved session note.");
 }
 
 async function updateCounter(nextValue) {
-  const result = await bridge.call("session.updateState", { counter: nextValue });
+  const result = await bridge.updateSessionState({ counter: nextValue });
   state.counter = Number(result?.state_snapshot?.counter) || 0;
   renderCounter();
   addLog("session.updateState", result);
@@ -236,19 +183,20 @@ async function updateCounter(nextValue) {
 }
 
 async function sendSummary() {
-  const text = `Counter Lab summary: shared counter is ${state.counter}.`;
-  const result = await bridge.call("conversation.sendMessage", { text });
+  const result = await bridge.sendConversationMessage({
+    content_type: "app_event",
+    content: {
+      event_name: "COUNTER_SUMMARY",
+      body: { counter: state.counter },
+    },
+    text: `Counter Lab summary: shared counter is ${state.counter}.`,
+  });
   addLog("conversation.sendMessage", result);
   setStatus("Projected summary into host transcript.");
   await refreshThreadContext();
 }
 
 async function bootstrap() {
-  if (!channelId || !parentOrigin) {
-    setStatus("Missing runtime channel information.", true);
-    return;
-  }
-
   try {
     await refreshLaunchContext();
     await refreshThreadContext();
@@ -318,8 +266,4 @@ el.sendSummaryBtn.addEventListener("click", async () => {
   }
 });
 
-renderCounter();
-renderContext();
-renderRecentMessages();
-renderLog();
 bootstrap();

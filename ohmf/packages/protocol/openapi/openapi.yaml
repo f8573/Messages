@@ -3,7 +3,7 @@ info:
   title: OHMF MVP API
   version: 1.0.0
 servers:
-  - url: http://localhost:18080
+  - url: http://localhost:18081
 components:
   securitySchemes:
     bearerAuth:
@@ -216,6 +216,126 @@ components:
           type: string
           format: date-time
         actor: { type: string }
+    MiniAppParticipant:
+      type: object
+      required: [user_id, role]
+      properties:
+        user_id: { type: string }
+        role: { type: string }
+        display_name: { type: string }
+    MiniAppManifestEnvelope:
+      type: object
+      required: [id, manifest]
+      properties:
+        id: { type: string }
+        owner_user_id: { type: string }
+        manifest:
+          type: object
+          additionalProperties: true
+        created_at:
+          type: string
+          format: date-time
+    MiniAppLaunchContext:
+      type: object
+      properties:
+        app_id: { type: string }
+        app_session_id: { type: string }
+        conversation_id: { type: string }
+        viewer: { $ref: '#/components/schemas/MiniAppParticipant' }
+        participants:
+          type: array
+          items: { $ref: '#/components/schemas/MiniAppParticipant' }
+        capabilities_granted:
+          type: array
+          items: { type: string }
+        state_snapshot:
+          type: object
+          additionalProperties: true
+        state_version: { type: integer }
+    MiniAppSessionState:
+      type: object
+      properties:
+        snapshot:
+          type: object
+          additionalProperties: true
+        session_storage:
+          type: object
+          additionalProperties: true
+        shared_conversation_storage:
+          type: object
+          additionalProperties: true
+        projected_messages:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+    MiniAppSession:
+      type: object
+      properties:
+        app_session_id: { type: string }
+        manifest_id: { type: string }
+        app_id: { type: string }
+        conversation_id: { type: string }
+        participants:
+          type: array
+          items: { $ref: '#/components/schemas/MiniAppParticipant' }
+        capabilities_granted:
+          type: array
+          items: { type: string }
+        state: { $ref: '#/components/schemas/MiniAppSessionState' }
+        state_version: { type: integer }
+        launch_context: { $ref: '#/components/schemas/MiniAppLaunchContext' }
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+    MiniAppRegisterRequest:
+      type: object
+      required: [manifest]
+      properties:
+        manifest:
+          type: object
+          additionalProperties: true
+    MiniAppCreateSessionRequest:
+      type: object
+      required: [conversation_id]
+      properties:
+        manifest_id: { type: string }
+        app_id: { type: string }
+        conversation_id: { type: string }
+        viewer: { $ref: '#/components/schemas/MiniAppParticipant' }
+        participants:
+          type: array
+          items: { $ref: '#/components/schemas/MiniAppParticipant' }
+        capabilities_granted:
+          type: array
+          items: { type: string }
+        state_snapshot:
+          type: object
+          additionalProperties: true
+        ttl_seconds: { type: integer }
+        resume_existing: { type: boolean }
+    MiniAppAppendEventRequest:
+      type: object
+      required: [event_name]
+      properties:
+        event_name: { type: string }
+        body:
+          type: object
+          additionalProperties: true
+    MiniAppSnapshotRequest:
+      type: object
+      properties:
+        state:
+          type: object
+          additionalProperties: true
+        state_version: { type: integer }
+        capabilities_granted:
+          type: array
+          items: { type: string }
 security:
   - bearerAuth: []
 paths:
@@ -509,3 +629,148 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+  /v1/apps/register:
+    post:
+      summary: Register a mini-app manifest
+      operationId: RegisterMiniApp
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MiniAppRegisterRequest' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+  /v1/apps:
+    get:
+      summary: List registered mini-apps
+      operationId: ListMiniApps
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/MiniAppManifestEnvelope' }
+  /v1/apps/{appID}:
+    get:
+      summary: Get the latest manifest for an app id
+      operationId: GetMiniApp
+      parameters:
+        - in: path
+          name: appID
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MiniAppManifestEnvelope' }
+        '404':
+          description: Not Found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+  /v1/apps/sessions:
+    post:
+      summary: Create or resume a mini-app session
+      operationId: CreateMiniAppSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MiniAppCreateSessionRequest' }
+      responses:
+        '200':
+          description: Resumed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MiniAppSession' }
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MiniAppSession' }
+  /v1/apps/sessions/{id}:
+    get:
+      summary: Fetch a mini-app session
+      operationId: GetMiniAppSession
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MiniAppSession' }
+    delete:
+      summary: End a mini-app session
+      operationId: EndMiniAppSession
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '204':
+          description: No Content
+  /v1/apps/sessions/{id}/events:
+    post:
+      summary: Append a mini-app session event
+      operationId: AppendMiniAppEvent
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MiniAppAppendEventRequest' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  event_seq: { type: integer }
+  /v1/apps/sessions/{id}/snapshot:
+    post:
+      summary: Persist a mini-app session snapshot
+      operationId: SnapshotMiniAppSession
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MiniAppSnapshotRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  state_version: { type: integer }

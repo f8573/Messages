@@ -3,7 +3,7 @@ info:
   title: OHMF MVP API
   version: 1.0.0
 servers:
-  - url: http://localhost:18080
+  - url: http://localhost:18081
 components:
   securitySchemes:
     bearerAuth:
@@ -112,6 +112,119 @@ components:
         status: { $ref: '#/components/schemas/SMSDeliveryStatus' }
         queued: { type: boolean }
         ack_timeout_ms: { type: integer, nullable: true }
+    MiniAppParticipant:
+      type: object
+      required: [user_id, role]
+      properties:
+        user_id: { type: string }
+        role: { type: string }
+        display_name: { type: string }
+    MiniAppManifestEnvelope:
+      type: object
+      required: [id, manifest]
+      properties:
+        id: { type: string }
+        owner_user_id: { type: string }
+        manifest:
+          type: object
+          additionalProperties: true
+        created_at:
+          type: string
+          format: date-time
+    MiniAppSessionState:
+      type: object
+      properties:
+        snapshot:
+          type: object
+          additionalProperties: true
+        session_storage:
+          type: object
+          additionalProperties: true
+        shared_conversation_storage:
+          type: object
+          additionalProperties: true
+        projected_messages:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+    MiniAppLaunchContext:
+      type: object
+      properties:
+        app_id: { type: string }
+        app_session_id: { type: string }
+        conversation_id: { type: string }
+        viewer: { $ref: '#/components/schemas/MiniAppParticipant' }
+        participants:
+          type: array
+          items: { $ref: '#/components/schemas/MiniAppParticipant' }
+        capabilities_granted:
+          type: array
+          items: { type: string }
+        state_snapshot:
+          type: object
+          additionalProperties: true
+        state_version: { type: integer }
+    MiniAppSession:
+      type: object
+      properties:
+        app_session_id: { type: string }
+        manifest_id: { type: string }
+        app_id: { type: string }
+        conversation_id: { type: string }
+        participants:
+          type: array
+          items: { $ref: '#/components/schemas/MiniAppParticipant' }
+        capabilities_granted:
+          type: array
+          items: { type: string }
+        state: { $ref: '#/components/schemas/MiniAppSessionState' }
+        state_version: { type: integer }
+        launch_context: { $ref: '#/components/schemas/MiniAppLaunchContext' }
+    MiniAppRegisterRequest:
+      type: object
+      required: [manifest]
+      properties:
+        manifest:
+          type: object
+          additionalProperties: true
+    MiniAppCreateSessionRequest:
+      type: object
+      required: [conversation_id]
+      properties:
+        manifest_id: { type: string }
+        app_id: { type: string }
+        conversation_id: { type: string }
+        viewer: { $ref: '#/components/schemas/MiniAppParticipant' }
+        participants:
+          type: array
+          items: { $ref: '#/components/schemas/MiniAppParticipant' }
+        capabilities_granted:
+          type: array
+          items: { type: string }
+        state_snapshot:
+          type: object
+          additionalProperties: true
+        ttl_seconds: { type: integer }
+        resume_existing: { type: boolean }
+    MiniAppAppendEventRequest:
+      type: object
+      required: [event_name]
+      properties:
+        event_name: { type: string }
+        body:
+          type: object
+          additionalProperties: true
+    MiniAppSnapshotRequest:
+      type: object
+      properties:
+        state:
+          type: object
+          additionalProperties: true
+        state_version: { type: integer }
+        capabilities_granted:
+          type: array
+          items: { type: string }
 security:
   - bearerAuth: []
 paths:
@@ -245,3 +358,89 @@ paths:
       responses:
         '204':
           description: No Content
+  /v1/apps/register:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MiniAppRegisterRequest' }
+      responses:
+        '201':
+          description: Created
+  /v1/apps:
+    get:
+      responses:
+        '200':
+          description: OK
+  /v1/apps/{appID}:
+    get:
+      parameters:
+        - in: path
+          name: appID
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+  /v1/apps/sessions:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MiniAppCreateSessionRequest' }
+      responses:
+        '200':
+          description: OK
+        '201':
+          description: Created
+  /v1/apps/sessions/{id}:
+    get:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+    delete:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '204':
+          description: No Content
+  /v1/apps/sessions/{id}/events:
+    post:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MiniAppAppendEventRequest' }
+      responses:
+        '201':
+          description: Created
+  /v1/apps/sessions/{id}/snapshot:
+    post:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MiniAppSnapshotRequest' }
+      responses:
+        '200':
+          description: OK

@@ -465,9 +465,18 @@ body {
 .composer {
   border-top: 1px solid var(--border);
   padding: 0.8rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  background:
+    linear-gradient(180deg, rgba(246, 250, 247, 0.98), rgba(255, 255, 255, 0.98));
+}
+
+.composer-main {
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: auto 1fr auto;
   gap: 0.6rem;
+  align-items: center;
 }
 
 .composer input {
@@ -503,6 +512,192 @@ body {
 .send-btn.full {
   width: 100%;
   min-height: 2.45rem;
+}
+
+.secondary-btn {
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 0 1rem;
+  font: inherit;
+  font-weight: 700;
+  color: var(--text);
+  background: #fff;
+  cursor: pointer;
+}
+
+.secondary-btn.compact {
+  padding: 0.55rem 0.85rem;
+  border-radius: 12px;
+}
+
+.attach-btn {
+  flex: 0 0 auto;
+}
+
+.miniapp-launcher {
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  background:
+    linear-gradient(180deg, rgba(232, 243, 236, 0.96), rgba(250, 252, 250, 0.98));
+  padding: 0.85rem;
+  display: grid;
+  gap: 0.8rem;
+}
+
+.miniapp-launcher-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.miniapp-kicker,
+.miniapp-config-label,
+.miniapp-preview-subtitle {
+  margin: 0;
+  color: var(--subtle);
+  font-size: 0.75rem;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.miniapp-title,
+.miniapp-preview-title {
+  margin: 0.1rem 0 0;
+  font-size: 1rem;
+  letter-spacing: -0.02em;
+}
+
+.miniapp-close-btn {
+  width: 32px;
+  height: 32px;
+}
+
+.miniapp-picker {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.miniapp-card {
+  border: 1px solid rgba(31, 122, 80, 0.18);
+  background: rgba(255, 255, 255, 0.85);
+  border-radius: 18px;
+  padding: 0.8rem 0.9rem;
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  min-width: 240px;
+  cursor: pointer;
+  text-align: left;
+  box-shadow: 0 12px 26px rgba(28, 61, 40, 0.07);
+}
+
+.miniapp-card:hover,
+.miniapp-card.active {
+  border-color: rgba(31, 122, 80, 0.45);
+  background: #fff;
+}
+
+.miniapp-card-icon {
+  width: 42px;
+  height: 42px;
+  border-radius: 14px;
+  display: grid;
+  place-items: center;
+  background: linear-gradient(145deg, #1f7a50, #2ea46c);
+  color: #fff;
+  font-weight: 800;
+  font-size: 1.1rem;
+}
+
+.miniapp-card-copy {
+  display: grid;
+  gap: 0.15rem;
+}
+
+.miniapp-card-copy strong {
+  font-size: 0.92rem;
+}
+
+.miniapp-card-copy span,
+.miniapp-config-copy,
+.miniapp-config-value {
+  color: var(--subtle);
+  font-size: 0.82rem;
+  line-height: 1.35;
+}
+
+.miniapp-stage {
+  display: grid;
+  grid-template-columns: minmax(0, 1.45fr) minmax(260px, 0.9fr);
+  gap: 0.85rem;
+  align-items: stretch;
+}
+
+.miniapp-preview,
+.miniapp-config {
+  border: 1px solid rgba(31, 122, 80, 0.14);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.88);
+  min-height: 0;
+}
+
+.miniapp-preview {
+  padding: 0.75rem;
+  display: grid;
+  grid-template-rows: auto 1fr;
+  gap: 0.65rem;
+}
+
+.miniapp-frame-wrap {
+  min-height: 340px;
+  border-radius: 16px;
+  overflow: hidden;
+  background: #eff6f1;
+  border: 1px solid rgba(31, 122, 80, 0.12);
+}
+
+.miniapp-frame-wrap iframe {
+  width: 100%;
+  height: 100%;
+  min-height: 340px;
+  border: 0;
+  background: #fff;
+}
+
+.miniapp-config {
+  padding: 0.8rem;
+  display: grid;
+  align-content: start;
+  gap: 0.8rem;
+}
+
+.miniapp-config-block {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.miniapp-permissions {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.miniapp-permission {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+  font-size: 0.84rem;
+}
+
+.miniapp-permission input {
+  margin-top: 0.12rem;
+}
+
+.miniapp-config-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
 }
 
 @keyframes appear {
@@ -551,5 +746,13 @@ body {
 
   .back-btn {
     display: inline-block;
+  }
+
+  .miniapp-stage {
+    grid-template-columns: 1fr;
+  }
+
+  .composer-main {
+    grid-template-columns: auto 1fr auto;
   }
 }

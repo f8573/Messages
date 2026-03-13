@@ -2,8 +2,9 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Mini App Manifest",
   "type": "object",
-  "required": ["app_id","name","version","entrypoint","permissions","capabilities","signature"],
+  "required": ["app_id","name","version","entrypoint","permissions","capabilities"],
   "properties": {
+    "manifest_version": {"type":"string","minLength":1},
     "app_id": {"type":"string","minLength":1},
     "name": {"type":"string","minLength":1},
     "version": {"type":"string","pattern":"^\\d+\\.\\d+\\.\\d+(-[A-Za-z0-9.-]+)?$"},
@@ -11,7 +12,7 @@
       "type":"object",
       "required":["type","url"],
       "properties":{
-        "type":{"type":"string","enum":["url","inline"]},
+        "type":{"type":"string","enum":["url","inline","web_bundle"]},
         "url":{"type":"string","format":"uri"},
         "mime_type": {"type":"string"}
       },
@@ -21,12 +22,17 @@
       "type":"array",
       "items":{
         "type":"object",
-        "required":["src","sizes"],
         "properties":{
           "src":{"type":"string","format":"uri"},
           "sizes":{"type":"string"},
-          "type":{"type":"string"}
+          "type":{"type":"string"},
+          "url":{"type":"string","format":"uri"},
+          "size":{"type":"integer","minimum":1}
         },
+        "anyOf":[
+          {"required":["src","sizes"]},
+          {"required":["url","size"]}
+        ],
         "additionalProperties": false
       }
     },

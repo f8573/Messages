@@ -5,12 +5,13 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self' http://localhost:18081 http://127.0.0.1:18081 https: http:; frame-src 'self' https: http:; object-src 'none'; base-uri 'none'; form-action 'self'"
     />
     <meta name="referrer" content="no-referrer" />
     <meta http-equiv="Permissions-Policy" content="camera=(), microphone=(), geolocation=()" />
     <title>OHMF Mini-App Runtime Lab</title>
     <link rel="stylesheet" href="./miniapp-runtime.css" />
+    <script src="./frontend-config.js?v=20260313b"></script>
   </head>
   <body>
     <div class="shell">
@@ -19,7 +20,7 @@
           <p class="eyebrow">Embedded App API</p>
           <h1>Mini-App Runtime Lab</h1>
           <p class="hero-copy">
-            Loads a sandboxed mini-app, exposes a small bridge, and lets you deny permissions to test host behavior.
+            Loads a sandboxed mini-app, exposes the web host bridge, and uses gateway-backed sessions when an OHMF web auth session is available.
           </p>
         </div>
         <p class="status" id="runtime-status" role="status" aria-live="polite">Ready.</p>
@@ -93,6 +94,6 @@
       </main>
     </div>
 
-    <script src="./miniapp-runtime.js"></script>
+    <script src="./miniapp-runtime.js?v=20260313b"></script>
   </body>
 </html>

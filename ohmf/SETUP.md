@@ -27,15 +27,15 @@ docker compose -f .\infra\docker\docker-compose.yml ps
 API health:
 
 ```powershell
-Invoke-WebRequest -UseBasicParsing http://localhost:18080/healthz
+Invoke-WebRequest -UseBasicParsing http://localhost:18081/healthz
 ```
 
 Expected status: `200`.
 
 ## 3) Core Endpoints
 
-- REST API base: `http://localhost:18080/v1`
-- WebSocket: `ws://localhost:18080/v1/ws?access_token=<JWT>`
+- REST API base: `http://localhost:18081/v1`
+- WebSocket: `ws://localhost:18081/v1/ws?access_token=<JWT>`
 
 OpenAPI contract:
 
