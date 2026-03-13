@@ -1,21 +1,31 @@
 "use strict";
 
 const DEFAULT_MANIFEST_URL = "./miniapps/counter/manifest.json";
-const STORAGE_PREFIX = "ohmf.miniapp.runtime.v1";
+const FRONTEND_PORT = String(window.OHMF_WEB_CONFIG?.frontend_port || window.location.port || "5174");
+const DEFAULT_API_BASE_URL = (window.OHMF_WEB_CONFIG?.api_base_url || window.localStorage.getItem("ohmf.apiBaseUrl") || "http://localhost:18081").replace(/\/+$/, "");
+const AUTH_STORAGE_KEY = "ohmf.auth.session.v1";
+const STORAGE_PREFIX = "ohmf.miniapp.runtime.v2";
 const PERMISSION_DESCRIPTIONS = Object.freeze({
-  "conversation.read_context": "Lets the app inspect a small recent window from the active conversation.",
-  "conversation.send_message": "Lets the app project app-generated messages into the conversation transcript.",
-  "storage.session": "Lets the app persist session-scoped key/value state in the host.",
-  "realtime.session": "Lets the app update session state and receive state change events.",
+  "conversation.read_context": "Read bounded thread metadata and a recent message window.",
+  "conversation.send_message": "Project user-approved app messages into the conversation transcript.",
+  "participants.read_basic": "Read participant ids, display names, and assigned roles.",
+  "storage.session": "Persist app-private session key/value state through the host.",
+  "storage.shared_conversation": "Persist conversation-scoped shared app state through the host.",
+  "realtime.session": "Update shared session state and receive state change events.",
+  "media.pick_user": "Open the host media picker after explicit user action.",
+  "notifications.in_app": "Display host-mediated in-app prompts and status badges.",
 });
 
 const state = {
   manifest: null,
+  auth: null,
+  apiBaseUrl: DEFAULT_API_BASE_URL,
   grantedPermissions: new Set(),
   frameWindow: null,
   channelId: "",
   launchContext: null,
   sessionState: null,
+  sessionMode: "local",
   logEntries: [],
 };
 
@@ -48,8 +58,16 @@ function randomId(prefix) {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function cloneJson(value) {
+  return value === undefined ? null : JSON.parse(JSON.stringify(value));
+}
+
 function storageKey(appId) {
-  return `${STORAGE_PREFIX}.${appId}`;
+  return `${STORAGE_PREFIX}.${appId}.session`;
+}
+
+function conversationKey(appId) {
+  return `${STORAGE_PREFIX}.${appId}.conversation_id`;
 }
 
 function defaultTranscript() {
@@ -69,31 +87,54 @@ function defaultTranscript() {
   ];
 }
 
-function loadSavedSession(appId) {
-  const raw = window.localStorage.getItem(storageKey(appId));
-  if (!raw) {
+function defaultSessionState() {
+  return {
+    stateVersion: 1,
+    stateSnapshot: { counter: 0, updated_by: "host" },
+    storage: {},
+    sharedConversationStorage: {},
+    transcript: defaultTranscript(),
+  };
+}
+
+function normalizeSessionState(raw) {
+  if (!raw || typeof raw !== "object") {
+    return defaultSessionState();
+  }
+  if ("snapshot" in raw || "session_storage" in raw || "shared_conversation_storage" in raw || "projected_messages" in raw) {
     return {
-      stateVersion: 1,
-      stateSnapshot: { counter: 0, updated_by: "host" },
-      storage: {},
-      transcript: defaultTranscript(),
+      stateVersion: Number(raw.state_version) > 0 ? Number(raw.state_version) : 1,
+      stateSnapshot: raw.snapshot && typeof raw.snapshot === "object" ? raw.snapshot : { counter: 0, updated_by: "host" },
+      storage: raw.session_storage && typeof raw.session_storage === "object" ? raw.session_storage : {},
+      sharedConversationStorage: raw.shared_conversation_storage && typeof raw.shared_conversation_storage === "object" ? raw.shared_conversation_storage : {},
+      transcript: Array.isArray(raw.projected_messages) && raw.projected_messages.length ? raw.projected_messages : defaultTranscript(),
     };
   }
+  return {
+    stateVersion: Number(raw.stateVersion) > 0 ? Number(raw.stateVersion) : 1,
+    stateSnapshot: raw.stateSnapshot && typeof raw.stateSnapshot === "object" ? raw.stateSnapshot : { counter: 0, updated_by: "host" },
+    storage: raw.storage && typeof raw.storage === "object" ? raw.storage : {},
+    sharedConversationStorage: raw.sharedConversationStorage && typeof raw.sharedConversationStorage === "object" ? raw.sharedConversationStorage : {},
+    transcript: Array.isArray(raw.transcript) && raw.transcript.length ? raw.transcript : defaultTranscript(),
+  };
+}
+
+function sessionEnvelopeFromState() {
+  return {
+    snapshot: cloneJson(state.sessionState?.stateSnapshot || {}),
+    session_storage: cloneJson(state.sessionState?.storage || {}),
+    shared_conversation_storage: cloneJson(state.sessionState?.sharedConversationStorage || {}),
+    projected_messages: cloneJson(state.sessionState?.transcript || []),
+  };
+}
+
+function loadSavedSession(appId) {
+  const raw = window.localStorage.getItem(storageKey(appId));
+  if (!raw) return defaultSessionState();
   try {
-    const parsed = JSON.parse(raw);
-    return {
-      stateVersion: Number(parsed.stateVersion) > 0 ? Number(parsed.stateVersion) : 1,
-      stateSnapshot: parsed.stateSnapshot && typeof parsed.stateSnapshot === "object" ? parsed.stateSnapshot : { counter: 0, updated_by: "host" },
-      storage: parsed.storage && typeof parsed.storage === "object" ? parsed.storage : {},
-      transcript: Array.isArray(parsed.transcript) ? parsed.transcript : defaultTranscript(),
-    };
+    return normalizeSessionState(JSON.parse(raw));
   } catch {
-    return {
-      stateVersion: 1,
-      stateSnapshot: { counter: 0, updated_by: "host" },
-      storage: {},
-      transcript: defaultTranscript(),
-    };
+    return defaultSessionState();
   }
 }
 
@@ -105,6 +146,27 @@ function saveSession() {
 function clearSavedSession() {
   if (!state.manifest?.app_id) return;
   window.localStorage.removeItem(storageKey(state.manifest.app_id));
+}
+
+function loadConversationID(appId) {
+  const key = conversationKey(appId);
+  const existing = window.localStorage.getItem(key);
+  if (existing) return existing;
+  const generated = window.crypto?.randomUUID?.() || `${Date.now()}00000000-0000-4000-8000-000000000000`.slice(0, 36);
+  window.localStorage.setItem(key, generated);
+  return generated;
+}
+
+function loadRuntimeAuth() {
+  const raw = window.sessionStorage.getItem(AUTH_STORAGE_KEY);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed?.accessToken || !parsed?.userId) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
 }
 
 function setStatus(message, isError = false) {
@@ -137,14 +199,12 @@ function renderLog() {
   state.logEntries.forEach((entry) => {
     const item = document.createElement("li");
     item.className = `log-item ${entry.kind}`;
-
     const header = document.createElement("header");
     const title = document.createElement("strong");
     title.textContent = entry.summary;
     const time = document.createElement("span");
     time.textContent = entry.time;
     header.append(title, time);
-
     item.append(header);
     if (entry.detail) {
       const pre = document.createElement("pre");
@@ -169,7 +229,6 @@ function renderTranscript() {
   transcript.forEach((message) => {
     const item = document.createElement("li");
     item.className = "transcript-item";
-
     const header = document.createElement("header");
     const author = document.createElement("strong");
     author.textContent = sanitizeText(message.author, 60) || "System";
@@ -177,10 +236,8 @@ function renderTranscript() {
     const d = new Date(message.createdAt);
     time.textContent = Number.isNaN(d.getTime()) ? "" : d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
     header.append(author, time);
-
     const body = document.createElement("div");
     body.textContent = sanitizeText(message.text, 280) || "(empty)";
-
     item.append(header, body);
     el.transcriptList.append(item);
   });
@@ -192,6 +249,15 @@ function renderManifest() {
 
 function renderContext() {
   el.contextJson.textContent = state.launchContext ? JSON.stringify(state.launchContext, null, 2) : "";
+}
+
+function currentGrantedPermissions() {
+  return Array.from(state.grantedPermissions).sort();
+}
+
+function syncLaunchContextPermissions() {
+  if (!state.launchContext) return;
+  state.launchContext.capabilities_granted = currentGrantedPermissions();
 }
 
 function renderPermissions() {
@@ -208,7 +274,6 @@ function renderPermissions() {
   permissions.forEach((permission) => {
     const item = document.createElement("label");
     item.className = "permission-item";
-
     const input = document.createElement("input");
     input.type = "checkbox";
     input.checked = state.grantedPermissions.has(permission);
@@ -223,8 +288,13 @@ function renderPermissions() {
         app_session_id: state.launchContext?.app_session_id,
         capabilities_granted: currentGrantedPermissions(),
       });
-      setStatus(`Updated permission grants for ${state.manifest?.name || "app"}.`);
       renderContext();
+      setStatus(`Updated permission grants for ${state.manifest?.name || "app"}.`);
+      void persistSessionState(0, "PERMISSIONS_UPDATED", {
+        capabilities_granted: currentGrantedPermissions(),
+      }).catch((error) => {
+        addLog("error", "runtime.permissions_persist_failed", { message: error.message || String(error) });
+      });
     });
 
     const copy = document.createElement("div");
@@ -240,37 +310,29 @@ function renderPermissions() {
   });
 }
 
-function currentGrantedPermissions() {
-  return Array.from(state.grantedPermissions).sort();
-}
-
-function syncLaunchContextPermissions() {
-  if (!state.launchContext) return;
-  state.launchContext.capabilities_granted = currentGrantedPermissions();
-}
-
 function rewriteLocalDevEntrypoint(rawUrl) {
   const url = new URL(rawUrl, window.location.href);
-  const localOrigins = new Set(["http://localhost:5173", "http://127.0.0.1:5173"]);
-  if (localOrigins.has(url.origin) && url.origin !== window.location.origin) {
+  const localHosts = new Set(["localhost", "127.0.0.1"]);
+  if (localHosts.has(url.hostname) && localHosts.has(window.location.hostname) && url.port !== FRONTEND_PORT) {
     url.protocol = window.location.protocol;
-    url.host = window.location.host;
+    url.host = `${window.location.hostname}:${FRONTEND_PORT}`;
   }
   return url.toString();
 }
 
 function validateManifest(manifest) {
-  if (!manifest || typeof manifest !== "object") {
-    throw new Error("Manifest must be a JSON object.");
-  }
+  if (!manifest || typeof manifest !== "object") throw new Error("Manifest must be a JSON object.");
   if (!sanitizeText(manifest.app_id, 120)) throw new Error("Manifest is missing app_id.");
   if (!sanitizeText(manifest.name, 120)) throw new Error("Manifest is missing name.");
   if (!sanitizeText(manifest.version, 40)) throw new Error("Manifest is missing version.");
   if (!manifest.entrypoint || typeof manifest.entrypoint !== "object") throw new Error("Manifest entrypoint is required.");
+  if (!["url", "inline", "web_bundle"].includes(sanitizeText(manifest.entrypoint.type, 40))) throw new Error("Manifest entrypoint.type is invalid.");
   if (!sanitizeText(manifest.entrypoint.url, 400)) throw new Error("Manifest entrypoint.url is required.");
   if (!Array.isArray(manifest.permissions)) throw new Error("Manifest permissions must be an array.");
   if (!manifest.capabilities || typeof manifest.capabilities !== "object") throw new Error("Manifest capabilities must be an object.");
-  if (!manifest.signature || typeof manifest.signature !== "object") throw new Error("Manifest signature is required.");
+  if (manifest.signature !== undefined && manifest.signature !== null && typeof manifest.signature !== "object") {
+    throw new Error("Manifest signature must be an object when provided.");
+  }
 }
 
 async function fetchManifest(url) {
@@ -281,24 +343,164 @@ async function fetchManifest(url) {
   const manifest = await response.json();
   validateManifest(manifest);
   manifest.entrypoint.url = rewriteLocalDevEntrypoint(manifest.entrypoint.url);
+  if (!manifest.manifest_version) {
+    manifest.manifest_version = "1.0";
+  }
   return manifest;
 }
 
-function buildLaunchContext() {
+function buildViewer() {
+  state.auth = loadRuntimeAuth();
+  if (state.auth?.userId) {
+    return {
+      user_id: state.auth.userId,
+      role: "PLAYER",
+      display_name: state.auth.phoneE164 || state.auth.userId,
+    };
+  }
+  return { user_id: "usr_demo_1", role: "PLAYER", display_name: "Avery" };
+}
+
+function buildParticipants(viewer) {
+  return [
+    viewer,
+    { user_id: "usr_demo_2", role: "PLAYER", display_name: "Jordan" },
+  ];
+}
+
+function buildLocalLaunchContext() {
   const saved = loadSavedSession(state.manifest.app_id);
+  const viewer = buildViewer();
+  state.sessionMode = "local";
   state.sessionState = saved;
   state.launchContext = {
     app_id: state.manifest.app_id,
     app_session_id: randomId("aps"),
-    conversation_id: "cnv_demo_runtime",
-    viewer: { user_id: "usr_demo_1", role: "PLAYER", display_name: "Avery" },
-    participants: [
-      { user_id: "usr_demo_1", role: "PLAYER", display_name: "Avery" },
-      { user_id: "usr_demo_2", role: "PLAYER", display_name: "Jordan" },
-    ],
+    conversation_id: loadConversationID(state.manifest.app_id),
+    viewer,
+    participants: buildParticipants(viewer),
     capabilities_granted: currentGrantedPermissions(),
-    state_snapshot: state.sessionState.stateSnapshot,
+    state_snapshot: saved.stateSnapshot,
+    state_version: saved.stateVersion,
   };
+}
+
+function applySessionRecord(record, mode) {
+  state.sessionMode = mode;
+  state.sessionState = normalizeSessionState({
+    state_version: record?.state_version,
+    snapshot: record?.state?.snapshot,
+    session_storage: record?.state?.session_storage,
+    shared_conversation_storage: record?.state?.shared_conversation_storage,
+    projected_messages: record?.state?.projected_messages,
+  });
+  state.launchContext = record?.launch_context || {
+    app_id: state.manifest.app_id,
+    app_session_id: record?.app_session_id || randomId("aps"),
+    conversation_id: record?.conversation_id || loadConversationID(state.manifest.app_id),
+    viewer: buildViewer(),
+    participants: buildParticipants(buildViewer()),
+    capabilities_granted: Array.isArray(record?.capabilities_granted) ? record.capabilities_granted : currentGrantedPermissions(),
+    state_snapshot: state.sessionState.stateSnapshot,
+    state_version: state.sessionState.stateVersion,
+  };
+  state.grantedPermissions = new Set(Array.isArray(record?.capabilities_granted) && record.capabilities_granted.length ? record.capabilities_granted : state.manifest.permissions);
+  syncLaunchContextPermissions();
+  saveSession();
+}
+
+async function gatewayRequest(path, options = {}) {
+  state.auth = loadRuntimeAuth();
+  if (!state.auth?.accessToken) {
+    throw new Error("No OHMF web auth session is available.");
+  }
+
+  const headers = new Headers(options.headers || {});
+  headers.set("Authorization", `Bearer ${state.auth.accessToken}`);
+  let body = options.body;
+  if (body !== undefined) {
+    headers.set("Content-Type", "application/json");
+    body = JSON.stringify(body);
+  }
+
+  const response = await fetch(`${state.apiBaseUrl}${path}`, {
+    method: options.method || "GET",
+    headers,
+    body,
+  });
+
+  const text = await response.text();
+  let payload = null;
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = { raw: text };
+    }
+  }
+
+  if (!response.ok) {
+    const err = new Error(payload?.message || `Gateway request failed with ${response.status}.`);
+    err.code = payload?.code || "gateway_error";
+    err.status = response.status;
+    err.details = payload?.details;
+    throw err;
+  }
+  return payload;
+}
+
+async function ensureManifestRegistered() {
+  try {
+    return await gatewayRequest(`/v1/apps/${encodeURIComponent(state.manifest.app_id)}`);
+  } catch (error) {
+    if (error.status !== 404) throw error;
+  }
+
+  await gatewayRequest("/v1/apps/register", {
+    method: "POST",
+    body: { manifest: state.manifest },
+  });
+  return gatewayRequest(`/v1/apps/${encodeURIComponent(state.manifest.app_id)}`);
+}
+
+async function ensureGatewaySession() {
+  await ensureManifestRegistered();
+  const viewer = buildViewer();
+  const localSeed = loadSavedSession(state.manifest.app_id);
+  const record = await gatewayRequest("/v1/apps/sessions", {
+    method: "POST",
+    body: {
+      app_id: state.manifest.app_id,
+      conversation_id: loadConversationID(state.manifest.app_id),
+      viewer,
+      participants: buildParticipants(viewer),
+      capabilities_granted: currentGrantedPermissions(),
+      state_snapshot: localSeed.stateSnapshot,
+      resume_existing: true,
+    },
+  });
+  applySessionRecord(record, "gateway");
+}
+
+async function initializeSession() {
+  state.auth = loadRuntimeAuth();
+  if (state.auth?.accessToken) {
+    try {
+      await ensureGatewaySession();
+      addLog("ok", "runtime.gateway_session", {
+        app_session_id: state.launchContext?.app_session_id,
+        conversation_id: state.launchContext?.conversation_id,
+      });
+      return;
+    } catch (error) {
+      addLog("error", "runtime.gateway_session_failed", { message: error.message || String(error), code: error.code });
+    }
+  }
+  buildLocalLaunchContext();
+  addLog("ok", "runtime.local_session", {
+    app_session_id: state.launchContext?.app_session_id,
+    conversation_id: state.launchContext?.conversation_id,
+  });
 }
 
 function buildFrameUrl() {
@@ -312,10 +514,11 @@ function buildFrameUrl() {
 function launchFrame() {
   state.channelId = randomId("chan");
   state.frameWindow = null;
-  el.frame.setAttribute("sandbox", "allow-scripts");
+  el.frame.setAttribute("sandbox", "allow-scripts allow-same-origin");
   el.frame.src = buildFrameUrl();
-  setStatus(`Launching ${state.manifest.name}.`);
-  addLog("ok", "runtime.launch", { entrypoint: state.manifest.entrypoint.url, channel: state.channelId });
+  const suffix = state.sessionMode === "gateway" ? " using gateway session." : " using local fallback session.";
+  setStatus(`Launching ${state.manifest.name}${suffix}`);
+  addLog("ok", "runtime.launch", { entrypoint: state.manifest.entrypoint.url, channel: state.channelId, mode: state.sessionMode });
 }
 
 function requirePermission(permission) {
@@ -328,24 +531,24 @@ function requirePermission(permission) {
   }
 }
 
-function cloneJson(value) {
-  return value === undefined ? null : JSON.parse(JSON.stringify(value));
-}
-
 function pushBridgeEvent(name, payload) {
   if (!state.frameWindow) return;
-  const message = {
-    bridge_event: name,
-    channel: state.channelId,
-    payload: cloneJson(payload),
-  };
-  state.frameWindow.postMessage(message, "*");
+  state.frameWindow.postMessage(
+    {
+      bridge_version: "1.0",
+      bridge_event: name,
+      channel: state.channelId,
+      payload: cloneJson(payload),
+    },
+    "*"
+  );
   addLog("ok", name, payload);
 }
 
 function sendBridgeResponse(targetWindow, requestId, ok, result, error) {
   targetWindow.postMessage(
     {
+      bridge_version: "1.0",
       channel: state.channelId,
       request_id: requestId,
       ok,
@@ -356,43 +559,159 @@ function sendBridgeResponse(targetWindow, requestId, ok, result, error) {
   );
 }
 
-function appendProjectedMessage(text) {
+function appendProjectedMessage(text, contentType = "app_event", content = null) {
   state.sessionState.transcript.push({
     id: randomId("msg"),
     author: state.manifest.name,
     text,
+    content_type: contentType,
+    content: cloneJson(content),
     createdAt: new Date().toISOString(),
   });
   state.sessionState.transcript = state.sessionState.transcript.slice(-20);
-  saveSession();
   renderTranscript();
+  saveSession();
 }
 
-function applyStateUpdate(params) {
+async function appendSessionEvent(eventName, body) {
+  if (state.sessionMode !== "gateway" || !state.launchContext?.app_session_id) return null;
+  return gatewayRequest(`/v1/apps/sessions/${encodeURIComponent(state.launchContext.app_session_id)}/events`, {
+    method: "POST",
+    body: { event_name: eventName, body },
+  });
+}
+
+async function persistSessionState(version, eventName, eventBody) {
+  if (!state.sessionState) return 0;
+  saveSession();
+
+  if (state.sessionMode !== "gateway" || !state.launchContext?.app_session_id) {
+    if (version > 0) {
+      state.sessionState.stateVersion = version;
+      state.launchContext.state_version = version;
+    }
+    return state.sessionState.stateVersion;
+  }
+
+  try {
+    const payload = await gatewayRequest(`/v1/apps/sessions/${encodeURIComponent(state.launchContext.app_session_id)}/snapshot`, {
+      method: "POST",
+      body: {
+        state: sessionEnvelopeFromState(),
+        state_version: version,
+        capabilities_granted: currentGrantedPermissions(),
+      },
+    });
+    state.sessionState.stateVersion = Number(payload?.state_version) > 0 ? Number(payload.state_version) : state.sessionState.stateVersion;
+    state.launchContext.state_version = state.sessionState.stateVersion;
+    state.launchContext.state_snapshot = cloneJson(state.sessionState.stateSnapshot);
+    saveSession();
+    if (eventName) {
+      await appendSessionEvent(eventName, eventBody);
+    }
+    return state.sessionState.stateVersion;
+  } catch (error) {
+    if (error.status === 409 && state.launchContext?.app_session_id) {
+      const refreshed = await gatewayRequest(`/v1/apps/sessions/${encodeURIComponent(state.launchContext.app_session_id)}`);
+      applySessionRecord(refreshed, "gateway");
+    }
+    throw error;
+  }
+}
+
+async function applyStateUpdate(params) {
   requirePermission("realtime.session");
-  const nextCounter = Math.max(0, Math.min(9999, Number(params?.counter) || 0));
-  state.sessionState.stateVersion += 1;
+  const requested = params && typeof params === "object" ? cloneJson(params) : {};
+  if ("counter" in requested) {
+    requested.counter = Math.max(0, Math.min(9999, Number(requested.counter) || 0));
+  }
+
   state.sessionState.stateSnapshot = {
-    counter: nextCounter,
-    updated_by: state.launchContext?.viewer?.display_name || "app",
+    ...cloneJson(state.sessionState.stateSnapshot || {}),
+    ...requested,
+    updated_by: state.launchContext?.viewer?.display_name || state.launchContext?.viewer?.user_id || "app",
     updated_at: new Date().toISOString(),
   };
-  state.launchContext.state_snapshot = state.sessionState.stateSnapshot;
-  saveSession();
+  state.sessionState.stateVersion += 1;
+  state.launchContext.state_snapshot = cloneJson(state.sessionState.stateSnapshot);
+  state.launchContext.state_version = state.sessionState.stateVersion;
+
+  const persistedVersion = await persistSessionState(state.sessionState.stateVersion, "STATE_UPDATED", {
+    app_session_id: state.launchContext.app_session_id,
+    delta: requested,
+    state_version: state.sessionState.stateVersion,
+  });
+
   renderContext();
   pushBridgeEvent("session.stateUpdated", {
     app_session_id: state.launchContext.app_session_id,
-    state_version: state.sessionState.stateVersion,
-    delta: { counter: nextCounter },
+    state_version: persistedVersion,
+    delta: requested,
     state_snapshot: state.sessionState.stateSnapshot,
   });
-  return {
-    state_version: state.sessionState.stateVersion,
-    state_snapshot: state.sessionState.stateSnapshot,
-  };
+  return { state_version: persistedVersion, state_snapshot: state.sessionState.stateSnapshot };
 }
 
-function handleBridgeCall(message) {
+function summarizeMessagePayload(params) {
+  const explicitText = sanitizeText(params?.text, 220);
+  if (explicitText) return explicitText;
+  const bodyText = sanitizeText(params?.content?.body?.text, 220);
+  if (bodyText) return bodyText;
+  const eventName = sanitizeText(params?.content?.event_name, 80);
+  if (eventName) return `${state.manifest.name}: ${eventName}`;
+  return `${state.manifest.name} posted an update.`;
+}
+
+async function pickUserMedia(params) {
+  requirePermission("media.pick_user");
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = sanitizeText(params?.accept, 200);
+  input.multiple = Boolean(params?.multiple);
+
+  const files = await new Promise((resolve) => {
+    input.addEventListener("change", () => resolve(Array.from(input.files || [])), { once: true });
+    input.click();
+  });
+
+  const items = await Promise.all(
+    files.slice(0, input.multiple ? 5 : 1).map(
+      (file) =>
+        new Promise((resolve) => {
+          if (file.size > 256 * 1024) {
+            resolve({ name: file.name, type: file.type, size_bytes: file.size, last_modified: file.lastModified });
+            return;
+          }
+          const reader = new FileReader();
+          reader.addEventListener("load", () => {
+            resolve({
+              name: file.name,
+              type: file.type,
+              size_bytes: file.size,
+              last_modified: file.lastModified,
+              data_url: typeof reader.result === "string" ? reader.result : "",
+            });
+          });
+          reader.readAsDataURL(file);
+        })
+    )
+  );
+
+  await appendSessionEvent("MEDIA_PICKED", { count: items.length, names: items.map((item) => item.name) });
+  return { items };
+}
+
+async function showInAppNotification(params) {
+  requirePermission("notifications.in_app");
+  const title = sanitizeText(params?.title || "Mini-app notice", 80);
+  const message = sanitizeText(params?.message || "", 180);
+  const notificationID = randomId("note");
+  setStatus(`${title}${message ? `: ${message}` : ""}`);
+  await appendSessionEvent("NOTIFICATION_SHOWN", { notification_id: notificationID, title, message });
+  return { notification_id: notificationID, displayed: true };
+}
+
+async function handleBridgeCall(message) {
   const method = sanitizeText(message.method, 120);
   switch (method) {
     case "host.getLaunchContext":
@@ -403,15 +722,25 @@ function handleBridgeCall(message) {
       return {
         conversation_id: state.launchContext.conversation_id,
         title: "Mini-App Runtime Test Thread",
-        recent_messages: state.sessionState.transcript.slice(-6),
+        recent_messages: cloneJson((state.sessionState?.transcript || []).slice(-6)),
       };
     case "conversation.sendMessage": {
       requirePermission("conversation.send_message");
-      const text = sanitizeText(message.params?.text, 220);
-      if (!text) throw new Error("conversation.sendMessage requires params.text");
-      appendProjectedMessage(text);
-      return { message_id: randomId("msg") };
+      const text = summarizeMessagePayload(message.params);
+      appendProjectedMessage(text, sanitizeText(message.params?.content_type, 60) || "app_event", message.params?.content || null);
+      state.sessionState.stateVersion += 1;
+      const persistedVersion = await persistSessionState(state.sessionState.stateVersion, "MESSAGE_PROJECTED", {
+        app_session_id: state.launchContext.app_session_id,
+        content_type: sanitizeText(message.params?.content_type, 60) || "app_event",
+        content: cloneJson(message.params?.content || null),
+        text,
+      });
+      return { message_id: randomId("msg"), state_version: persistedVersion };
     }
+    case "conversation.readParticipants":
+    case "participants.readBasic":
+      requirePermission("participants.read_basic");
+      return { participants: cloneJson(state.launchContext?.participants || []) };
     case "storage.session.get": {
       requirePermission("storage.session");
       const key = sanitizeText(message.params?.key, 80);
@@ -423,11 +752,31 @@ function handleBridgeCall(message) {
       const key = sanitizeText(message.params?.key, 80);
       if (!key) throw new Error("storage.session.set requires params.key");
       state.sessionState.storage[key] = cloneJson(message.params?.value);
-      saveSession();
-      return { key, value: cloneJson(state.sessionState.storage[key]) };
+      state.sessionState.stateVersion += 1;
+      const persistedVersion = await persistSessionState(state.sessionState.stateVersion, "SESSION_STORAGE_UPDATED", { key });
+      return { key, value: cloneJson(state.sessionState.storage[key]), state_version: persistedVersion };
+    }
+    case "storage.sharedConversation.get": {
+      requirePermission("storage.shared_conversation");
+      const key = sanitizeText(message.params?.key, 80);
+      if (!key) throw new Error("storage.sharedConversation.get requires params.key");
+      return { key, value: cloneJson(state.sessionState.sharedConversationStorage[key]) };
+    }
+    case "storage.sharedConversation.set": {
+      requirePermission("storage.shared_conversation");
+      const key = sanitizeText(message.params?.key, 80);
+      if (!key) throw new Error("storage.sharedConversation.set requires params.key");
+      state.sessionState.sharedConversationStorage[key] = cloneJson(message.params?.value);
+      state.sessionState.stateVersion += 1;
+      const persistedVersion = await persistSessionState(state.sessionState.stateVersion, "SHARED_STORAGE_UPDATED", { key });
+      return { key, value: cloneJson(state.sessionState.sharedConversationStorage[key]), state_version: persistedVersion };
     }
     case "session.updateState":
       return applyStateUpdate(message.params);
+    case "media.pickUser":
+      return pickUserMedia(message.params);
+    case "notifications.inApp.show":
+      return showInAppNotification(message.params);
     default: {
       const err = new Error(`Unknown bridge method: ${method}`);
       err.code = "method_not_found";
@@ -440,7 +789,7 @@ async function loadAndLaunch(manifestUrl) {
   const cleanUrl = sanitizeText(manifestUrl, 300) || DEFAULT_MANIFEST_URL;
   state.manifest = await fetchManifest(cleanUrl);
   state.grantedPermissions = new Set(state.manifest.permissions);
-  buildLaunchContext();
+  await initializeSession();
   renderManifest();
   renderPermissions();
   renderContext();
@@ -449,22 +798,23 @@ async function loadAndLaunch(manifestUrl) {
   el.manifestUrl.value = cleanUrl;
 }
 
-window.addEventListener("message", (event) => {
+window.addEventListener("message", async (event) => {
   if (event.source !== el.frame.contentWindow) return;
-  if (event.origin !== "null") return;
+  if (state.manifest?.entrypoint?.url) {
+    const expectedOrigin = new URL(state.manifest.entrypoint.url, window.location.href).origin;
+    if (event.origin !== expectedOrigin) return;
+  }
   const message = event.data;
   if (!message || typeof message !== "object") return;
   if (message.channel !== state.channelId) return;
 
   state.frameWindow = event.source;
-
   const requestId = sanitizeText(message.request_id, 80);
   if (!requestId) return;
 
   addLog("ok", `request ${sanitizeText(message.method, 120)}`, message);
-
   try {
-    const result = handleBridgeCall(message);
+    const result = await handleBridgeCall(message);
     sendBridgeResponse(event.source, requestId, true, result);
   } catch (error) {
     const payload = {
@@ -487,19 +837,14 @@ el.manifestForm.addEventListener("submit", async (event) => {
   }
 });
 
-el.relaunchBtn.addEventListener("click", async () => {
+el.relaunchBtn.addEventListener("click", () => {
   if (!state.manifest) {
     setStatus("Load a manifest before relaunching.", true);
     return;
   }
-  try {
-    buildLaunchContext();
-    renderContext();
-    renderTranscript();
-    launchFrame();
-  } catch (error) {
-    setStatus(error.message || "Failed to relaunch app.", true);
-  }
+  renderContext();
+  renderTranscript();
+  launchFrame();
 });
 
 el.clearSessionBtn.addEventListener("click", async () => {
@@ -507,8 +852,16 @@ el.clearSessionBtn.addEventListener("click", async () => {
     setStatus("Load a manifest before clearing session state.", true);
     return;
   }
+  try {
+    if (state.sessionMode === "gateway" && state.launchContext?.app_session_id) {
+      await gatewayRequest(`/v1/apps/sessions/${encodeURIComponent(state.launchContext.app_session_id)}`, { method: "DELETE" });
+    }
+  } catch (error) {
+    addLog("error", "runtime.end_session_failed", { message: error.message || String(error) });
+  }
   clearSavedSession();
-  buildLaunchContext();
+  await initializeSession();
+  renderPermissions();
   renderContext();
   renderTranscript();
   launchFrame();

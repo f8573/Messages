@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "entrypoint": {
     "type": "url",
-    "url": "http://localhost:5173/miniapps/counter/index.html",
+    "url": "http://localhost:5174/miniapps/counter/index.html",
     "mime_type": "text/html"
   },
   "permissions": [
@@ -21,7 +21,7 @@
   "metadata": {
     "category": "test",
     "declared_origins": [
-      "http://localhost:5173"
+        "http://localhost:5174"
     ]
   },
   "signature": {

@@ -3,19 +3,24 @@ package events
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5"
 	"ohmf/services/gateway/internal/middleware"
 )
 
-type Handler struct {
-	db *pgxpool.Pool
+type DB interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
-func NewHandler(db *pgxpool.Pool) *Handler {
+type Handler struct {
+	db DB
+}
+
+func NewHandler(db DB) *Handler {
 	return &Handler{db: db}
 }
 
@@ -25,11 +30,6 @@ func (h *Handler) Stream(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing auth", http.StatusUnauthorized)
 		return
 	}
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "stream unsupported", http.StatusInternalServerError)
-		return
-	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
@@ -37,12 +37,15 @@ func (h *Handler) Stream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Accel-Buffering", "no")
 
 	cursor, err := h.snapshot(r.Context(), userID)
-	if err != nil {
+	if err == nil {
+		_ = writeEvent(w, "sync_required", map[string]string{"cursor": cursor})
+	} else {
+		_ = writeEvent(w, "error", map[string]string{"message": "snapshot_unavailable"})
+	}
+	if err := flush(w); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	_ = writeEvent(w, "sync_required", map[string]string{"cursor": cursor})
-	flusher.Flush()
 
 	ticker := time.NewTicker(1200 * time.Millisecond)
 	defer ticker.Stop()
@@ -54,7 +57,7 @@ func (h *Handler) Stream(w http.ResponseWriter, r *http.Request) {
 			next, err := h.snapshot(r.Context(), userID)
 			if err != nil {
 				_ = writeEvent(w, "error", map[string]string{"message": "snapshot_failed"})
-				flusher.Flush()
+				_ = flush(w)
 				continue
 			}
 			if next != cursor {
@@ -63,7 +66,7 @@ func (h *Handler) Stream(w http.ResponseWriter, r *http.Request) {
 			} else {
 				_, _ = w.Write([]byte(": keepalive\n\n"))
 			}
-			flusher.Flush()
+			_ = flush(w)
 		}
 	}
 }
@@ -97,6 +100,13 @@ func writeEvent(w http.ResponseWriter, name string, payload any) error {
 		return err
 	}
 	if _, err := fmt.Fprintf(w, "data: %s\n\n", body); err != nil {
+		return err
+	}
+	return nil
+}
+
+func flush(w http.ResponseWriter) error {
+	if err := http.NewResponseController(w).Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
 		return err
 	}
 	return nil

@@ -3,11 +3,12 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self' http://localhost:18080 http://127.0.0.1:18080; object-src 'none'; base-uri 'none'; form-action 'self'" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self' http://localhost:18081 http://127.0.0.1:18081; object-src 'none'; base-uri 'none'; form-action 'self'" />
     <meta name="referrer" content="no-referrer" />
     <meta http-equiv="Permissions-Policy" content="camera=(), microphone=(), geolocation=()" />
     <title>OHMF Messages</title>
     <link rel="stylesheet" href="./styles.css" />
+    <script src="./frontend-config.js?v=20260313b"></script>
   </head>
   <body>
     <div class="bg-layer"></div>
@@ -92,18 +93,75 @@
         </section>
 
         <form class="composer" id="composer">
-          <input
-            id="composer-input"
-            type="text"
-            placeholder="Message"
-            autocomplete="off"
-            maxlength="1000"
-          />
-          <button type="submit" class="send-btn">Send</button>
+          <section class="miniapp-launcher hidden" id="miniapp-launcher">
+            <div class="miniapp-launcher-head">
+              <div>
+                <p class="miniapp-kicker">Embedded Apps</p>
+                <h2 class="miniapp-title">Launch an app in this thread</h2>
+              </div>
+              <button type="button" class="icon-btn miniapp-close-btn" id="miniapp-close-btn" aria-label="Close app launcher">x</button>
+            </div>
+
+            <div class="miniapp-picker" id="miniapp-picker">
+              <button type="button" class="miniapp-card" id="miniapp-counter-card">
+                <span class="miniapp-card-icon">#</span>
+                <span class="miniapp-card-copy">
+                  <strong>Counter Lab</strong>
+                  <span>Shared state demo with projected messages.</span>
+                </span>
+              </button>
+            </div>
+
+            <div class="miniapp-stage hidden" id="miniapp-stage">
+              <div class="miniapp-preview">
+                <div class="miniapp-preview-head">
+                  <p class="miniapp-preview-title" id="miniapp-preview-title">App Preview</p>
+                  <p class="miniapp-preview-subtitle" id="miniapp-preview-subtitle">Choose launch settings, then open the app.</p>
+                </div>
+                <div class="miniapp-frame-wrap">
+                  <iframe id="miniapp-frame" title="Embedded mini-app"></iframe>
+                </div>
+              </div>
+
+              <aside class="miniapp-config">
+                <div class="miniapp-config-block">
+                  <p class="miniapp-config-label">Launch mode</p>
+                  <p class="miniapp-config-value" id="miniapp-launch-mode">Ready</p>
+                </div>
+
+                <div class="miniapp-config-block">
+                  <p class="miniapp-config-label">Permissions</p>
+                  <div class="miniapp-permissions" id="miniapp-permissions"></div>
+                </div>
+
+                <div class="miniapp-config-block">
+                  <p class="miniapp-config-label">Context</p>
+                  <p class="miniapp-config-copy" id="miniapp-context-copy">Pick a conversation to prepare the app.</p>
+                </div>
+
+                <div class="miniapp-config-actions">
+                  <button type="button" class="send-btn compact" id="miniapp-open-btn">Open App</button>
+                  <button type="button" class="secondary-btn compact" id="miniapp-reset-btn">Reset Session</button>
+                </div>
+              </aside>
+            </div>
+          </section>
+
+          <div class="composer-main">
+            <button type="button" class="icon-btn attach-btn" id="attach-btn" aria-label="Attachment and apps">+</button>
+            <input
+              id="composer-input"
+              type="text"
+              placeholder="Message"
+              autocomplete="off"
+              maxlength="1000"
+            />
+            <button type="submit" class="send-btn">Send</button>
+          </div>
         </form>
       </main>
     </div>
 
-    <script src="./app.js"></script>
+    <script src="./app.js?v=20260313b"></script>
   </body>
 </html>

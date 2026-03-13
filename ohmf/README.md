@@ -30,7 +30,7 @@ go test ./integration -v
 docker compose -f .\infra\docker\docker-compose.yml up -d --build
 ```
 
-API will be available at `http://localhost:18080`.
+API will be available at `http://localhost:18081` by default.
 
 This stack now includes:
 - Gateway (REST + WebSocket)
@@ -41,7 +41,7 @@ This stack now includes:
 - `delivery-processor`
 - `sms-processor`
 
-WebSocket endpoint: `ws://localhost:18080/v1/ws?access_token=<JWT>`
+WebSocket endpoint: `ws://localhost:18081/v1/ws?access_token=<JWT>`
 
 Feature flags (gateway):
 - `APP_USE_KAFKA_SEND` (`true` by default in compose)

@@ -233,9 +233,7 @@ func main() {
 	// CORS middleware: allow local web dev server to call this API.
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins: []string{
-			"http://localhost:5173",
 			"http://localhost:5174",
-			"http://127.0.0.1:5173",
 			"http://127.0.0.1:5174",
 		},
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
@@ -315,6 +313,7 @@ func main() {
 			protected.Post("/apps/sessions/{id}/events", miniappHandler.AppendEvent)
 			protected.Post("/apps/sessions/{id}/snapshot", miniappHandler.Snapshot)
 			protected.Get("/apps", miniappHandler.ListApps)
+			protected.Get("/apps/{appID}", miniappHandler.GetApp)
 
 			protected.Post("/notifications/send", notificationHandler.Send)
 			protected.Post("/relay/messages", relayHandler.CreateMessage)

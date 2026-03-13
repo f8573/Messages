@@ -2,6 +2,7 @@ package miniapp
 
 import (
 	"crypto"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -11,14 +12,11 @@ import (
 	"encoding/pem"
 	"errors"
 	"testing"
-	"time"
 
-	"github.com/google/uuid"
 	"ohmf/services/gateway/internal/config"
 )
 
-func TestVerifyManifestSignature(t *testing.T) {
-	// generate test RSA key
+func TestVerifyManifestSignatureRS256(t *testing.T) {
 	pk, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)
@@ -27,63 +25,126 @@ func TestVerifyManifestSignature(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pubPem := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubBytes})
+	pubPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubBytes})
 
-	// create sample manifest
-	manifest := map[string]any{
-		"app_id":     "com.example.test",
-		"name":       "test-app",
-		"version":    "1.0.0",
-		"owner":      uuid.New().String(),
-		"created_at": time.Now().UTC().Format(time.RFC3339),
-		"entrypoint": map[string]any{
-			"type": "url",
-			"url":  "https://example.com/app",
-		},
-		"permissions":  []string{"storage"},
-		"capabilities": map[string]any{"storage": true},
-	}
-
-	// prepare payload without signature
+	manifest := validManifest()
 	payload, _ := json.Marshal(manifest)
-	h := sha256.Sum256(payload)
-	sig, err := rsa.SignPKCS1v15(rand.Reader, pk, crypto.SHA256, h[:])
+	hash := sha256.Sum256(payload)
+	sig, err := rsa.SignPKCS1v15(rand.Reader, pk, crypto.SHA256, hash[:])
 	if err != nil {
 		t.Fatal(err)
 	}
 	manifest["signature"] = map[string]any{
 		"alg": "RS256",
-		"kid": "test-key",
+		"kid": "rsa-key",
 		"sig": base64.StdEncoding.EncodeToString(sig),
 	}
 
-	// construct service with public key
-	cfg := config.Config{MiniappPublicKeyPEM: string(pubPem)}
-	s := NewService(nil, cfg)
+	svc := NewService(nil, config.Config{MiniappPublicKeyPEM: string(pubPEM)})
+	if err := svc.verifyManifestSignature(manifest); err != nil {
+		t.Fatalf("signature verification failed: %v", err)
+	}
+}
 
-	// verify
-	if err := s.verifyManifestSignature(manifest); err != nil {
+func TestVerifyManifestSignatureEd25519(t *testing.T) {
+	pubKey, privKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubBytes, err := x509.MarshalPKIXPublicKey(pubKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubBytes})
+
+	manifest := validManifest()
+	payload, _ := json.Marshal(manifest)
+	sig := ed25519.Sign(privKey, payload)
+	manifest["signature"] = map[string]any{
+		"alg": "Ed25519",
+		"kid": "ed-key",
+		"sig": base64.StdEncoding.EncodeToString(sig),
+	}
+
+	svc := NewService(nil, config.Config{MiniappPublicKeyPEM: string(pubPEM)})
+	if err := svc.verifyManifestSignature(manifest); err != nil {
 		t.Fatalf("signature verification failed: %v", err)
 	}
 }
 
 func TestValidateManifestRejectsSchemaMismatch(t *testing.T) {
-	svc := &Service{}
-	_, err := svc.RegisterManifest(nil, "owner-1", map[string]any{
+	if err := validateManifest(map[string]any{
 		"app_id":      "com.example.invalid",
 		"name":        "broken",
 		"version":     "1.0",
 		"entrypoint":  "https://example.com",
-		"permissions": []string{"storage"},
+		"permissions": []string{"storage.session"},
 		"capabilities": map[string]any{
-			"storage": true,
+			"storage.session": true,
 		},
 		"signature": "legacy-sig",
-	})
-	if err == nil {
+	}); err == nil {
 		t.Fatalf("expected validation error")
-	}
-	if !errors.Is(err, ErrManifestInvalid) {
+	} else if !errors.Is(err, ErrManifestInvalid) {
 		t.Fatalf("expected ErrManifestInvalid, got %v", err)
+	}
+}
+
+func TestValidateManifestAllowsUnsignedWebBundle(t *testing.T) {
+	manifest := validManifest()
+	manifest["entrypoint"] = map[string]any{
+		"type": "web_bundle",
+		"url":  "https://example.com/app/index.html",
+	}
+	if err := validateManifest(manifest); err != nil {
+		t.Fatalf("expected manifest to validate, got %v", err)
+	}
+}
+
+func TestStateEnvelopeFromAnySupportsLegacyShape(t *testing.T) {
+	state := stateEnvelopeFromAny(map[string]any{"turn": "usr_02"})
+	if state.Snapshot["turn"] != "usr_02" {
+		t.Fatalf("expected legacy state to be promoted into snapshot, got %#v", state.Snapshot)
+	}
+	if len(state.ProjectedMessages) != 0 {
+		t.Fatalf("expected empty projected messages, got %#v", state.ProjectedMessages)
+	}
+}
+
+func TestSanitizeGrantedPermissionsFiltersUndeclaredPermissions(t *testing.T) {
+	got := sanitizeGrantedPermissions(
+		[]string{"conversation.send_message", "device.identifiers", "conversation.read_context"},
+		[]string{"conversation.send_message", "conversation.read_context"},
+	)
+	want := []string{"conversation.read_context", "conversation.send_message"}
+	if len(got) != len(want) {
+		t.Fatalf("expected %d permissions, got %#v", len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("permission mismatch at %d: got %q want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func validManifest() map[string]any {
+	return map[string]any{
+		"manifest_version": "1.0",
+		"app_id":           "com.example.test",
+		"name":             "test-app",
+		"version":          "1.0.0",
+		"entrypoint": map[string]any{
+			"type": "url",
+			"url":  "https://example.com/app",
+		},
+		"permissions": []string{
+			"conversation.read_context",
+			"conversation.send_message",
+			"storage.session",
+			"realtime.session",
+		},
+		"capabilities": map[string]any{
+			"turn_based": true,
+		},
 	}
 }

@@ -9,17 +9,17 @@ It also includes a standalone mini-app runtime test page for the embedded app AP
 From `apps/web`:
 
 ```powershell
-py -m http.server 5173
+py -m http.server 5174
 ```
 
 Then open:
 
-- `http://localhost:5173`
-- `http://localhost:5173/miniapp-runtime.html`
+- `http://localhost:5174`
+- `http://localhost:5174/miniapp-runtime.html`
 
 Gateway API should be running at:
 
-- `http://localhost:18080`
+- `http://localhost:18081`
 
 ## Current Scope
 
@@ -50,8 +50,10 @@ Gateway API should be running at:
 - Mini-app runtime lab:
   - Loads `./miniapps/counter/manifest.json`
   - Runs the app in a sandboxed iframe
-  - Exposes a minimal bridge with `host.getLaunchContext`, `conversation.readContext`, `conversation.sendMessage`, `storage.session.get`, `storage.session.set`, and `session.updateState`
+  - Exposes a browser mini-app SDK and host bridge with `host.getLaunchContext`, `conversation.readContext`, `conversation.sendMessage`, `participants.readBasic`, `storage.session.*`, `storage.sharedConversation.*`, `session.updateState`, `media.pickUser`, and `notifications.inApp.show`
+  - Uses gateway-backed manifest registration and session persistence when an OHMF web auth session is available, with local fallback otherwise
   - Lets you toggle granted permissions to verify host-side capability enforcement
+  - The default frontend port is configured in `frontend-config.js` as `frontend_port`
 
 ## Security And Dev Guardrails
 
@@ -71,4 +73,4 @@ Gateway API should be running at:
 - Realtime updates
 - Contact names/profile resolution
 - Media attachments and rich content types
-- Backend-backed mini-app session persistence through the gateway mini-app endpoints
+- Launching the runtime from a real conversation inside the main web app shell
