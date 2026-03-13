@@ -14,5 +14,5 @@ Behavior covered
 - session state updates with host-pushed `session.stateUpdated` events
 
 Local run
-- Serve `ohmf/apps/web` with a static server on `http://localhost:5173`.
-- Open `http://localhost:5173/miniapp-runtime.html`.
+- Serve `ohmf/apps/web` with a static server on `http://localhost:5174`.
+- Open `http://localhost:5174/miniapp-runtime.html`.

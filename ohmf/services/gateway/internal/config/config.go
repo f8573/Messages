@@ -55,7 +55,7 @@ type Config struct {
 func Load() Config {
 	return Config{
 		Env:                    get("APP_ENV", "dev"),
-		Addr:                   get("APP_ADDR", ":8080"),
+		Addr:                   get("APP_ADDR", ":8081"),
 		LogLevel:               get("APP_LOG_LEVEL", "info"),
 		DBDSN:                  get("APP_DB_DSN", "postgres://ohmf:ohmf@localhost:5432/ohmf?sslmode=disable"),
 		RedisAddr:              get("APP_REDIS_ADDR", "localhost:6379"),

@@ -26,7 +26,7 @@ func TestGatewayIntegration(t *testing.T) {
     // Services are expected to be reachable on localhost; allow overrides via env
     gateway := os.Getenv("GATEWAY_ADDR")
     if gateway == "" {
-        gateway = "http://localhost:8080"
+		gateway = "http://localhost:18081"
     }
     contacts := os.Getenv("CONTACTS_ADDR")
     if contacts == "" {

@@ -46,9 +46,9 @@ services:
       dockerfile: Dockerfile
     container_name: ohmf_gateway
     expose:
-      - "8080"
+      - "8081"
     environment:
-      - APP_ADDR=:8080
+      - APP_ADDR=:8081
       - APP_SMOKE_MODE=1
       - APP_LOG_LEVEL=debug
       - APP_CONTACTS_ADDR=http://contacts:18085
@@ -59,7 +59,7 @@ services:
       - apps
       - media
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      test: ["CMD", "curl", "-f", "http://localhost:8081/healthz"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -77,9 +77,9 @@ services:
       - gateway
     environment:
       - INTEGRATION=1
-      - GATEWAY_ADDR=http://gateway:8080
+      - GATEWAY_ADDR=http://gateway:8081
       - CONTACTS_ADDR=http://contacts:18085
-    command: sh -c "apk add --no-cache curl ca-certificates >/dev/null 2>&1 || true; sleep 3; cd ohmf; INTEGRATION=1 GATEWAY_ADDR=http://gateway:8080 CONTACTS_ADDR=http://contacts:18085 go test ./integration -run TestGatewayIntegration -v"
+    command: sh -c "apk add --no-cache curl ca-certificates >/dev/null 2>&1 || true; sleep 3; cd ohmf; INTEGRATION=1 GATEWAY_ADDR=http://gateway:8081 CONTACTS_ADDR=http://contacts:18085 go test ./integration -run TestGatewayIntegration -v"
 
   postgres:
     image: postgres:15-alpine

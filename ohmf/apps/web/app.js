@@ -1,6 +1,25 @@
 "use strict";
 
-const API_BASE_URL = (window.localStorage.getItem("ohmf.apiBaseUrl") || "http://localhost:18080").replace(/\/+$/, "");
+function normalizeAPIBaseURL(value) {
+  const fallback = (window.OHMF_WEB_CONFIG?.api_base_url || "http://localhost:18081").replace(/\/+$/, "");
+  if (!value) return fallback;
+  try {
+    const url = new URL(value);
+    const localHosts = new Set(["localhost", "127.0.0.1"]);
+    const targetPort = String(window.OHMF_WEB_CONFIG?.api_host_port || "18081");
+    if (localHosts.has(url.hostname) && (url.port === "18080" || url.port === "8080")) {
+      url.port = targetPort;
+      const normalized = url.toString().replace(/\/+$/, "");
+      window.localStorage.setItem("ohmf.apiBaseUrl", normalized);
+      return normalized;
+    }
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return fallback;
+  }
+}
+
+const API_BASE_URL = normalizeAPIBaseURL(window.OHMF_WEB_CONFIG?.api_base_url || window.localStorage.getItem("ohmf.apiBaseUrl") || "http://localhost:18081");
 const AUTH_STORAGE_KEY = "ohmf.auth.session.v1";
 const STORE_VERSION = 2;
 const TRANSPORT_SMS = "SMS";
@@ -16,6 +35,14 @@ const OHMF_DELIVERY_STATUSES = Object.freeze({
   FAIL_DELIVERY: "FAIL_DELIVERY",
   FAIL_SEND: "FAIL_SEND",
 });
+const MINIAPP_CATALOG = Object.freeze([
+  {
+    appId: "app.ohmf.counter-lab",
+    manifestUrl: "./miniapps/counter/manifest.json",
+    title: "Counter Lab",
+    summary: "Shared state demo with projected messages.",
+  },
+]);
 
 const state = {
   auth: null,
@@ -24,11 +51,23 @@ const state = {
   activeThreadId: null,
   threads: [],
   typingDraft: "",
+  miniapp: {
+    drawerOpen: false,
+    selectedAppId: "",
+    manifest: null,
+    launchContext: null,
+    sessionState: null,
+    grantedPermissions: new Set(),
+    frameWindow: null,
+    channelId: "",
+    sessionMode: "idle",
+  },
 };
 let liveSyncInFlight = false;
 let eventStreamAbort = null;
 let eventStreamReconnectTimer = 0;
 let refreshAuthInFlight = null;
+let eventStreamDisabled = false;
 
 const el = {
   authShell: document.getElementById("auth-shell"),
@@ -57,6 +96,20 @@ const el = {
   nicknameBtn: document.getElementById("nickname-btn"),
   blockBtn: document.getElementById("block-btn"),
   closeThreadBtn: document.getElementById("close-thread-btn"),
+  attachBtn: document.getElementById("attach-btn"),
+  miniappLauncher: document.getElementById("miniapp-launcher"),
+  miniappCloseBtn: document.getElementById("miniapp-close-btn"),
+  miniappPicker: document.getElementById("miniapp-picker"),
+  miniappCounterCard: document.getElementById("miniapp-counter-card"),
+  miniappStage: document.getElementById("miniapp-stage"),
+  miniappPreviewTitle: document.getElementById("miniapp-preview-title"),
+  miniappPreviewSubtitle: document.getElementById("miniapp-preview-subtitle"),
+  miniappPermissions: document.getElementById("miniapp-permissions"),
+  miniappContextCopy: document.getElementById("miniapp-context-copy"),
+  miniappLaunchMode: document.getElementById("miniapp-launch-mode"),
+  miniappOpenBtn: document.getElementById("miniapp-open-btn"),
+  miniappResetBtn: document.getElementById("miniapp-reset-btn"),
+  miniappFrame: document.getElementById("miniapp-frame"),
 };
 
 function nowISO() {
@@ -267,6 +320,274 @@ async function refreshAuthTokens() {
   return refreshAuthInFlight;
 }
 
+function cloneJson(value) {
+  return value === undefined ? null : JSON.parse(JSON.stringify(value));
+}
+
+function randomId(prefix) {
+  if (window.crypto && typeof window.crypto.randomUUID === "function") {
+    return `${prefix}_${window.crypto.randomUUID().replace(/-/g, "")}`;
+  }
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function getMiniappCatalogEntry(appId = state.miniapp.selectedAppId) {
+  return MINIAPP_CATALOG.find((item) => item.appId === appId) || null;
+}
+
+function activeThreadSupportsMiniapps(thread = getActiveThread()) {
+  return Boolean(thread && thread.kind !== "draft_phone" && !thread.closed);
+}
+
+function rewriteLocalDevEntrypoint(rawUrl) {
+  const url = new URL(rawUrl, window.location.href);
+  const localHosts = new Set(["localhost", "127.0.0.1"]);
+  if (localHosts.has(url.hostname) && localHosts.has(window.location.hostname) && url.port !== window.location.port) {
+    url.protocol = window.location.protocol;
+    url.host = `${window.location.hostname}:${window.location.port}`;
+  }
+  return url.toString();
+}
+
+function normalizeMiniappSessionState(raw) {
+  if (!raw || typeof raw !== "object") {
+    return {
+      stateVersion: 1,
+      stateSnapshot: {},
+      storage: {},
+      sharedConversationStorage: {},
+      transcript: [],
+    };
+  }
+  return {
+    stateVersion: Number(raw.state_version || raw.stateVersion || 1) || 1,
+    stateSnapshot: raw.snapshot || raw.stateSnapshot || {},
+    storage: raw.session_storage || raw.storage || {},
+    sharedConversationStorage: raw.shared_conversation_storage || raw.sharedConversationStorage || {},
+    transcript: Array.isArray(raw.projected_messages || raw.transcript) ? (raw.projected_messages || raw.transcript) : [],
+  };
+}
+
+async function fetchMiniappManifest(manifestUrl) {
+  const response = await fetch(manifestUrl, { cache: "no-store" });
+  if (!response.ok) throw new Error(`Manifest request failed with ${response.status}`);
+  const manifest = await response.json();
+  if (!manifest?.app_id || !manifest?.entrypoint?.url) throw new Error("invalid_manifest");
+  manifest.entrypoint.url = rewriteLocalDevEntrypoint(manifest.entrypoint.url);
+  return manifest;
+}
+
+async function ensureMiniappManifestRegistered(manifest) {
+  try {
+    return await apiRequest(`/v1/apps/${encodeURIComponent(manifest.app_id)}`, { method: "GET" });
+  } catch (error) {
+    if (error.status !== 404) throw error;
+  }
+  await apiRequest("/v1/apps/register", { method: "POST", body: JSON.stringify({ manifest }) });
+  return apiRequest(`/v1/apps/${encodeURIComponent(manifest.app_id)}`, { method: "GET" });
+}
+
+function buildMiniappViewer(thread) {
+  return {
+    user_id: state.auth?.userId || "",
+    role: "PLAYER",
+    display_name: thread?.title || state.auth?.phoneE164 || state.auth?.userId || "You",
+  };
+}
+
+function buildMiniappParticipants(thread) {
+  const ids = Array.isArray(thread?.participants) ? thread.participants : [];
+  const viewer = buildMiniappViewer(thread);
+  const participants = [{ ...viewer }];
+  for (const id of ids) {
+    if (!id || id === viewer.user_id) continue;
+    participants.push({ user_id: id, role: "PLAYER", display_name: `User ${id.slice(0, 8)}` });
+  }
+  if (participants.length === 1 && thread?.externalPhones?.[0]) {
+    participants.push({ user_id: `phone:${thread.externalPhones[0]}`, role: "PLAYER", display_name: thread.externalPhones[0] });
+  }
+  return participants;
+}
+
+function applyMiniappSessionRecord(record, manifest) {
+  state.miniapp.sessionMode = "gateway";
+  state.miniapp.manifest = manifest;
+  state.miniapp.sessionState = normalizeMiniappSessionState({
+    state_version: record?.state_version,
+    snapshot: record?.state?.snapshot,
+    session_storage: record?.state?.session_storage,
+    shared_conversation_storage: record?.state?.shared_conversation_storage,
+    projected_messages: record?.state?.projected_messages,
+  });
+  state.miniapp.launchContext = record?.launch_context || null;
+  state.miniapp.grantedPermissions = new Set(
+    Array.isArray(record?.capabilities_granted) && record.capabilities_granted.length ? record.capabilities_granted : (manifest.permissions || [])
+  );
+}
+
+async function ensureMiniappSession() {
+  const thread = getActiveThread();
+  if (!activeThreadSupportsMiniapps(thread)) throw new Error("Select a saved conversation first.");
+  const entry = getMiniappCatalogEntry();
+  if (!entry) throw new Error("Select an app first.");
+  const manifest = state.miniapp.manifest || await fetchMiniappManifest(entry.manifestUrl);
+  state.miniapp.manifest = manifest;
+  await ensureMiniappManifestRegistered(manifest);
+  const record = await apiRequest("/v1/apps/sessions", {
+    method: "POST",
+    body: JSON.stringify({
+      app_id: manifest.app_id,
+      conversation_id: thread.id,
+      viewer: buildMiniappViewer(thread),
+      participants: buildMiniappParticipants(thread),
+      capabilities_granted: Array.from(state.miniapp.grantedPermissions),
+      state_snapshot: cloneJson(state.miniapp.sessionState?.stateSnapshot || {}),
+      resume_existing: true,
+    }),
+  });
+  applyMiniappSessionRecord(record, manifest);
+}
+
+async function persistMiniappSession(version, eventName, eventBody) {
+  if (!state.miniapp.launchContext?.app_session_id) return 0;
+  const payload = await apiRequest(`/v1/apps/sessions/${encodeURIComponent(state.miniapp.launchContext.app_session_id)}/snapshot`, {
+    method: "POST",
+    body: JSON.stringify({
+      state: {
+        snapshot: cloneJson(state.miniapp.sessionState?.stateSnapshot || {}),
+        session_storage: cloneJson(state.miniapp.sessionState?.storage || {}),
+        shared_conversation_storage: cloneJson(state.miniapp.sessionState?.sharedConversationStorage || {}),
+        projected_messages: cloneJson(state.miniapp.sessionState?.transcript || []),
+      },
+      state_version: version,
+      capabilities_granted: Array.from(state.miniapp.grantedPermissions),
+    }),
+  });
+  if (eventName) {
+    await apiRequest(`/v1/apps/sessions/${encodeURIComponent(state.miniapp.launchContext.app_session_id)}/events`, {
+      method: "POST",
+      body: JSON.stringify({ event_name: eventName, body: eventBody || {} }),
+    });
+  }
+  return Number(payload?.state_version || version || 1);
+}
+
+function appendProjectedMiniappMessage(text, contentType = "app_event", content = null) {
+  const thread = getActiveThread();
+  if (!thread) return;
+  const message = {
+    id: randomId("appmsg"),
+    direction: "out",
+    text: sanitizeText(text, 280),
+    createdAt: nowISO(),
+    serverOrder: Number.MAX_SAFE_INTEGER - Date.now(),
+    status: OHMF_DELIVERY_STATUSES.SENT,
+    statusUpdatedAt: nowISO(),
+    transport: TRANSPORT_OHMF,
+    reactions: {},
+    editedAt: "",
+    deleted: false,
+    contentType,
+    content,
+  };
+  upsertThread({ ...thread, messages: [...(thread.messages || []), message], updatedAt: message.createdAt });
+  saveConversationStore();
+  renderAll();
+}
+
+function buildMiniappFrameURL() {
+  const url = new URL(state.miniapp.manifest.entrypoint.url, window.location.href);
+  state.miniapp.channelId = randomId("chan");
+  url.searchParams.set("channel", state.miniapp.channelId);
+  url.searchParams.set("parent_origin", window.location.origin);
+  url.searchParams.set("app_id", state.miniapp.manifest.app_id);
+  return url.toString();
+}
+
+function summarizeMiniappMessage(params) {
+  const explicit = sanitizeText(params?.text, 220);
+  if (explicit) return explicit;
+  const eventName = sanitizeText(params?.content?.event_name, 80);
+  if (eventName) return `${state.miniapp.manifest?.name || "App"}: ${eventName}`;
+  return `${state.miniapp.manifest?.name || "App"} posted an update.`;
+}
+
+async function handleMiniappBridgeCall(message) {
+  const method = sanitizeText(message.method, 120);
+  switch (method) {
+    case "host.getLaunchContext":
+      return cloneJson(state.miniapp.launchContext);
+    case "conversation.readContext":
+      return {
+        conversation_id: state.miniapp.launchContext?.conversation_id,
+        title: getActiveThread()?.title || "Conversation",
+        recent_messages: cloneJson((getActiveThread()?.messages || []).slice(-6).map((item) => ({
+          author: item.direction === "out" ? "You" : getActiveThread()?.title || "Participant",
+          text: item.text,
+          createdAt: item.createdAt,
+        }))),
+      };
+    case "conversation.sendMessage": {
+      const text = summarizeMiniappMessage(message.params);
+      appendProjectedMiniappMessage(text, sanitizeText(message.params?.content_type, 60) || "app_event", message.params?.content || null);
+      state.miniapp.sessionState.transcript.push({ author: state.miniapp.manifest.name, text, createdAt: nowISO() });
+      state.miniapp.sessionState.stateVersion += 1;
+      const persistedVersion = await persistMiniappSession(state.miniapp.sessionState.stateVersion, "MESSAGE_PROJECTED", {
+        text,
+        content_type: sanitizeText(message.params?.content_type, 60) || "app_event",
+      });
+      state.miniapp.launchContext.state_version = persistedVersion;
+      return { message_id: randomId("msg"), state_version: persistedVersion };
+    }
+    case "participants.readBasic":
+      return { participants: cloneJson(state.miniapp.launchContext?.participants || []) };
+    case "storage.session.get": {
+      const key = sanitizeText(message.params?.key, 80);
+      return { key, value: cloneJson(state.miniapp.sessionState.storage[key]) };
+    }
+    case "storage.session.set": {
+      const key = sanitizeText(message.params?.key, 80);
+      state.miniapp.sessionState.storage[key] = cloneJson(message.params?.value);
+      state.miniapp.sessionState.stateVersion += 1;
+      const persistedVersion = await persistMiniappSession(state.miniapp.sessionState.stateVersion, "SESSION_STORAGE_UPDATED", { key });
+      state.miniapp.launchContext.state_version = persistedVersion;
+      return { key, value: cloneJson(state.miniapp.sessionState.storage[key]), state_version: persistedVersion };
+    }
+    case "session.updateState": {
+      const next = cloneJson(message.params || {});
+      state.miniapp.sessionState.stateSnapshot = {
+        ...(state.miniapp.sessionState.stateSnapshot || {}),
+        ...next,
+        updated_at: nowISO(),
+      };
+      state.miniapp.sessionState.stateVersion += 1;
+      const persistedVersion = await persistMiniappSession(state.miniapp.sessionState.stateVersion, "STATE_UPDATED", { delta: next });
+      state.miniapp.launchContext.state_snapshot = cloneJson(state.miniapp.sessionState.stateSnapshot);
+      state.miniapp.launchContext.state_version = persistedVersion;
+      return { state_version: persistedVersion, state_snapshot: cloneJson(state.miniapp.sessionState.stateSnapshot) };
+    }
+    default: {
+      const error = new Error(`Unknown bridge method: ${method}`);
+      error.code = "method_not_found";
+      throw error;
+    }
+  }
+}
+
+function sendMiniappBridgeResponse(targetWindow, requestId, ok, result, error) {
+  targetWindow.postMessage(
+    {
+      bridge_version: "1.0",
+      channel: state.miniapp.channelId,
+      request_id: requestId,
+      ok,
+      result: ok ? cloneJson(result) : undefined,
+      error: ok ? undefined : error,
+    },
+    "*"
+  );
+}
+
 function pickTitle(conversation) {
   if (conversation.nickname) return conversation.nickname;
   if (conversation.externalPhones?.length) return conversation.externalPhones[0];
@@ -456,7 +777,7 @@ function stopEventStream() {
 }
 
 function scheduleEventStreamReconnect(delayMs = 1500) {
-  if (!state.auth || eventStreamReconnectTimer) return;
+  if (!state.auth || eventStreamReconnectTimer || eventStreamDisabled) return;
   eventStreamReconnectTimer = window.setTimeout(() => {
     eventStreamReconnectTimer = 0;
     void startEventStream();
@@ -470,7 +791,7 @@ function handleSSEEvent(name, rawData) {
 }
 
 async function startEventStream() {
-  if (!state.auth || eventStreamAbort) return;
+  if (!state.auth || eventStreamAbort || eventStreamDisabled) return;
   const controller = new AbortController();
   eventStreamAbort = controller;
   try {
@@ -491,6 +812,11 @@ async function startEventStream() {
         scheduleEventStreamReconnect(200);
         return;
       }
+    }
+    if (response.status >= 500) {
+      eventStreamDisabled = true;
+      console.warn("Event stream unavailable; realtime updates disabled for this session.");
+      return;
     }
     if (!response.ok || !response.body) {
       throw new Error(`stream_http_${response.status}`);
@@ -533,7 +859,9 @@ async function startEventStream() {
   } catch (error) {
     if (!controller.signal.aborted) {
       console.error(error);
-      scheduleEventStreamReconnect();
+      if (!eventStreamDisabled) {
+        scheduleEventStreamReconnect();
+      }
     }
   } finally {
     if (eventStreamAbort === controller) {
@@ -658,6 +986,60 @@ function scrollMessageListToBottom() {
   el.messageList.scrollTop = el.messageList.scrollHeight;
 }
 
+function closeMiniappLauncher() {
+  state.miniapp.drawerOpen = false;
+  state.miniapp.frameWindow = null;
+  el.miniappFrame.src = "about:blank";
+}
+
+function renderMiniappLauncher() {
+  const thread = getActiveThread();
+  const supported = activeThreadSupportsMiniapps(thread);
+  el.attachBtn.disabled = !supported;
+  el.miniappLauncher.classList.toggle("hidden", !state.miniapp.drawerOpen);
+  el.miniappStage.classList.toggle("hidden", !state.miniapp.selectedAppId);
+  el.miniappCounterCard.classList.toggle("active", state.miniapp.selectedAppId === "app.ohmf.counter-lab");
+
+  if (!state.miniapp.drawerOpen) {
+    el.miniappContextCopy.textContent = supported
+      ? "Open the attachment menu to choose an app."
+      : "Select a saved conversation to launch an app.";
+    el.miniappLaunchMode.textContent = "Ready";
+    return;
+  }
+
+  const manifest = state.miniapp.manifest;
+  el.miniappPreviewTitle.textContent = manifest?.name || "App Preview";
+  el.miniappPreviewSubtitle.textContent = thread
+    ? `Prepare ${manifest?.name || "the app"} for ${thread.title}.`
+    : "Choose launch settings, then open the app.";
+  el.miniappLaunchMode.textContent = state.miniapp.launchContext?.app_session_id ? "Attached to thread" : "Needs launch";
+  el.miniappContextCopy.textContent = supported
+    ? `App sessions attach to ${thread.title}. Permissions can be adjusted before launch.`
+    : "Select a saved conversation to launch an embedded app.";
+
+  el.miniappPermissions.replaceChildren();
+  const permissions = Array.isArray(manifest?.permissions) ? manifest.permissions : [];
+  for (const permission of permissions) {
+    const item = document.createElement("label");
+    item.className = "miniapp-permission";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = state.miniapp.grantedPermissions.has(permission);
+    input.disabled = !supported;
+    input.addEventListener("change", () => {
+      if (input.checked) state.miniapp.grantedPermissions.add(permission);
+      else state.miniapp.grantedPermissions.delete(permission);
+    });
+    const copy = document.createElement("span");
+    copy.textContent = permission;
+    item.append(input, copy);
+    el.miniappPermissions.append(item);
+  }
+  el.miniappOpenBtn.disabled = !supported || !manifest;
+  el.miniappResetBtn.disabled = !state.miniapp.launchContext?.app_session_id;
+}
+
 function renderMessages() {
   const thread = getActiveThread();
   const blocked = Boolean(thread?.blocked);
@@ -670,6 +1052,8 @@ function renderMessages() {
     el.title.textContent = "Select a conversation";
     el.subtitle.textContent = "No active thread";
     el.composerInput.disabled = true;
+    closeMiniappLauncher();
+    renderMiniappLauncher();
     el.messageList.replaceChildren(el.emptyState);
     return;
   }
@@ -678,6 +1062,7 @@ function renderMessages() {
   el.subtitle.textContent = thread.subtitle;
   el.composerInput.disabled = blocked;
   el.composerInput.placeholder = blocked ? "Unblock this user to send messages" : "Message";
+  renderMiniappLauncher();
   el.messageList.replaceChildren();
 
   for (const message of thread.messages || []) {
@@ -1076,6 +1461,7 @@ async function bootAfterAuth() {
   state.query = "";
   state.activeThreadId = null;
   state.threads = [];
+  eventStreamDisabled = false;
   loadConversationStore();
   showAppShell();
   renderAll();
@@ -1090,6 +1476,49 @@ async function bootAfterAuth() {
   }
 }
 
+async function selectMiniapp(appId) {
+  const entry = getMiniappCatalogEntry(appId);
+  if (!entry) return;
+  state.miniapp.selectedAppId = appId;
+  state.miniapp.launchContext = null;
+  state.miniapp.sessionState = normalizeMiniappSessionState(null);
+  state.miniapp.frameWindow = null;
+  el.miniappFrame.src = "about:blank";
+  try {
+    const manifest = await fetchMiniappManifest(entry.manifestUrl);
+    state.miniapp.manifest = manifest;
+    state.miniapp.grantedPermissions = new Set(Array.isArray(manifest.permissions) ? manifest.permissions : []);
+  } catch (error) {
+    console.error(error);
+  }
+  renderMiniappLauncher();
+}
+
+async function openEmbeddedMiniapp() {
+  try {
+    await ensureMiniappSession();
+    el.miniappFrame.setAttribute("sandbox", "allow-scripts allow-same-origin");
+    el.miniappFrame.src = buildMiniappFrameURL();
+    renderMiniappLauncher();
+  } catch (error) {
+    console.error(error);
+  }
+}
+
+async function resetEmbeddedMiniappSession() {
+  if (!state.miniapp.launchContext?.app_session_id) return;
+  try {
+    await apiRequest(`/v1/apps/sessions/${encodeURIComponent(state.miniapp.launchContext.app_session_id)}`, { method: "DELETE" });
+  } catch (error) {
+    console.error(error);
+  }
+  state.miniapp.launchContext = null;
+  state.miniapp.sessionState = normalizeMiniappSessionState(null);
+  state.miniapp.frameWindow = null;
+  el.miniappFrame.src = "about:blank";
+  renderMiniappLauncher();
+}
+
 function logout() {
   stopEventStream();
   authStoreClear();
@@ -1097,6 +1526,12 @@ function logout() {
   state.activeThreadId = null;
   state.query = "";
   state.typingDraft = "";
+  state.miniapp.drawerOpen = false;
+  state.miniapp.selectedAppId = "";
+  state.miniapp.manifest = null;
+  state.miniapp.launchContext = null;
+  state.miniapp.sessionState = null;
+  state.miniapp.frameWindow = null;
   showAuthShell();
   setAuthStatus("Signed out.");
   renderAll();
@@ -1105,6 +1540,31 @@ function logout() {
 el.searchInput.addEventListener("input", (event) => {
   state.query = sanitizeText(event.target.value, 120);
   renderThreadList();
+});
+
+el.attachBtn.addEventListener("click", async () => {
+  state.miniapp.drawerOpen = !state.miniapp.drawerOpen;
+  if (state.miniapp.drawerOpen && !state.miniapp.selectedAppId) {
+    await selectMiniapp("app.ohmf.counter-lab");
+  }
+  renderMiniappLauncher();
+});
+
+el.miniappCloseBtn.addEventListener("click", () => {
+  closeMiniappLauncher();
+  renderMiniappLauncher();
+});
+
+el.miniappCounterCard.addEventListener("click", async () => {
+  await selectMiniapp("app.ohmf.counter-lab");
+});
+
+el.miniappOpenBtn.addEventListener("click", async () => {
+  await openEmbeddedMiniapp();
+});
+
+el.miniappResetBtn.addEventListener("click", async () => {
+  await resetEmbeddedMiniappSession();
 });
 
 el.composerInput.addEventListener("input", () => {
@@ -1193,6 +1653,29 @@ el.newPhoneInput.addEventListener("input", updateNewPhoneFormat);
 
 window.addEventListener("resize", () => {
   if (!window.matchMedia("(max-width: 880px)").matches) closeMobileThread();
+});
+
+window.addEventListener("message", async (event) => {
+  if (event.source !== el.miniappFrame.contentWindow) return;
+  if (!state.miniapp.manifest?.entrypoint?.url) return;
+  const expectedOrigin = new URL(state.miniapp.manifest.entrypoint.url, window.location.href).origin;
+  if (event.origin !== expectedOrigin) return;
+
+  const message = event.data;
+  if (!message || typeof message !== "object" || message.channel !== state.miniapp.channelId) return;
+  state.miniapp.frameWindow = event.source;
+  const requestId = sanitizeText(message.request_id, 80);
+  if (!requestId) return;
+
+  try {
+    const result = await handleMiniappBridgeCall(message);
+    sendMiniappBridgeResponse(event.source, requestId, true, result);
+  } catch (error) {
+    sendMiniappBridgeResponse(event.source, requestId, false, null, {
+      code: sanitizeText(error.code || "bridge_error", 80),
+      message: sanitizeText(error.message || "Bridge call failed", 220),
+    });
+  }
 });
 
 async function init() {
