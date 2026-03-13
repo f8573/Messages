@@ -15,6 +15,7 @@ import (
 	"ohmf/services/gateway/internal/limit"
 	"ohmf/services/gateway/internal/messages"
 	appmw "ohmf/services/gateway/internal/middleware"
+	"ohmf/services/gateway/internal/observability"
 	"ohmf/services/gateway/internal/token"
 )
 
@@ -163,6 +164,7 @@ func (h *Handler) readLoop(c *client, ip string) {
 			h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": "invalid event envelope"})
 			continue
 		}
+		observability.RecordWSMessage("received", env.Event)
 		switch env.Event {
 		// Support legacy/spec alias: "subscribe" maps to presence_subscribe
 		case "subscribe":
@@ -357,6 +359,7 @@ func (h *Handler) register(c *client) {
 		h.clients[c.userID] = bucket
 	}
 	bucket[c] = struct{}{}
+	observability.IncWSConnection()
 }
 
 func (h *Handler) unregister(c *client) {
@@ -369,6 +372,7 @@ func (h *Handler) unregister(c *client) {
 			_ = h.redis.Del(context.Background(), "presence:user:"+c.userID).Err()
 		}
 	}
+	observability.DecWSConnection()
 	close(c.send)
 	_ = c.conn.Close()
 }
@@ -381,6 +385,7 @@ func (h *Handler) sendJSON(c *client, event string, data any) {
 	if err != nil {
 		return
 	}
+	observability.RecordWSMessage("sent", event)
 	select {
 	case c.send <- payload:
 	default:

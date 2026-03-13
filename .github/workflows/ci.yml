@@ -37,10 +37,10 @@ jobs:
           cd tools/validate_openapi || exit 1
           go run . -spec ../../${OPENAPI_SPEC}
 
-      - name: Run unit tests (ohmf module)
+      - name: Run repository tests (script)
         run: |
-          cd ohmf
-          go test ./... -v
+          chmod +x ./scripts/run-tests.sh || true
+          ./scripts/run-tests.sh
 
       - name: Build docker images
         run: |
@@ -101,10 +101,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-go-
 
-      - name: Run unit tests (ohmf module)
+      - name: Run repository tests (script)
         run: |
-          cd ohmf
-          go test ./... -v
+          chmod +x ./scripts/run-tests.sh || true
+          ./scripts/run-tests.sh
 
       - name: Build docker images
         run: |
@@ -127,11 +127,10 @@ jobs:
           echo "gateway did not become healthy" >&2
           exit 1
 
-      - name: Run integration tests
-        env:
-          INTEGRATION: 1
+      - name: Run repository integration tests (script)
         run: |
-          go test ./ohmf/integration -v
+          chmod +x ./scripts/run-tests.sh || true
+          ./scripts/run-tests.sh --integration
 
       - name: Collect docker-compose logs on failure
         if: failure()

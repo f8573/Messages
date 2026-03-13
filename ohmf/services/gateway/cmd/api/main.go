@@ -54,6 +54,7 @@ func main() {
 		r.Use(chimiddleware.RealIP)
 		r.Use(chimiddleware.Recoverer)
 		r.Use(chimiddleware.Timeout(30 * time.Second))
+		r.Use(observability.HTTPMetricsMiddleware)
 
 		// Lightweight reverse-proxy handlers for local dev and integration tests.
 		// These proxy /v1/contacts, /v1/apps, /v1/media to configured backend addresses.
@@ -84,7 +85,12 @@ func main() {
 		r.Handle("/v1/apps/*", makeProxy(cfg.AppsAddr))
 		r.Handle("/v1/media", makeProxy(cfg.MediaAddr))
 		r.Handle("/v1/media/*", makeProxy(cfg.MediaAddr))
+		r.Handle("/metrics", observability.MetricsHandler())
 		r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+		})
+		r.Get("/readyz", func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("ok"))
 		})
@@ -219,6 +225,7 @@ func main() {
 	r.Use(chimiddleware.RealIP)
 	r.Use(chimiddleware.Recoverer)
 	r.Use(chimiddleware.Timeout(30 * time.Second))
+	r.Use(observability.HTTPMetricsMiddleware)
 
 	// API versioning middleware: advertise spec & API versions
 	r.Use(appmw.APIVersionMiddleware(cfg))
@@ -251,6 +258,11 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+	r.Get("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	r.Handle("/metrics", observability.MetricsHandler())
 
 	// Serve the OpenAPI spec at the repository-level path.
 	r.Get("/openapi.yaml", openapipkg.NewHandler())

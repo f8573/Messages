@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'"
+    />
+    <meta name="referrer" content="no-referrer" />
+    <meta http-equiv="Permissions-Policy" content="camera=(), microphone=(), geolocation=()" />
+    <title>OHMF Mini-App Runtime Lab</title>
+    <link rel="stylesheet" href="./miniapp-runtime.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">Embedded App API</p>
+          <h1>Mini-App Runtime Lab</h1>
+          <p class="hero-copy">
+            Loads a sandboxed mini-app, exposes a small bridge, and lets you deny permissions to test host behavior.
+          </p>
+        </div>
+        <p class="status" id="runtime-status" role="status" aria-live="polite">Ready.</p>
+      </header>
+
+      <main class="layout">
+        <section class="panel controls">
+          <div class="section-head">
+            <h2>Launch</h2>
+            <p>Point the runtime at a bundled manifest or another same-origin test manifest.</p>
+          </div>
+
+          <form id="manifest-form" class="manifest-form">
+            <label for="manifest-url">Manifest URL</label>
+            <div class="manifest-row">
+              <input
+                id="manifest-url"
+                name="manifestUrl"
+                type="text"
+                spellcheck="false"
+                value="./miniapps/counter/manifest.json"
+              />
+              <button type="submit" class="primary-btn">Load</button>
+            </div>
+          </form>
+
+          <div class="button-row">
+            <button id="relaunch-btn" class="secondary-btn" type="button">Relaunch</button>
+            <button id="clear-session-btn" class="secondary-btn" type="button">Clear Session</button>
+          </div>
+
+          <div class="section-head compact">
+            <h2>Permissions</h2>
+            <p>Granted permissions are enforced by the host bridge per request.</p>
+          </div>
+          <div id="permissions-list" class="permission-list"></div>
+
+          <div class="section-head compact">
+            <h2>Launch Context</h2>
+          </div>
+          <pre id="context-json" class="code-block"></pre>
+
+          <div class="section-head compact">
+            <h2>Manifest</h2>
+          </div>
+          <pre id="manifest-json" class="code-block"></pre>
+        </section>
+
+        <section class="panel runtime">
+          <div class="section-head">
+            <h2>Sandbox</h2>
+            <p>The iframe runs with <code>sandbox="allow-scripts"</code>, so bridge traffic is correlated by source window and channel token.</p>
+          </div>
+          <div class="frame-wrap">
+            <iframe id="app-frame" title="Mini-app sandbox"></iframe>
+          </div>
+        </section>
+
+        <section class="panel events">
+          <div class="section-head">
+            <h2>Conversation Projection</h2>
+            <p>Messages sent through <code>conversation.sendMessage</code> are projected into this local transcript.</p>
+          </div>
+          <ul id="transcript-list" class="transcript-list"></ul>
+
+          <div class="section-head compact">
+            <h2>Bridge Log</h2>
+          </div>
+          <ul id="log-list" class="log-list"></ul>
+        </section>
+      </main>
+    </div>
+
+    <script src="./miniapp-runtime.js"></script>
+  </body>
+</html>

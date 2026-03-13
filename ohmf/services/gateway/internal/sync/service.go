@@ -9,6 +9,24 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+type Rows interface {
+	Next() bool
+	Scan(dest ...any) error
+	Close()
+}
+
+type DB interface {
+	Query(ctx context.Context, sql string, args ...any) (Rows, error)
+}
+
+type pgxPoolAdapter struct {
+	db *pgxpool.Pool
+}
+
+func (a *pgxPoolAdapter) Query(ctx context.Context, sql string, args ...any) (Rows, error) {
+	return a.db.Query(ctx, sql, args...)
+}
+
 // parseCursor accepts either an opaque base64-encoded JSON cursor containing
 // `timestamp_ms` (unix ms) or an RFC3339 timestamp string. Returns zero Time
 // on failure.
@@ -45,10 +63,12 @@ func parseCursor(cursor string) time.Time {
 }
 
 type Service struct {
-	db *pgxpool.Pool
+	db DB
 }
 
-func NewService(db *pgxpool.Pool) *Service { return &Service{db: db} }
+func NewService(db *pgxpool.Pool) *Service { return &Service{db: &pgxPoolAdapter{db: db}} }
+
+func NewServiceWithDB(db DB) *Service { return &Service{db: db} }
 
 // SyncResponse is a minimal response payload for incremental sync.
 type SyncResponse struct {

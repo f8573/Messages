@@ -11,11 +11,45 @@ import (
 	"time"
 )
 
-type Service struct {
-	db *pgxpool.Pool
+type RowScanner interface {
+	Scan(dest ...any) error
 }
 
-func NewService(db *pgxpool.Pool) *Service { return &Service{db: db} }
+type Rows interface {
+	Next() bool
+	Scan(dest ...any) error
+	Close()
+}
+
+type DB interface {
+	Exec(ctx context.Context, sql string, args ...any) (any, error)
+	Query(ctx context.Context, sql string, args ...any) (Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) RowScanner
+}
+
+type pgxPoolAdapter struct {
+	p *pgxpool.Pool
+}
+
+func (a *pgxPoolAdapter) QueryRow(ctx context.Context, sql string, args ...any) RowScanner {
+	return a.p.QueryRow(ctx, sql, args...)
+}
+
+func (a *pgxPoolAdapter) Query(ctx context.Context, sql string, args ...any) (Rows, error) {
+	return a.p.Query(ctx, sql, args...)
+}
+
+func (a *pgxPoolAdapter) Exec(ctx context.Context, sql string, args ...any) (any, error) {
+	return a.p.Exec(ctx, sql, args...)
+}
+
+type Service struct {
+	db DB
+}
+
+func NewService(db *pgxpool.Pool) *Service { return &Service{db: &pgxPoolAdapter{p: db}} }
+
+func NewServiceWithDB(db DB) *Service { return &Service{db: db} }
 
 type RelayJob struct {
 	ID                string `json:"id"`

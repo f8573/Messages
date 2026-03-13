@@ -2,17 +2,20 @@
 
 This is a barebones Google Messages-style web interface wired to the OHMF gateway API.
 
+It also includes a standalone mini-app runtime test page for the embedded app API.
+
 ## Run
 
 From `apps/web`:
 
 ```powershell
-python -m http.server 5173
+py -m http.server 5173
 ```
 
 Then open:
 
 - `http://localhost:5173`
+- `http://localhost:5173/miniapp-runtime.html`
 
 Gateway API should be running at:
 
@@ -44,6 +47,11 @@ Gateway API should be running at:
 - Conversation store:
   - Per-user conversation state cached in `localStorage`
   - Auth session stored in `sessionStorage`
+- Mini-app runtime lab:
+  - Loads `./miniapps/counter/manifest.json`
+  - Runs the app in a sandboxed iframe
+  - Exposes a minimal bridge with `host.getLaunchContext`, `conversation.readContext`, `conversation.sendMessage`, `storage.session.get`, `storage.session.set`, and `session.updateState`
+  - Lets you toggle granted permissions to verify host-side capability enforcement
 
 ## Security And Dev Guardrails
 
@@ -63,3 +71,4 @@ Gateway API should be running at:
 - Realtime updates
 - Contact names/profile resolution
 - Media attachments and rich content types
+- Backend-backed mini-app session persistence through the gateway mini-app endpoints
