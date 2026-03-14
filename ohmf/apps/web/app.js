@@ -24,6 +24,9 @@ const AUTH_STORAGE_KEY = "ohmf.auth.session.v1";
 const STORE_VERSION = 2;
 const TRANSPORT_SMS = "SMS";
 const TRANSPORT_OHMF = "OHMF";
+const CONTENT_TYPE_TEXT = "text";
+const CONTENT_TYPE_APP_CARD = "app_card";
+const CONTENT_TYPE_APP_EVENT = "app_event";
 const SMS_DELIVERY_STATUSES = Object.freeze({
   SENT: "SENT",
   FAIL_SEND: "FAIL_SEND",
@@ -61,6 +64,8 @@ const state = {
     frameWindow: null,
     channelId: "",
     sessionMode: "idle",
+    consentRequired: false,
+    lastShareError: "",
   },
 };
 let liveSyncInFlight = false;
@@ -68,6 +73,8 @@ let eventStreamAbort = null;
 let eventStreamReconnectTimer = 0;
 let refreshAuthInFlight = null;
 let eventStreamDisabled = false;
+let realtimeSocket = null;
+let realtimeReconnectTimer = 0;
 
 const el = {
   authShell: document.getElementById("auth-shell"),
@@ -107,6 +114,7 @@ const el = {
   miniappPermissions: document.getElementById("miniapp-permissions"),
   miniappContextCopy: document.getElementById("miniapp-context-copy"),
   miniappLaunchMode: document.getElementById("miniapp-launch-mode"),
+  miniappShareBtn: document.getElementById("miniapp-share-btn"),
   miniappOpenBtn: document.getElementById("miniapp-open-btn"),
   miniappResetBtn: document.getElementById("miniapp-reset-btn"),
   miniappFrame: document.getElementById("miniapp-frame"),
@@ -335,8 +343,15 @@ function getMiniappCatalogEntry(appId = state.miniapp.selectedAppId) {
   return MINIAPP_CATALOG.find((item) => item.appId === appId) || null;
 }
 
+function miniappSupportReason(thread = getActiveThread()) {
+  if (!thread) return "Select a saved OHMF conversation to launch an app.";
+  if (thread.closed) return "Reopen or choose an active conversation to launch an app.";
+  if (thread.kind === "draft_phone") return "Save the conversation before sending an app.";
+  return "";
+}
+
 function activeThreadSupportsMiniapps(thread = getActiveThread()) {
-  return Boolean(thread && thread.kind !== "draft_phone" && !thread.closed);
+  return miniappSupportReason(thread) === "";
 }
 
 function rewriteLocalDevEntrypoint(rawUrl) {
@@ -387,6 +402,14 @@ async function ensureMiniappManifestRegistered(manifest) {
   return apiRequest(`/v1/apps/${encodeURIComponent(manifest.app_id)}`, { method: "GET" });
 }
 
+async function loadMiniappManifestByAppId(appId) {
+  const response = await apiRequest(`/v1/apps/${encodeURIComponent(appId)}`, { method: "GET" });
+  const manifest = response?.manifest;
+  if (!manifest?.app_id || !manifest?.entrypoint?.url) throw new Error("invalid_manifest");
+  manifest.entrypoint.url = rewriteLocalDevEntrypoint(manifest.entrypoint.url);
+  return manifest;
+}
+
 function buildMiniappViewer(thread) {
   return {
     user_id: state.auth?.userId || "",
@@ -420,9 +443,11 @@ function applyMiniappSessionRecord(record, manifest) {
     projected_messages: record?.state?.projected_messages,
   });
   state.miniapp.launchContext = record?.launch_context || null;
+  state.miniapp.consentRequired = Boolean(record?.consent_required || record?.launch_context?.consent_required);
   state.miniapp.grantedPermissions = new Set(
     Array.isArray(record?.capabilities_granted) && record.capabilities_granted.length ? record.capabilities_granted : (manifest.permissions || [])
   );
+  state.miniapp.lastShareError = "";
 }
 
 async function ensureMiniappSession() {
@@ -448,6 +473,27 @@ async function ensureMiniappSession() {
   applyMiniappSessionRecord(record, manifest);
 }
 
+async function fetchMiniappSession(sessionId) {
+  const record = await apiRequest(`/v1/apps/sessions/${encodeURIComponent(sessionId)}`, { method: "GET" });
+  const appId = sanitizeText(record?.app_id, 120);
+  if (!appId) throw new Error("invalid_session");
+  const manifest = state.miniapp.manifest?.app_id === appId ? state.miniapp.manifest : await loadMiniappManifestByAppId(appId);
+  state.miniapp.selectedAppId = appId;
+  applyMiniappSessionRecord(record, manifest);
+  return record;
+}
+
+async function joinMiniappSession(sessionId) {
+  const record = await apiRequest(`/v1/apps/sessions/${encodeURIComponent(sessionId)}/join`, {
+    method: "POST",
+    body: JSON.stringify({ capabilities_granted: Array.from(state.miniapp.grantedPermissions) }),
+  });
+  const appId = sanitizeText(record?.app_id, 120);
+  const manifest = state.miniapp.manifest?.app_id === appId ? state.miniapp.manifest : await loadMiniappManifestByAppId(appId);
+  applyMiniappSessionRecord(record, manifest);
+  return record;
+}
+
 async function persistMiniappSession(version, eventName, eventBody) {
   if (!state.miniapp.launchContext?.app_session_id) return 0;
   const payload = await apiRequest(`/v1/apps/sessions/${encodeURIComponent(state.miniapp.launchContext.app_session_id)}/snapshot`, {
@@ -470,6 +516,57 @@ async function persistMiniappSession(version, eventName, eventBody) {
     });
   }
   return Number(payload?.state_version || version || 1);
+}
+
+async function shareMiniappToConversation() {
+  const thread = getActiveThread();
+  if (!activeThreadSupportsMiniapps(thread)) {
+    state.miniapp.lastShareError = miniappSupportReason(thread);
+    renderMiniappLauncher();
+    return;
+  }
+  const entry = getMiniappCatalogEntry();
+  if (!entry) return;
+  const manifest = state.miniapp.manifest || await fetchMiniappManifest(entry.manifestUrl);
+  state.miniapp.manifest = manifest;
+  state.miniapp.lastShareError = "";
+  let payload;
+  try {
+    payload = await apiRequest("/v1/apps/shares", {
+      method: "POST",
+      body: JSON.stringify({
+        conversation_id: thread.id,
+        app_id: manifest.app_id,
+        capabilities_granted: Array.from(state.miniapp.grantedPermissions),
+        state_snapshot: cloneJson(state.miniapp.sessionState?.stateSnapshot || {}),
+        resume_existing: true,
+      }),
+    });
+  } catch (error) {
+    if (error.status === 409 && error.code === "miniapp_unsupported") {
+      state.miniapp.lastShareError = "This conversation is not mini-app capable yet. Every participant needs an OHMF device with mini-app support.";
+      renderMiniappLauncher();
+      return;
+    }
+    throw error;
+  }
+  if (payload?.message) {
+    upsertThreadMessage(thread.id, mapMessage(payload.message));
+  }
+  applyMiniappSessionRecord(payload, manifest);
+  renderAll();
+  await openEmbeddedMiniapp();
+}
+
+async function openMiniappCard(message) {
+  const sessionId = sanitizeText(message?.content?.app_session_id, 120);
+  if (!sessionId) return;
+  state.miniapp.drawerOpen = true;
+  const record = await fetchMiniappSession(sessionId);
+  renderMiniappLauncher();
+  if (record?.joinable !== false && !state.miniapp.consentRequired) {
+    await openEmbeddedMiniapp();
+  }
 }
 
 function appendProjectedMiniappMessage(text, contentType = "app_event", content = null) {
@@ -512,12 +609,20 @@ function summarizeMiniappMessage(params) {
   return `${state.miniapp.manifest?.name || "App"} posted an update.`;
 }
 
+function requireMiniappPermission(permission) {
+  if (state.miniapp.grantedPermissions.has(permission)) return;
+  const error = new Error(`Permission required: ${permission}`);
+  error.code = "permission_denied";
+  throw error;
+}
+
 async function handleMiniappBridgeCall(message) {
   const method = sanitizeText(message.method, 120);
   switch (method) {
     case "host.getLaunchContext":
       return cloneJson(state.miniapp.launchContext);
     case "conversation.readContext":
+      requireMiniappPermission("conversation.read_context");
       return {
         conversation_id: state.miniapp.launchContext?.conversation_id,
         title: getActiveThread()?.title || "Conversation",
@@ -528,6 +633,7 @@ async function handleMiniappBridgeCall(message) {
         }))),
       };
     case "conversation.sendMessage": {
+      requireMiniappPermission("conversation.send_message");
       const text = summarizeMiniappMessage(message.params);
       appendProjectedMiniappMessage(text, sanitizeText(message.params?.content_type, 60) || "app_event", message.params?.content || null);
       state.miniapp.sessionState.transcript.push({ author: state.miniapp.manifest.name, text, createdAt: nowISO() });
@@ -540,12 +646,15 @@ async function handleMiniappBridgeCall(message) {
       return { message_id: randomId("msg"), state_version: persistedVersion };
     }
     case "participants.readBasic":
+      requireMiniappPermission("participants.read_basic");
       return { participants: cloneJson(state.miniapp.launchContext?.participants || []) };
     case "storage.session.get": {
+      requireMiniappPermission("storage.session");
       const key = sanitizeText(message.params?.key, 80);
       return { key, value: cloneJson(state.miniapp.sessionState.storage[key]) };
     }
     case "storage.session.set": {
+      requireMiniappPermission("storage.session");
       const key = sanitizeText(message.params?.key, 80);
       state.miniapp.sessionState.storage[key] = cloneJson(message.params?.value);
       state.miniapp.sessionState.stateVersion += 1;
@@ -554,6 +663,7 @@ async function handleMiniappBridgeCall(message) {
       return { key, value: cloneJson(state.miniapp.sessionState.storage[key]), state_version: persistedVersion };
     }
     case "session.updateState": {
+      requireMiniappPermission("realtime.session");
       const next = cloneJson(message.params || {});
       state.miniapp.sessionState.stateSnapshot = {
         ...(state.miniapp.sessionState.stateSnapshot || {}),
@@ -629,18 +739,43 @@ function mapMessage(item) {
     transport,
     item.status || (item.sender_user_id === state.auth?.userId ? OHMF_DELIVERY_STATUSES.SENT : "")
   );
+  const contentType = sanitizeText(item?.content_type, 40) || CONTENT_TYPE_TEXT;
+  const content = item?.content && typeof item.content === "object" ? item.content : {};
+  const fallbackText = contentType === CONTENT_TYPE_APP_CARD
+    ? sanitizeText(content.title || "Shared app", 1000)
+    : sanitizeText(item?.content?.text || JSON.stringify(content || {}), 1000);
   return {
     id: sanitizeText(item?.message_id, 80),
     direction: item.sender_user_id === state.auth?.userId ? "out" : "in",
-    text: sanitizeText(item?.content?.text || JSON.stringify(item?.content || {}), 1000),
+    text: fallbackText,
     createdAt: item.created_at || nowISO(),
+    sentAt: item.sent_at || item.created_at || nowISO(),
+    deliveredAt: item.delivered_at || "",
+    readAt: item.read_at || "",
     serverOrder: Number(item.server_order || 0),
     status,
+    statusUpdatedAt: item.status_updated_at || item.read_at || item.delivered_at || item.sent_at || item.created_at || nowISO(),
     transport,
     reactions: {},
     editedAt: "",
     deleted: false,
+    contentType,
+    content,
   };
+}
+
+function isAppCardMessage(message) {
+  return sanitizeText(message?.contentType, 40) === CONTENT_TYPE_APP_CARD;
+}
+
+function upsertThreadMessage(threadId, nextMessage) {
+  const thread = getThreadById(threadId);
+  if (!thread) return;
+  const nextMessages = [...(thread.messages || []).filter((message) => message.id !== nextMessage.id), nextMessage].sort(
+    (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+  );
+  upsertThread({ ...thread, messages: nextMessages, updatedAt: nextMessage.createdAt || nowISO() });
+  saveConversationStore();
 }
 
 function normalizeTransport(value) {
@@ -670,14 +805,13 @@ function normalizeDeliveryStatus(transport, status) {
 function deliveryIndicatorLabel(message) {
   if (normalizeTransport(message.transport) !== TRANSPORT_OHMF || message.direction !== "out") return "";
   const status = normalizeDeliveryStatus(message.transport, message.status);
-  const statusStamp = message.statusUpdatedAt ? formatShortTime(message.statusUpdatedAt) : "";
   switch (status) {
     case OHMF_DELIVERY_STATUSES.SENT:
-      return "Sent";
+      return message.sentAt ? `Sent ${formatShortTime(message.sentAt)}` : "Sent";
     case OHMF_DELIVERY_STATUSES.DELIVERED:
-      return statusStamp ? `Delivered ${statusStamp}` : "Delivered";
+      return message.deliveredAt ? `Delivered ${formatShortTime(message.deliveredAt)}` : "Delivered";
     case OHMF_DELIVERY_STATUSES.READ:
-      return statusStamp ? `Read ${statusStamp}` : "Read";
+      return message.readAt ? `Read ${formatShortTime(message.readAt)}` : "Read";
     case OHMF_DELIVERY_STATUSES.FAIL_DELIVERY:
       return "Failed delivery";
     case OHMF_DELIVERY_STATUSES.FAIL_SEND:
@@ -785,6 +919,14 @@ function scheduleEventStreamReconnect(delayMs = 1500) {
 }
 
 function handleSSEEvent(name, rawData) {
+  if (name === "message_created" || name === "delivery_update") {
+    try {
+      handleRealtimeEvent(name, rawData ? JSON.parse(rawData) : null);
+    } catch (error) {
+      console.error(error);
+    }
+    return;
+  }
   if (name === "sync_required") {
     void refreshLiveState();
   }
@@ -874,6 +1016,133 @@ async function ensureMessagesLoaded(threadId) {
   const thread = getThreadById(threadId);
   if (!thread || thread.kind === "draft_phone" || thread.loadedMessages) return;
   await loadMessagesForThread(threadId);
+}
+
+async function waitForOutgoingStatus(threadId, messageId, currentStatus, attempts = 8, delayMs = 900) {
+  if (!threadId || !messageId) return;
+  const baseline = normalizeDeliveryStatus(TRANSPORT_OHMF, currentStatus);
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    await loadMessagesForThread(threadId);
+    const thread = getThreadById(threadId);
+    const message = (thread?.messages || []).find((item) => item.id === messageId);
+    const nextStatus = normalizeDeliveryStatus(message?.transport || TRANSPORT_OHMF, message?.status || "");
+    if (nextStatus && nextStatus !== baseline && nextStatus !== OHMF_DELIVERY_STATUSES.SENT) {
+      return;
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+  }
+}
+
+function stopRealtimeSocket() {
+  if (realtimeReconnectTimer) {
+    window.clearTimeout(realtimeReconnectTimer);
+    realtimeReconnectTimer = 0;
+  }
+  if (realtimeSocket) {
+    realtimeSocket.close();
+    realtimeSocket = null;
+  }
+}
+
+function scheduleRealtimeReconnect(delayMs = 1200) {
+  if (!state.auth || realtimeReconnectTimer || realtimeSocket) return;
+  realtimeReconnectTimer = window.setTimeout(() => {
+    realtimeReconnectTimer = 0;
+    startRealtimeSocket();
+  }, delayMs);
+}
+
+function applyDeliveryUpdate(payload) {
+  const conversationId = sanitizeText(payload?.conversation_id, 80);
+  const status = normalizeDeliveryStatus(TRANSPORT_OHMF, payload?.status || "");
+  if (!conversationId || !status) return;
+  if (status === OHMF_DELIVERY_STATUSES.READ) {
+    const through = Number(payload?.through_server_order || 0);
+    const thread = getThreadById(conversationId);
+    if (!thread) return;
+    const nextMessages = (thread.messages || []).map((message) => {
+      if (message.direction !== "out" || Number(message.serverOrder || 0) > through) return message;
+      return {
+        ...message,
+        status: OHMF_DELIVERY_STATUSES.READ,
+        readAt: payload?.status_updated_at || nowISO(),
+        statusUpdatedAt: payload?.status_updated_at || nowISO(),
+      };
+    });
+    upsertThread({ ...thread, messages: nextMessages, updatedAt: payload?.status_updated_at || thread.updatedAt });
+    saveConversationStore();
+    renderAll();
+    return;
+  }
+
+  const messageId = sanitizeText(payload?.message_id, 80);
+  if (!messageId) return;
+  patchMessage(conversationId, messageId, {
+    status,
+    transport: TRANSPORT_OHMF,
+    deliveredAt: payload?.status_updated_at || nowISO(),
+    statusUpdatedAt: payload?.status_updated_at || nowISO(),
+  });
+  renderAll();
+}
+
+function handleRealtimeEvent(eventName, payload) {
+  if (eventName === "message_created") {
+    applyIncomingMessage(payload);
+    return;
+  }
+  if (eventName === "delivery_update") {
+    applyDeliveryUpdate(payload);
+  }
+}
+
+function applyIncomingMessage(payload) {
+  const conversationId = sanitizeText(payload?.conversation_id, 80);
+  if (!conversationId) return;
+  const nextMessage = mapMessage(payload);
+  const existingThread = getThreadById(conversationId);
+  if (existingThread) {
+    upsertThreadMessage(conversationId, nextMessage);
+    if (state.activeThreadId === conversationId) {
+      void loadMessagesForThread(conversationId);
+    } else {
+      renderAll();
+    }
+    return;
+  }
+  void (async () => {
+    await loadConversationsFromApi();
+    await loadMessagesForThread(conversationId);
+    renderAll();
+  })();
+}
+
+function startRealtimeSocket() {
+  if (!state.auth || realtimeSocket) return;
+  const wsURL = new URL(API_BASE_URL.replace(/^http/i, "ws") + "/v1/ws");
+  wsURL.searchParams.set("access_token", state.auth.accessToken);
+  const socket = new window.WebSocket(wsURL.toString());
+  realtimeSocket = socket;
+
+  socket.addEventListener("message", (event) => {
+    try {
+      const message = JSON.parse(event.data);
+      handleRealtimeEvent(sanitizeText(message?.event, 80), message?.data);
+    } catch (error) {
+      console.error(error);
+    }
+  });
+
+  socket.addEventListener("close", () => {
+    if (realtimeSocket === socket) {
+      realtimeSocket = null;
+      scheduleRealtimeReconnect();
+    }
+  });
+
+  socket.addEventListener("error", () => {
+    socket.close();
+  });
 }
 
 async function markConversationRead(thread) {
@@ -989,13 +1258,18 @@ function scrollMessageListToBottom() {
 function closeMiniappLauncher() {
   state.miniapp.drawerOpen = false;
   state.miniapp.frameWindow = null;
+  state.miniapp.consentRequired = false;
+  state.miniapp.lastShareError = "";
   el.miniappFrame.src = "about:blank";
 }
 
 function renderMiniappLauncher() {
   const thread = getActiveThread();
   const supported = activeThreadSupportsMiniapps(thread);
-  el.attachBtn.disabled = !supported;
+  const supportReason = miniappSupportReason(thread);
+  const joinable = state.miniapp.launchContext?.joinable !== false;
+  el.attachBtn.disabled = false;
+  el.attachBtn.title = supported ? "Open apps and attachments" : supportReason;
   el.miniappLauncher.classList.toggle("hidden", !state.miniapp.drawerOpen);
   el.miniappStage.classList.toggle("hidden", !state.miniapp.selectedAppId);
   el.miniappCounterCard.classList.toggle("active", state.miniapp.selectedAppId === "app.ohmf.counter-lab");
@@ -1003,8 +1277,9 @@ function renderMiniappLauncher() {
   if (!state.miniapp.drawerOpen) {
     el.miniappContextCopy.textContent = supported
       ? "Open the attachment menu to choose an app."
-      : "Select a saved conversation to launch an app.";
+      : supportReason;
     el.miniappLaunchMode.textContent = "Ready";
+    el.miniappShareBtn.disabled = true;
     return;
   }
 
@@ -1013,10 +1288,12 @@ function renderMiniappLauncher() {
   el.miniappPreviewSubtitle.textContent = thread
     ? `Prepare ${manifest?.name || "the app"} for ${thread.title}.`
     : "Choose launch settings, then open the app.";
-  el.miniappLaunchMode.textContent = state.miniapp.launchContext?.app_session_id ? "Attached to thread" : "Needs launch";
-  el.miniappContextCopy.textContent = supported
+  el.miniappLaunchMode.textContent = state.miniapp.launchContext?.app_session_id
+    ? (!joinable ? "Session ended" : (state.miniapp.consentRequired ? "Consent required" : "Attached to thread"))
+    : "Needs launch";
+  el.miniappContextCopy.textContent = state.miniapp.lastShareError || (supported
     ? `App sessions attach to ${thread.title}. Permissions can be adjusted before launch.`
-    : "Select a saved conversation to launch an embedded app.";
+    : supportReason);
 
   el.miniappPermissions.replaceChildren();
   const permissions = Array.isArray(manifest?.permissions) ? manifest.permissions : [];
@@ -1026,7 +1303,7 @@ function renderMiniappLauncher() {
     const input = document.createElement("input");
     input.type = "checkbox";
     input.checked = state.miniapp.grantedPermissions.has(permission);
-    input.disabled = !supported;
+    input.disabled = !supported || !joinable;
     input.addEventListener("change", () => {
       if (input.checked) state.miniapp.grantedPermissions.add(permission);
       else state.miniapp.grantedPermissions.delete(permission);
@@ -1036,8 +1313,45 @@ function renderMiniappLauncher() {
     item.append(input, copy);
     el.miniappPermissions.append(item);
   }
-  el.miniappOpenBtn.disabled = !supported || !manifest;
+  el.miniappShareBtn.disabled = !supported || !manifest || !joinable;
+  el.miniappShareBtn.textContent = state.miniapp.launchContext?.app_session_id ? "Send Again" : "Send App";
+  el.miniappOpenBtn.disabled = !supported || !manifest || !joinable;
+  el.miniappOpenBtn.textContent = !joinable ? "Session Ended" : (state.miniapp.consentRequired ? "Join & Open" : (state.miniapp.launchContext?.app_session_id ? "Resume App" : "Open App"));
   el.miniappResetBtn.disabled = !state.miniapp.launchContext?.app_session_id;
+}
+
+function buildAppCardBubble(message) {
+  const bubble = document.createElement("article");
+  bubble.className = `bubble ${message.direction} app-card-bubble`;
+  const joinable = message.content?.joinable !== false;
+
+  const title = document.createElement("strong");
+  title.className = "app-card-title";
+  title.textContent = sanitizeText(message.content?.title || message.text || "Shared app", 120);
+
+  const summary = document.createElement("p");
+  summary.className = "app-card-summary";
+  summary.textContent = sanitizeText(message.content?.summary || "Open this shared app in the conversation.", 180);
+
+  bubble.append(title, summary);
+
+  const cta = document.createElement("button");
+  cta.type = "button";
+  cta.className = "secondary-btn compact app-card-open-btn";
+  cta.textContent = joinable ? sanitizeText(message.content?.cta_label || "Open", 32) : "Ended";
+  cta.disabled = !joinable;
+  cta.addEventListener("click", async () => {
+    try {
+      await openMiniappCard(message);
+    } catch (error) {
+      console.error(error);
+      state.miniapp.lastShareError = sanitizeText(error.message || "Unable to open app card.", 180);
+      renderMiniappLauncher();
+    }
+  });
+  bubble.appendChild(cta);
+
+  return bubble;
 }
 
 function renderMessages() {
@@ -1069,9 +1383,14 @@ function renderMessages() {
     const wrap = document.createElement("div");
     wrap.className = `bubble-wrap ${message.direction}`;
 
-    const bubble = document.createElement("article");
-    bubble.className = `bubble ${message.direction}`;
-    bubble.textContent = message.deleted ? "Message deleted" : message.text;
+    const bubble = isAppCardMessage(message)
+      ? buildAppCardBubble(message)
+      : (() => {
+          const plainBubble = document.createElement("article");
+          plainBubble.className = `bubble ${message.direction}`;
+          plainBubble.textContent = message.deleted ? "Message deleted" : message.text;
+          return plainBubble;
+        })();
 
     const meta = document.createElement("p");
     meta.className = `bubble-meta ${message.direction}`;
@@ -1119,7 +1438,7 @@ function renderMessages() {
       reactBtn.addEventListener("click", () => addReaction(thread.id, message.id));
       actions.appendChild(reactBtn);
 
-      if (message.direction === "out" && !message.deleted) {
+      if (message.direction === "out" && !message.deleted && !isAppCardMessage(message)) {
         const editBtn = document.createElement("button");
         editBtn.type = "button";
         editBtn.textContent = "Edit";
@@ -1290,7 +1609,7 @@ async function sendInConversation(thread, text) {
       createdAt: nowISO(),
       statusUpdatedAt: nowISO(),
     });
-    await ensureMessagesLoaded(thread.id);
+    await waitForOutgoingStatus(thread.id, finalMessageId, OHMF_DELIVERY_STATUSES.SENT);
   } catch (err) {
     const phone = thread.externalPhones?.[0];
     if (thread.kind !== "phone" || !phone) {
@@ -1308,7 +1627,7 @@ async function sendInConversation(thread, text) {
         createdAt: nowISO(),
         statusUpdatedAt: nowISO(),
       });
-      await ensureMessagesLoaded(thread.id);
+      await loadMessagesForThread(thread.id);
     } catch (smsErr) {
       patchMessage(thread.id, pendingId, { status: SMS_DELIVERY_STATUSES.FAIL_SEND, transport: TRANSPORT_SMS });
       throw smsErr;
@@ -1359,7 +1678,7 @@ async function sendInDraftPhoneConversation(thread, text) {
       createdAt: nowISO(),
       statusUpdatedAt: nowISO(),
     });
-    await ensureMessagesLoaded(conversationId);
+    await waitForOutgoingStatus(conversationId, finalMessageId, OHMF_DELIVERY_STATUSES.SENT);
   } catch {
     try {
       const smsPayload = await sendSMS(phone, text);
@@ -1374,7 +1693,7 @@ async function sendInDraftPhoneConversation(thread, text) {
         createdAt: nowISO(),
         statusUpdatedAt: nowISO(),
       });
-      if (conversationId) await ensureMessagesLoaded(conversationId);
+      if (conversationId) await loadMessagesForThread(conversationId);
     } catch (error) {
       patchMessage(thread.id, pendingId, { status: SMS_DELIVERY_STATUSES.FAIL_SEND, transport: TRANSPORT_SMS });
       throw error;
@@ -1434,7 +1753,7 @@ async function verifyPhoneAuth(event) {
       body: JSON.stringify({
         challenge_id: state.challengeId,
         otp_code: otp,
-        device: { platform: "WEB", device_name: "OHMF Web" },
+        device: { platform: "WEB", device_name: "OHMF Web", capabilities: ["MINI_APPS"] },
       }),
     });
     const user = payload?.user || {};
@@ -1469,7 +1788,9 @@ async function bootAfterAuth() {
     await loadConversationsFromApi();
     if (state.activeThreadId) await ensureMessagesLoaded(state.activeThreadId);
     stopEventStream();
+    stopRealtimeSocket();
     void startEventStream();
+    startRealtimeSocket();
     renderAll();
   } catch (error) {
     console.error(error);
@@ -1483,6 +1804,8 @@ async function selectMiniapp(appId) {
   state.miniapp.launchContext = null;
   state.miniapp.sessionState = normalizeMiniappSessionState(null);
   state.miniapp.frameWindow = null;
+  state.miniapp.consentRequired = false;
+  state.miniapp.lastShareError = "";
   el.miniappFrame.src = "about:blank";
   try {
     const manifest = await fetchMiniappManifest(entry.manifestUrl);
@@ -1496,12 +1819,25 @@ async function selectMiniapp(appId) {
 
 async function openEmbeddedMiniapp() {
   try {
-    await ensureMiniappSession();
+    if (state.miniapp.launchContext?.joinable === false) {
+      throw new Error("This shared app session has ended.");
+    }
+    if (state.miniapp.launchContext?.app_session_id) {
+      if (state.miniapp.consentRequired) {
+        await joinMiniappSession(state.miniapp.launchContext.app_session_id);
+      } else {
+        await fetchMiniappSession(state.miniapp.launchContext.app_session_id);
+      }
+    } else {
+      await ensureMiniappSession();
+    }
     el.miniappFrame.setAttribute("sandbox", "allow-scripts allow-same-origin");
     el.miniappFrame.src = buildMiniappFrameURL();
     renderMiniappLauncher();
   } catch (error) {
     console.error(error);
+    state.miniapp.lastShareError = sanitizeText(error.message || "Unable to open app.", 180);
+    renderMiniappLauncher();
   }
 }
 
@@ -1515,12 +1851,15 @@ async function resetEmbeddedMiniappSession() {
   state.miniapp.launchContext = null;
   state.miniapp.sessionState = normalizeMiniappSessionState(null);
   state.miniapp.frameWindow = null;
+  state.miniapp.consentRequired = false;
+  state.miniapp.lastShareError = "";
   el.miniappFrame.src = "about:blank";
   renderMiniappLauncher();
 }
 
 function logout() {
   stopEventStream();
+  stopRealtimeSocket();
   authStoreClear();
   state.threads = [];
   state.activeThreadId = null;
@@ -1532,6 +1871,8 @@ function logout() {
   state.miniapp.launchContext = null;
   state.miniapp.sessionState = null;
   state.miniapp.frameWindow = null;
+  state.miniapp.consentRequired = false;
+  state.miniapp.lastShareError = "";
   showAuthShell();
   setAuthStatus("Signed out.");
   renderAll();
@@ -1557,6 +1898,16 @@ el.miniappCloseBtn.addEventListener("click", () => {
 
 el.miniappCounterCard.addEventListener("click", async () => {
   await selectMiniapp("app.ohmf.counter-lab");
+});
+
+el.miniappShareBtn.addEventListener("click", async () => {
+  try {
+    await shareMiniappToConversation();
+  } catch (error) {
+    console.error(error);
+    state.miniapp.lastShareError = sanitizeText(error.message || "Unable to share app.", 180);
+    renderMiniappLauncher();
+  }
 });
 
 el.miniappOpenBtn.addEventListener("click", async () => {

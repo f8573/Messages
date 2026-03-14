@@ -5,13 +5,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self' http://localhost:18081 http://127.0.0.1:18081 https: http:; frame-src 'self' https: http:; object-src 'none'; base-uri 'none'; form-action 'self'"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self' http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:* https: http:; frame-src 'self' https: http:; object-src 'none'; base-uri 'none'; form-action 'self'"
     />
     <meta name="referrer" content="no-referrer" />
     <meta http-equiv="Permissions-Policy" content="camera=(), microphone=(), geolocation=()" />
     <title>OHMF Mini-App Runtime Lab</title>
-    <link rel="stylesheet" href="./miniapp-runtime.css" />
-    <script src="./frontend-config.js?v=20260313b"></script>
+    <link rel="icon" href="data:," />
+    <script src="./runtime-config.js"></script>
+    <script src="./asset-loader.js" data-css="./miniapp-runtime.css" data-js="./frontend-config.js"></script>
   </head>
   <body>
     <div class="shell">
@@ -94,6 +95,6 @@
       </main>
     </div>
 
-    <script src="./miniapp-runtime.js?v=20260313b"></script>
+    <script src="./asset-loader.js" data-js="./miniapp-runtime.js"></script>
   </body>
 </html>

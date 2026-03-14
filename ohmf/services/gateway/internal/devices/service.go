@@ -2,6 +2,7 @@ package devices
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -27,6 +28,7 @@ type Service struct {
 func NewService(db *pgxpool.Pool) *Service { return &Service{db: db} }
 
 func (s *Service) RegisterDevice(ctx context.Context, userID string, d Device) (string, error) {
+	d.Capabilities = normalizeCapabilities(d.Platform, d.Capabilities)
 	var id string
 	err := s.db.QueryRow(ctx, `
 		INSERT INTO devices (user_id, platform, device_name, client_version, capabilities, sms_role_state, push_token, public_key, last_seen_at)
@@ -68,4 +70,26 @@ func nullable(v string) any {
 		return nil
 	}
 	return v
+}
+
+func normalizeCapabilities(platform string, requested []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(requested)+1)
+	for _, capability := range requested {
+		capability = strings.TrimSpace(strings.ToUpper(capability))
+		if capability == "" {
+			continue
+		}
+		if _, exists := seen[capability]; exists {
+			continue
+		}
+		seen[capability] = struct{}{}
+		out = append(out, capability)
+	}
+	if strings.EqualFold(platform, "WEB") {
+		if _, exists := seen["MINI_APPS"]; !exists {
+			out = append(out, "MINI_APPS")
+		}
+	}
+	return out
 }

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ohmf.local/schemas/send-message-request.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["conversation_id", "idempotency_key", "content_type", "content"],
+  "properties": {
+    "conversation_id": { "type": "string", "minLength": 1 },
+    "idempotency_key": { "type": "string", "minLength": 1 },
+    "content_type": { "type": "string", "minLength": 1 },
+    "content": { "type": "object" },
+    "client_generated_id": { "type": "string", "minLength": 1 }
+  }
+}

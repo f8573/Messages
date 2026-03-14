@@ -31,10 +31,11 @@ type VerifyRequest struct {
 	ChallengeID string `json:"challenge_id"`
 	OTPCode     string `json:"otp_code"`
 	Device      struct {
-		Platform   string `json:"platform"`
-		DeviceName string `json:"device_name"`
-		PushToken  string `json:"push_token"`
-		PublicKey  string `json:"public_key"`
+		Platform     string   `json:"platform"`
+		DeviceName   string   `json:"device_name"`
+		PushToken    string   `json:"push_token"`
+		PublicKey    string   `json:"public_key"`
+		Capabilities []string `json:"capabilities"`
 	} `json:"device"`
 }
 
@@ -261,11 +262,12 @@ func (s *Service) VerifyPhone(ctx context.Context, req VerifyRequest, ip string)
 	}
 
 	var deviceID string
+	deviceCapabilities := normalizeDeviceCapabilities(req.Device.Platform, req.Device.Capabilities)
 	err = tx.QueryRow(ctx, `
-		INSERT INTO devices (user_id, platform, device_name, push_token, public_key, last_seen_at)
-		VALUES ($1, $2, $3, $4, $5, now())
+		INSERT INTO devices (user_id, platform, device_name, capabilities, push_token, public_key, last_seen_at)
+		VALUES ($1, $2, $3, $4, $5, $6, now())
 		RETURNING id::text
-	`, userID, req.Device.Platform, req.Device.DeviceName, nullable(req.Device.PushToken), nullable(req.Device.PublicKey)).Scan(&deviceID)
+	`, userID, req.Device.Platform, req.Device.DeviceName, deviceCapabilities, nullable(req.Device.PushToken), nullable(req.Device.PublicKey)).Scan(&deviceID)
 	if err != nil {
 		return nil, err
 	}
@@ -375,6 +377,28 @@ func (s *Service) decideProfilesForPlatform(platform string) []string {
 		profiles = append(profiles, "WEB_RELAY")
 	}
 	return profiles
+}
+
+func normalizeDeviceCapabilities(platform string, requested []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(requested)+1)
+	for _, capability := range requested {
+		capability = strings.TrimSpace(strings.ToUpper(capability))
+		if capability == "" {
+			continue
+		}
+		if _, exists := seen[capability]; exists {
+			continue
+		}
+		seen[capability] = struct{}{}
+		out = append(out, capability)
+	}
+	if strings.EqualFold(platform, "WEB") {
+		if _, exists := seen["MINI_APPS"]; !exists {
+			out = append(out, "MINI_APPS")
+		}
+	}
+	return out
 }
 
 func (s *Service) Logout(ctx context.Context, userID string, req LogoutRequest) error {

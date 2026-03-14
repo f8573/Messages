@@ -700,6 +700,26 @@ body {
   gap: 0.5rem;
 }
 
+.app-card-bubble {
+  display: grid;
+  gap: 0.55rem;
+  align-items: start;
+}
+
+.app-card-title {
+  font-size: 0.95rem;
+}
+
+.app-card-summary {
+  margin: 0;
+  color: var(--subtle);
+  line-height: 1.4;
+}
+
+.app-card-open-btn {
+  justify-self: start;
+}
+
 @keyframes appear {
   from {
     opacity: 0;

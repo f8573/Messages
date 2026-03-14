@@ -3,12 +3,13 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self' http://localhost:18081 http://127.0.0.1:18081; object-src 'none'; base-uri 'none'; form-action 'self'" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self' http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:*; object-src 'none'; base-uri 'none'; form-action 'self'" />
     <meta name="referrer" content="no-referrer" />
     <meta http-equiv="Permissions-Policy" content="camera=(), microphone=(), geolocation=()" />
     <title>OHMF Messages</title>
-    <link rel="stylesheet" href="./styles.css" />
-    <script src="./frontend-config.js?v=20260313b"></script>
+    <link rel="icon" href="data:," />
+    <script src="./runtime-config.js"></script>
+    <script src="./asset-loader.js" data-css="./styles.css" data-js="./frontend-config.js"></script>
   </head>
   <body>
     <div class="bg-layer"></div>
@@ -140,6 +141,7 @@
                 </div>
 
                 <div class="miniapp-config-actions">
+                  <button type="button" class="send-btn compact" id="miniapp-share-btn">Send App</button>
                   <button type="button" class="send-btn compact" id="miniapp-open-btn">Open App</button>
                   <button type="button" class="secondary-btn compact" id="miniapp-reset-btn">Reset Session</button>
                 </div>
@@ -162,6 +164,6 @@
       </main>
     </div>
 
-    <script src="./app.js?v=20260313b"></script>
+    <script src="./asset-loader.js" data-js="./app.js"></script>
   </body>
 </html>
