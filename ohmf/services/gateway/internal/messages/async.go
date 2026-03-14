@@ -60,11 +60,7 @@ func (p *AsyncPipeline) PublishIngress(ctx context.Context, evt IngressEvent) er
 	if p == nil || p.producer == nil {
 		return nil
 	}
-	env, err := BuildEnvelopeFromIngressEvent(evt)
-	if err != nil {
-		return err
-	}
-	return p.producer.PublishIngress(ctx, evt.ConversationID, env)
+	return p.producer.PublishIngress(ctx, evt.ConversationID, evt)
 }
 
 // PublishEnvelope publishes an already-built Envelope to the ingress topic.

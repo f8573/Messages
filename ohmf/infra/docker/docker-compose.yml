@@ -1,3 +1,5 @@
+name: ohmf
+
 services:
   db:
     image: postgres:16-alpine
@@ -113,6 +115,7 @@ services:
       - "13000:3000"
 
   api:
+    image: ohmf-api:dev
     build:
       context: ../../services/gateway
       dockerfile: Dockerfile
@@ -130,7 +133,7 @@ services:
         condition: service_completed_successfully
     environment:
       APP_ENV: dev
-      APP_ADDR: :${API_CONTAINER_PORT:-8081}
+      APP_ADDR: :${API_CONTAINER_PORT:-8080}
       APP_LOG_LEVEL: info
       APP_DB_DSN: postgres://${POSTGRES_USER:-ohmf}:${POSTGRES_PASSWORD:-ohmf}@db:5432/${POSTGRES_DB:-ohmf}?sslmode=disable
       APP_REDIS_ADDR: redis:6379
@@ -154,7 +157,7 @@ services:
       APP_CASSANDRA_KEYSPACE: ohmf_messages
       APP_CASSANDRA_CONSISTENCY: quorum
     ports:
-      - "${API_HOST_PORT:-18081}:${API_CONTAINER_PORT:-8081}"
+      - "${API_HOST_PORT:-18080}:${API_CONTAINER_PORT:-8080}"
 
   messages-processor:
     build:
@@ -192,6 +195,8 @@ services:
       dockerfile: Dockerfile
     container_name: ohmf-delivery-processor
     depends_on:
+      db:
+        condition: service_healthy
       redis:
         condition: service_healthy
       kafka:
@@ -199,6 +204,7 @@ services:
       kafka-init:
         condition: service_completed_successfully
     environment:
+      APP_DB_DSN: postgres://${POSTGRES_USER:-ohmf}:${POSTGRES_PASSWORD:-ohmf}@db:5432/${POSTGRES_DB:-ohmf}?sslmode=disable
       APP_REDIS_ADDR: redis:6379
       APP_KAFKA_BROKERS: kafka:9092
       APP_KAFKA_GROUP_ID: delivery-processor-v1

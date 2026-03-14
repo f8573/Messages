@@ -7,6 +7,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -185,8 +186,9 @@ func main() {
 		Async:             asyncPipeline,
 		Cassandra:         cassandraStore,
 		RateLimiter:       rateLimiter,
+		Redis:             rdb,
 	})
-	eventsHandler := events.NewHandler(pool)
+	eventsHandler := events.NewHandler(pool, rdb, msgSvc)
 	wsHandler := realtime.NewHandler(tokens, msgSvc, rdb, rateLimiter, cfg.EnableWSSend)
 
 	authHandler := auth.NewHandler(authSvc)
@@ -224,7 +226,17 @@ func main() {
 	r.Use(chimiddleware.RequestID)
 	r.Use(chimiddleware.RealIP)
 	r.Use(chimiddleware.Recoverer)
-	r.Use(chimiddleware.Timeout(30 * time.Second))
+	r.Use(func(next http.Handler) http.Handler {
+		timeout := chimiddleware.Timeout(30 * time.Second)
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			switch req.URL.Path {
+			case "/v1/ws", "/v1/events/stream":
+				next.ServeHTTP(w, req)
+				return
+			}
+			timeout(next).ServeHTTP(w, req)
+		})
+	})
 	r.Use(observability.HTTPMetricsMiddleware)
 
 	// API versioning middleware: advertise spec & API versions
@@ -232,9 +244,14 @@ func main() {
 
 	// CORS middleware: allow local web dev server to call this API.
 	r.Use(cors.Handler(cors.Options{
-		AllowedOrigins: []string{
-			"http://localhost:5174",
-			"http://127.0.0.1:5174",
+		AllowOriginFunc: func(_ *http.Request, origin string) bool {
+			if origin == "" {
+				return false
+			}
+			if cfg.AllowedOrigin != "*" && origin == cfg.AllowedOrigin {
+				return true
+			}
+			return strings.HasPrefix(origin, "http://localhost:") || strings.HasPrefix(origin, "http://127.0.0.1:")
 		},
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
@@ -247,7 +264,7 @@ func main() {
 	// must be delivered as a header (not a meta tag) to be enforced.
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-			w.Header().Set("Content-Security-Policy", "default-src 'self'; frame-ancestors 'self' http://localhost:5174")
+			w.Header().Set("Content-Security-Policy", "default-src 'self'; frame-ancestors 'self' http://localhost:* http://127.0.0.1:*")
 			next.ServeHTTP(w, req)
 		})
 	})
@@ -306,12 +323,19 @@ func main() {
 			protected.Post("/miniapps/sessions", miniappHandler.CreateSession)
 			protected.Get("/miniapps/sessions/{id}", miniappHandler.GetSession)
 			protected.Delete("/miniapps/sessions/{id}", miniappHandler.EndSession)
+			protected.Post("/miniapps/sessions/{id}/join", miniappHandler.JoinSession)
+			protected.Post("/miniapps/sessions/{id}/events", miniappHandler.AppendEvent)
+			protected.Post("/miniapps/sessions/{id}/snapshot", miniappHandler.Snapshot)
+			protected.Post("/miniapps/shares", miniappHandler.Share)
 			// Spec aliases: /apps/... map to miniapp handlers
 			protected.Post("/apps/sessions", miniappHandler.CreateSession)
 			protected.Get("/apps/sessions/{id}", miniappHandler.GetSession)
+			protected.Delete("/apps/sessions/{id}", miniappHandler.EndSession)
+			protected.Post("/apps/sessions/{id}/join", miniappHandler.JoinSession)
 			protected.Post("/apps/register", miniappHandler.RegisterManifest)
 			protected.Post("/apps/sessions/{id}/events", miniappHandler.AppendEvent)
 			protected.Post("/apps/sessions/{id}/snapshot", miniappHandler.Snapshot)
+			protected.Post("/apps/shares", miniappHandler.Share)
 			protected.Get("/apps", miniappHandler.ListApps)
 			protected.Get("/apps/{appID}", miniappHandler.GetApp)
 
@@ -333,8 +357,8 @@ func main() {
 			protected.Get("/conversations/{id}", convHandler.Get)
 			protected.Patch("/conversations/{id}", convHandler.UpdatePolicy)
 			protected.Post("/conversations/{id}/thread_keys", convHandler.SetThreadKeys)
-			protected.With(appmw.ValidateJSONMiddleware("message-ingress")).Post("/messages", msgHandler.Send)
-			protected.With(appmw.ValidateJSONMiddleware("message-ingress")).Post("/messages/phone", msgHandler.SendToPhone)
+			protected.With(appmw.ValidateJSONMiddleware("send-message-request")).Post("/messages", msgHandler.Send)
+			protected.With(appmw.ValidateJSONMiddleware("send-phone-message-request")).Post("/messages/phone", msgHandler.SendToPhone)
 			protected.Post("/messages/{id}/reactions", msgHandler.AddReaction)
 			protected.Delete("/messages/{id}/reactions", msgHandler.RemoveReaction)
 			protected.Post("/messages/{id}/deliveries", msgHandler.RecordDelivery)

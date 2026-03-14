@@ -94,9 +94,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	h.register(c)
 	h.markPresence(ctx, userID)
+	if updates, err := h.messages.DeliverPendingToUser(ctx, userID); err == nil {
+		for _, update := range updates {
+			body, _ := json.Marshal(update)
+			senderUserID, _ := update["sender_user_id"].(string)
+			if senderUserID != "" {
+				_ = h.redis.Publish(ctx, "delivery:user:"+senderUserID, body).Err()
+			}
+		}
+	}
 
 	go h.writeLoop(c)
 	go h.subscribeDelivery(ctx, c)
+	go h.subscribeMessages(ctx, c)
 	h.readLoop(c, ip)
 }
 
@@ -408,6 +418,18 @@ func (h *Handler) subscribeDelivery(ctx context.Context, c *client) {
 	ch := pubsub.Channel()
 	for msg := range ch {
 		h.sendJSON(c, "delivery_update", json.RawMessage(msg.Payload))
+	}
+}
+
+func (h *Handler) subscribeMessages(ctx context.Context, c *client) {
+	if h.redis == nil {
+		return
+	}
+	pubsub := h.redis.Subscribe(ctx, "message:user:"+c.userID)
+	defer pubsub.Close()
+	ch := pubsub.Channel()
+	for msg := range ch {
+		h.sendJSON(c, "message_created", json.RawMessage(msg.Payload))
 	}
 }
 

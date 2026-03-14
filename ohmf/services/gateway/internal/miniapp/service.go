@@ -66,18 +66,19 @@ type sessionState struct {
 }
 
 type sessionRecord struct {
-	ID                 string
-	ManifestID         string
-	AppID              string
-	ConversationID     string
-	Participants       []SessionParticipant
-	GrantedPermissions []string
-	State              sessionState
-	StateVersion       int
-	CreatedBy          string
-	ExpiresAt          *time.Time
-	CreatedAt          *time.Time
-	EndedAt            *time.Time
+	ID                     string
+	ManifestID             string
+	AppID                  string
+	ConversationID         string
+	Participants           []SessionParticipant
+	GlobalPermissions      []string
+	ParticipantPermissions map[string][]string
+	State                  sessionState
+	StateVersion           int
+	CreatedBy              string
+	ExpiresAt              *time.Time
+	CreatedAt              *time.Time
+	EndedAt                *time.Time
 }
 
 type manifestSignature struct {
@@ -334,19 +335,25 @@ func (s *Service) CreateSession(ctx context.Context, input CreateSessionInput) (
 	id := uuid.New().String()
 	partsB, _ := json.Marshal(participants)
 	permsB, _ := json.Marshal(grantedPermissions)
+	participantPermissions := map[string][]string{}
+	if viewer.UserID != "" {
+		participantPermissions[viewer.UserID] = append([]string(nil), grantedPermissions...)
+	}
+	participantPermsB, _ := json.Marshal(participantPermissions)
 	stateB, _ := json.Marshal(defaultSessionState(input.StateSnapshot))
 	expires := time.Now().Add(input.TTL)
 	createdBy := nullUUIDArg(viewer.UserID)
 	_, err = s.db.Exec(
 		ctx,
-		`INSERT INTO miniapp_sessions (id, manifest_id, app_id, conversation_id, participants, granted_permissions, state, state_version, created_by, expires_at, created_at)
-		 VALUES ($1::uuid, $2::uuid, $3, $4::uuid, $5::jsonb, $6::jsonb, $7::jsonb, 1, $8::uuid, $9, now())`,
+		`INSERT INTO miniapp_sessions (id, manifest_id, app_id, conversation_id, participants, granted_permissions, participant_permissions, state, state_version, created_by, expires_at, created_at)
+		 VALUES ($1::uuid, $2::uuid, $3, $4::uuid, $5::jsonb, $6::jsonb, $7::jsonb, $8::jsonb, 1, $9::uuid, $10, now())`,
 		id,
 		manifestID,
 		appID,
 		input.ConversationID,
 		string(partsB),
 		string(permsB),
+		string(participantPermsB),
 		string(stateB),
 		createdBy,
 		expires,
@@ -374,8 +381,12 @@ func (s *Service) EndSession(ctx context.Context, sessionID string) error {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
-		if _, err := s.loadSessionRecord(ctx, sessionID); err != nil {
+		record, err := s.loadSessionRecord(ctx, sessionID)
+		if err != nil {
 			return err
+		}
+		if record.EndedAt != nil {
+			return ErrSessionEnded
 		}
 		return ErrSessionEnded
 	}
@@ -387,8 +398,12 @@ func (s *Service) AppendEvent(ctx context.Context, sessionID, actorID, eventName
 	if eventName == "" {
 		return 0, fmt.Errorf("event_name required")
 	}
-	if _, err := s.loadSessionRecord(ctx, sessionID); err != nil {
+	record, err := s.loadSessionRecord(ctx, sessionID)
+	if err != nil {
 		return 0, err
+	}
+	if record.EndedAt != nil {
+		return 0, ErrSessionEnded
 	}
 	b, err := json.Marshal(body)
 	if err != nil {
@@ -413,7 +428,7 @@ func (s *Service) AppendEvent(ctx context.Context, sessionID, actorID, eventName
 }
 
 // SnapshotSession replaces persisted state and advances the session state version.
-func (s *Service) SnapshotSession(ctx context.Context, sessionID string, state any, version int, grantedPermissions []string) (int, error) {
+func (s *Service) SnapshotSession(ctx context.Context, sessionID string, state any, version int, _ []string) (int, error) {
 	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return 0, err
@@ -442,32 +457,14 @@ func (s *Service) SnapshotSession(ctx context.Context, sessionID string, state a
 		return 0, ErrStateVersionConflict
 	}
 
-	permitted, err := s.manifestPermissionsForAppID(ctx, appID)
-	if err != nil {
-		return 0, err
-	}
-	normalizedPermissions := sanitizeGrantedPermissions(grantedPermissions, permitted)
-	var permsPayload any = nil
-	if grantedPermissions != nil {
-		payload, _ := json.Marshal(normalizedPermissions)
-		permsPayload = string(payload)
-	}
-
 	stateEnvelope := stateEnvelopeFromAny(state)
 	stateB, err := json.Marshal(stateEnvelope)
 	if err != nil {
 		return 0, err
 	}
 
-	query := `UPDATE miniapp_sessions SET state = $1::jsonb, state_version = $2, expires_at = now() + interval '1 hour'`
-	args := []any{string(stateB), nextVersion}
-	if permsPayload != nil {
-		query += `, granted_permissions = $3::jsonb WHERE id = $4::uuid`
-		args = append(args, permsPayload, sessionID)
-	} else {
-		query += ` WHERE id = $3::uuid`
-		args = append(args, sessionID)
-	}
+	query := `UPDATE miniapp_sessions SET state = $1::jsonb, state_version = $2, expires_at = now() + interval '1 hour' WHERE id = $3::uuid`
+	args := []any{string(stateB), nextVersion, sessionID}
 	if _, err := tx.Exec(ctx, query, args...); err != nil {
 		return 0, err
 	}
@@ -628,18 +625,15 @@ func (s *Service) findActiveSession(ctx context.Context, appID, conversationID s
 	return &record, nil
 }
 
-func (s *Service) refreshSession(ctx context.Context, sessionID string, participants []SessionParticipant, grantedPermissions []string, ttl time.Duration) error {
+func (s *Service) refreshSession(ctx context.Context, sessionID string, participants []SessionParticipant, _ []string, ttl time.Duration) error {
 	partsB, _ := json.Marshal(participants)
-	permsB, _ := json.Marshal(grantedPermissions)
 	_, err := s.db.Exec(
 		ctx,
 		`UPDATE miniapp_sessions
 		    SET participants = $1::jsonb,
-		        granted_permissions = $2::jsonb,
-		        expires_at = $3
-		  WHERE id = $4::uuid`,
+		        expires_at = $2
+		  WHERE id = $3::uuid`,
 		string(partsB),
-		string(permsB),
 		time.Now().Add(ttl),
 		sessionID,
 	)
@@ -648,11 +642,11 @@ func (s *Service) refreshSession(ctx context.Context, sessionID string, particip
 
 func (s *Service) loadSessionRecord(ctx context.Context, sessionID string) (sessionRecord, error) {
 	var record sessionRecord
-	var participantsB, permissionsB, stateB []byte
+	var participantsB, permissionsB, participantPermissionsB, stateB []byte
 	var createdBy *string
 	err := s.db.QueryRow(
 		ctx,
-		`SELECT id::text, manifest_id::text, app_id, conversation_id::text, participants, granted_permissions, state, state_version, created_by::text, expires_at, created_at, ended_at
+		`SELECT id::text, manifest_id::text, app_id, conversation_id::text, participants, granted_permissions, participant_permissions, state, state_version, created_by::text, expires_at, created_at, ended_at
 		   FROM miniapp_sessions
 		  WHERE id = $1::uuid`,
 		sessionID,
@@ -663,6 +657,7 @@ func (s *Service) loadSessionRecord(ctx context.Context, sessionID string) (sess
 		&record.ConversationID,
 		&participantsB,
 		&permissionsB,
+		&participantPermissionsB,
 		&stateB,
 		&record.StateVersion,
 		&createdBy,
@@ -680,22 +675,22 @@ func (s *Service) loadSessionRecord(ctx context.Context, sessionID string) (sess
 		record.CreatedBy = *createdBy
 	}
 	record.Participants = decodeParticipants(participantsB)
-	record.GrantedPermissions = decodeStringList(permissionsB)
+	record.GlobalPermissions = decodeStringList(permissionsB)
+	record.ParticipantPermissions = decodeParticipantPermissions(participantPermissionsB)
 	record.State = decodeSessionState(stateB)
-	if record.EndedAt != nil {
-		return sessionRecord{}, ErrSessionEnded
-	}
 	return record, nil
 }
 
 func (s *Service) sessionRecordToMap(record sessionRecord) map[string]any {
+	viewer := pickViewer(record.Participants, record.CreatedBy)
 	return map[string]any{
 		"app_session_id":       record.ID,
 		"manifest_id":          record.ManifestID,
 		"app_id":               record.AppID,
 		"conversation_id":      record.ConversationID,
 		"participants":         record.Participants,
-		"capabilities_granted": record.GrantedPermissions,
+		"capabilities_granted": record.viewerGrantedPermissions(viewer.UserID),
+		"participant_permissions": record.ParticipantPermissions,
 		"state":                record.State,
 		"state_version":        record.StateVersion,
 		"expires_at":           record.ExpiresAt,
@@ -713,9 +708,10 @@ func buildLaunchContext(record sessionRecord) map[string]any {
 		"conversation_id":      record.ConversationID,
 		"viewer":               viewer,
 		"participants":         record.Participants,
-		"capabilities_granted": record.GrantedPermissions,
+		"capabilities_granted": record.viewerGrantedPermissions(viewer.UserID),
 		"state_snapshot":       record.State.Snapshot,
 		"state_version":        record.StateVersion,
+		"joinable":             record.EndedAt == nil,
 	}
 }
 

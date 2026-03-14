@@ -323,6 +323,12 @@ func (p *processor) processMessage(ctx context.Context, msg kafka.Message) error
 			return err
 		}
 	}
+	for _, recipientID := range recipients {
+		if strings.TrimSpace(recipientID) == "" {
+			continue
+		}
+		_ = p.redis.Publish(ctx, "message:user:"+recipientID, payload).Err()
+	}
 	return nil
 }
 

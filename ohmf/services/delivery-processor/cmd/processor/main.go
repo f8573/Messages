@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"github.com/segmentio/kafka-go"
 )
@@ -31,6 +32,14 @@ func main() {
 	persistedTopic := getenv("APP_KAFKA_PERSISTED_TOPIC", "msg.persisted.v1")
 	deliveryTopic := getenv("APP_KAFKA_DELIVERY_TOPIC", "msg.delivery.v1")
 	dlqTopic := getenv("APP_KAFKA_DELIVERY_DLQ_TOPIC", "msg.delivery.dlq.v1")
+	pg, err := pgxpool.New(ctx, getenv("APP_DB_DSN", "postgres://ohmf:ohmf@localhost:5432/ohmf?sslmode=disable"))
+	if err != nil {
+		log.Fatalf("postgres init failed: %v", err)
+	}
+	defer pg.Close()
+	if err := pg.Ping(ctx); err != nil {
+		log.Fatalf("postgres ping failed: %v", err)
+	}
 
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:     brokers,
@@ -60,7 +69,7 @@ func main() {
 			time.Sleep(300 * time.Millisecond)
 			continue
 		}
-		if err := process(ctx, rdb, deliveryWriter, msg); err != nil {
+		if err := process(ctx, pg, rdb, deliveryWriter, msg); err != nil {
 			log.Printf("process failed: %v", err)
 			_ = publishDLQ(ctx, dlqWriter, msg, err)
 		}
@@ -70,7 +79,7 @@ func main() {
 	}
 }
 
-func process(ctx context.Context, rdb *redis.Client, deliveryWriter *kafka.Writer, msg kafka.Message) error {
+func process(ctx context.Context, pg *pgxpool.Pool, rdb *redis.Client, deliveryWriter *kafka.Writer, msg kafka.Message) error {
 	var evt persistedEvent
 	if err := json.Unmarshal(msg.Value, &evt); err != nil {
 		return err
@@ -84,9 +93,13 @@ func process(ctx context.Context, rdb *redis.Client, deliveryWriter *kafka.Write
 		if strings.TrimSpace(recipientID) == "" {
 			continue
 		}
+		if ok, err := rdb.Exists(ctx, "presence:user:"+recipientID).Result(); err != nil || ok == 0 {
+			continue
+		}
 		delivery := map[string]any{
 			"event_id":          evt.EventID,
 			"recipient_user_id": recipientID,
+			"sender_user_id":    evt.SenderUserID,
 			"message_id":        evt.MessageID,
 			"conversation_id":   evt.ConversationID,
 			"server_order":      evt.ServerOrder,
@@ -95,6 +108,18 @@ func process(ctx context.Context, rdb *redis.Client, deliveryWriter *kafka.Write
 			"trace_id":          evt.TraceID,
 		}
 		body, _ := json.Marshal(delivery)
+		if _, err := pg.Exec(ctx, `
+			INSERT INTO message_deliveries (
+				message_id,
+				recipient_user_id,
+				transport,
+				state,
+				submitted_at,
+				updated_at
+			) VALUES ($1::uuid, $2::uuid, $3, $4, now(), now())
+		`, evt.MessageID, recipientID, evt.Transport, "DELIVERED"); err != nil {
+			return err
+		}
 		if err := deliveryWriter.WriteMessages(ctx, kafka.Message{
 			Key:   []byte(recipientID),
 			Value: body,
@@ -103,6 +128,9 @@ func process(ctx context.Context, rdb *redis.Client, deliveryWriter *kafka.Write
 			return err
 		}
 		_ = rdb.Publish(ctx, "delivery:user:"+recipientID, body).Err()
+		if strings.TrimSpace(evt.SenderUserID) != "" && evt.SenderUserID != recipientID {
+			_ = rdb.Publish(ctx, "delivery:user:"+evt.SenderUserID, body).Err()
+		}
 	}
 	return nil
 }

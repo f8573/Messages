@@ -15,6 +15,12 @@ import (
 //go:embed schemas/message-ingress.schema.json
 var messageIngressSchemaBytes []byte
 
+//go:embed schemas/send-message-request.schema.json
+var sendMessageRequestSchemaBytes []byte
+
+//go:embed schemas/send-phone-message-request.schema.json
+var sendPhoneMessageRequestSchemaBytes []byte
+
 //go:embed schemas/ws-subscribe.schema.json
 var wsSubscribeSchemaBytes []byte
 
@@ -29,6 +35,16 @@ func init() {
 	if err := compiler.AddResource("message-ingress.json", bytes.NewReader(messageIngressSchemaBytes)); err == nil {
 		if s, err := compiler.Compile("message-ingress.json"); err == nil {
 			compiledSchemas["message-ingress"] = s
+		}
+	}
+	if err := compiler.AddResource("send-message-request.json", bytes.NewReader(sendMessageRequestSchemaBytes)); err == nil {
+		if s, err := compiler.Compile("send-message-request.json"); err == nil {
+			compiledSchemas["send-message-request"] = s
+		}
+	}
+	if err := compiler.AddResource("send-phone-message-request.json", bytes.NewReader(sendPhoneMessageRequestSchemaBytes)); err == nil {
+		if s, err := compiler.Compile("send-phone-message-request.json"); err == nil {
+			compiledSchemas["send-phone-message-request"] = s
 		}
 	}
 	if err := compiler.AddResource("ws-subscribe.json", bytes.NewReader(wsSubscribeSchemaBytes)); err == nil {
