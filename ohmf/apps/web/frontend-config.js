@@ -1,10 +1,11 @@
 (() => {
-  const DEFAULT_FRONTEND_PORT = "5174";
-  const DEFAULT_API_HOST_PORT = "18081";
+  const runtimeConfig = window.OHMF_RUNTIME_CONFIG || {};
+  const DEFAULT_FRONTEND_PORT = String(runtimeConfig.frontend_port || "5173");
+  const DEFAULT_API_HOST_PORT = String(runtimeConfig.api_host_port || "18080");
 
   const storedFrontendPort = window.localStorage.getItem("ohmf.frontend_port") || DEFAULT_FRONTEND_PORT;
   const storedAPIHostPort = window.localStorage.getItem("ohmf.api_host_port") || DEFAULT_API_HOST_PORT;
-  const storedAPIBaseURL = window.localStorage.getItem("ohmf.apiBaseUrl");
+  const storedAPIBaseURL = window.localStorage.getItem("ohmf.apiBaseUrl") || runtimeConfig.api_base_url || `http://localhost:${DEFAULT_API_HOST_PORT}`;
 
   function normalizeAPIBaseURL(value) {
     const fallback = `http://localhost:${storedAPIHostPort || DEFAULT_API_HOST_PORT}`;

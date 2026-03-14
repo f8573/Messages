@@ -20,6 +20,15 @@ type Handler struct {
 	svc *Service
 }
 
+func isReservedContentType(contentType string) bool {
+	switch contentType {
+	case "app_card":
+		return true
+	default:
+		return false
+	}
+}
+
 func NewHandler(svc *Service) *Handler {
 	return &Handler{svc: svc}
 }
@@ -53,6 +62,10 @@ func (h *Handler) Send(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.ContentType == "" {
 		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "content_type required", nil)
+		return
+	}
+	if isReservedContentType(req.ContentType) {
+		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "content_type is server-authored only", nil)
 		return
 	}
 	if req.Content == nil {
@@ -143,6 +156,10 @@ func (h *Handler) SendToPhone(w http.ResponseWriter, r *http.Request) {
 	// Validate required fields per OpenAPI: content_type, content
 	if req.ContentType == "" {
 		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "content_type required", nil)
+		return
+	}
+	if isReservedContentType(req.ContentType) {
+		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "content_type is server-authored only", nil)
 		return
 	}
 	if req.Content == nil {

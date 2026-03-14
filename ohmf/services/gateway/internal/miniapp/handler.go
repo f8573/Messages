@@ -90,7 +90,7 @@ func (h *Handler) CreateSession(w http.ResponseWriter, r *http.Request) {
 		resumeExisting = *req.ResumeExisting
 	}
 
-	session, created, err := h.svc.CreateSession(r.Context(), CreateSessionInput{
+	session, created, err := h.svc.CreateSessionForUser(r.Context(), userID, CreateSessionInput{
 		ManifestID:         req.ManifestID,
 		AppID:              req.AppID,
 		ConversationID:     req.ConversationID,
@@ -119,7 +119,7 @@ func (h *Handler) CreateSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) GetSession(w http.ResponseWriter, r *http.Request) {
-	_, ok := middleware.UserIDFromContext(r.Context())
+	userID, ok := middleware.UserIDFromContext(r.Context())
 	if !ok {
 		httpx.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing auth", nil)
 		return
@@ -129,7 +129,7 @@ func (h *Handler) GetSession(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "session id required", nil)
 		return
 	}
-	s, err := h.svc.GetSession(r.Context(), id)
+	s, err := h.svc.GetSessionForUser(r.Context(), userID, id)
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrSessionNotFound):
@@ -145,7 +145,7 @@ func (h *Handler) GetSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) EndSession(w http.ResponseWriter, r *http.Request) {
-	_, ok := middleware.UserIDFromContext(r.Context())
+	userID, ok := middleware.UserIDFromContext(r.Context())
 	if !ok {
 		httpx.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing auth", nil)
 		return
@@ -155,7 +155,7 @@ func (h *Handler) EndSession(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "session id required", nil)
 		return
 	}
-	if err := h.svc.EndSession(r.Context(), id); err != nil {
+	if err := h.svc.EndSessionForUser(r.Context(), userID, id); err != nil {
 		switch {
 		case errors.Is(err, ErrSessionNotFound):
 			httpx.WriteError(w, r, http.StatusNotFound, "not_found", err.Error(), nil)
@@ -192,13 +192,15 @@ func (h *Handler) AppendEvent(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "event_name required", nil)
 		return
 	}
-	seq, err := h.svc.AppendEvent(r.Context(), id, userID, req.EventName, req.Body)
+	seq, err := h.svc.AppendEventForUser(r.Context(), userID, id, req.EventName, req.Body)
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrSessionNotFound):
 			httpx.WriteError(w, r, http.StatusNotFound, "not_found", err.Error(), nil)
 		case errors.Is(err, ErrSessionEnded):
 			httpx.WriteError(w, r, http.StatusConflict, "session_ended", err.Error(), nil)
+		case errors.Is(err, ErrMiniAppConsent):
+			httpx.WriteError(w, r, http.StatusForbidden, "consent_required", err.Error(), nil)
 		default:
 			httpx.WriteError(w, r, http.StatusInternalServerError, "append_failed", err.Error(), nil)
 		}
@@ -208,7 +210,7 @@ func (h *Handler) AppendEvent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) Snapshot(w http.ResponseWriter, r *http.Request) {
-	_, ok := middleware.UserIDFromContext(r.Context())
+	userID, ok := middleware.UserIDFromContext(r.Context())
 	if !ok {
 		httpx.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing auth", nil)
 		return
@@ -227,7 +229,7 @@ func (h *Handler) Snapshot(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "invalid body", nil)
 		return
 	}
-	version, err := h.svc.SnapshotSession(r.Context(), id, req.State, req.StateVersion, req.GrantedPermissions)
+	version, err := h.svc.SnapshotSessionForUser(r.Context(), userID, id, req.State, req.StateVersion)
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrSessionNotFound):
@@ -236,12 +238,99 @@ func (h *Handler) Snapshot(w http.ResponseWriter, r *http.Request) {
 			httpx.WriteError(w, r, http.StatusConflict, "session_ended", err.Error(), nil)
 		case errors.Is(err, ErrStateVersionConflict):
 			httpx.WriteError(w, r, http.StatusConflict, "state_version_conflict", err.Error(), nil)
+		case errors.Is(err, ErrMiniAppConsent):
+			httpx.WriteError(w, r, http.StatusForbidden, "consent_required", err.Error(), nil)
 		default:
 			httpx.WriteError(w, r, http.StatusInternalServerError, "snapshot_failed", err.Error(), nil)
 		}
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"state_version": version})
+}
+
+func (h *Handler) JoinSession(w http.ResponseWriter, r *http.Request) {
+	userID, ok := middleware.UserIDFromContext(r.Context())
+	if !ok {
+		httpx.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing auth", nil)
+		return
+	}
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "session id required", nil)
+		return
+	}
+	var req struct {
+		GrantedPermissions []string `json:"capabilities_granted"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "invalid body", nil)
+		return
+	}
+	session, err := h.svc.JoinSession(r.Context(), userID, id, req.GrantedPermissions)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrSessionNotFound):
+			httpx.WriteError(w, r, http.StatusNotFound, "not_found", err.Error(), nil)
+		case errors.Is(err, ErrSessionEnded):
+			httpx.WriteError(w, r, http.StatusConflict, "session_ended", err.Error(), nil)
+		case err.Error() == "conversation_access_denied":
+			httpx.WriteError(w, r, http.StatusForbidden, "forbidden", err.Error(), nil)
+		default:
+			httpx.WriteError(w, r, http.StatusForbidden, "forbidden", err.Error(), nil)
+		}
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, session)
+}
+
+func (h *Handler) Share(w http.ResponseWriter, r *http.Request) {
+	userID, ok := middleware.UserIDFromContext(r.Context())
+	if !ok {
+		httpx.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing auth", nil)
+		return
+	}
+	var req struct {
+		ManifestID         string   `json:"manifest_id"`
+		AppID              string   `json:"app_id"`
+		ConversationID     string   `json:"conversation_id"`
+		GrantedPermissions []string `json:"capabilities_granted"`
+		StateSnapshot      any      `json:"state_snapshot"`
+		ResumeExisting     *bool    `json:"resume_existing"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "invalid body", nil)
+		return
+	}
+	if req.ConversationID == "" || (req.ManifestID == "" && req.AppID == "") {
+		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "conversation_id and app_id or manifest_id are required", nil)
+		return
+	}
+	resumeExisting := true
+	if req.ResumeExisting != nil {
+		resumeExisting = *req.ResumeExisting
+	}
+	result, err := h.svc.ShareSession(r.Context(), userID, ShareInput{
+		ManifestID:         req.ManifestID,
+		AppID:              req.AppID,
+		ConversationID:     req.ConversationID,
+		GrantedPermissions: req.GrantedPermissions,
+		StateSnapshot:      req.StateSnapshot,
+		ResumeExisting:     resumeExisting,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrManifestNotFound):
+			httpx.WriteError(w, r, http.StatusNotFound, "manifest_not_found", err.Error(), nil)
+		case errors.Is(err, ErrMiniAppUnsupported):
+			httpx.WriteError(w, r, http.StatusConflict, "miniapp_unsupported", "conversation is not eligible for app sharing", nil)
+		case err.Error() == "conversation_access_denied":
+			httpx.WriteError(w, r, http.StatusForbidden, "forbidden", err.Error(), nil)
+		default:
+			httpx.WriteError(w, r, http.StatusInternalServerError, "share_failed", err.Error(), nil)
+		}
+		return
+	}
+	httpx.WriteJSON(w, http.StatusCreated, result)
 }
 
 func (h *Handler) ListApps(w http.ResponseWriter, r *http.Request) {

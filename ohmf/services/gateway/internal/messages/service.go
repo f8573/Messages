@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 	"ohmf/services/gateway/internal/limit"
 	"ohmf/services/gateway/internal/middleware"
 )
@@ -27,6 +28,10 @@ type Message struct {
 	ServerOrder       int64          `json:"server_order"`
 	Status            string         `json:"status,omitempty"`
 	CreatedAt         string         `json:"created_at"`
+	SentAt            string         `json:"sent_at,omitempty"`
+	DeliveredAt       string         `json:"delivered_at,omitempty"`
+	ReadAt            string         `json:"read_at,omitempty"`
+	StatusUpdatedAt   string         `json:"status_updated_at,omitempty"`
 	Source            string         `json:"source,omitempty"`
 }
 
@@ -43,6 +48,7 @@ type Options struct {
 	Async             *AsyncPipeline
 	Cassandra         *CassandraStore
 	RateLimiter       *limit.TokenBucket
+	Redis             *redis.Client
 }
 
 type Service struct {
@@ -53,6 +59,7 @@ type Service struct {
 	async             *AsyncPipeline
 	cassandra         *CassandraStore
 	rateLimiter       *limit.TokenBucket
+	redis             *redis.Client
 }
 
 type DeliveryRecord struct {
@@ -345,7 +352,20 @@ func NewService(db *pgxpool.Pool, opts Options) *Service {
 		async:             opts.Async,
 		cassandra:         opts.Cassandra,
 		rateLimiter:       opts.RateLimiter,
+		redis:             opts.Redis,
 	}
+}
+
+type receiptEvent struct {
+	SenderUserID      string `json:"sender_user_id"`
+	RecipientUserID   string `json:"recipient_user_id,omitempty"`
+	ReaderUserID      string `json:"reader_user_id,omitempty"`
+	MessageID         string `json:"message_id,omitempty"`
+	ConversationID    string `json:"conversation_id"`
+	ServerOrder       int64  `json:"server_order,omitempty"`
+	ThroughServerOrder int64 `json:"through_server_order,omitempty"`
+	Status            string `json:"status"`
+	StatusUpdatedAt   string `json:"status_updated_at"`
 }
 
 func (s *Service) Send(ctx context.Context, userID, conversationID, idemKey, contentType string, content map[string]any, clientGeneratedID string, traceID string, ip string) (SendResult, error) {
@@ -474,28 +494,30 @@ func (s *Service) List(ctx context.Context, actor, conversationID string) ([]Mes
 			m.transport,
 			m.server_order,
 			CASE
-				WHEN m.sender_user_id = $2::uuid AND m.transport = 'OTT' THEN
-					CASE
-						WHEN EXISTS (
-							SELECT 1
-							FROM conversation_members other
-							WHERE other.conversation_id = m.conversation_id
-							  AND other.user_id <> $2::uuid
-						)
-						AND NOT EXISTS (
-							SELECT 1
-							FROM conversation_members other
-							WHERE other.conversation_id = m.conversation_id
-							  AND other.user_id <> $2::uuid
-							  AND other.last_read_server_order < m.server_order
-						) THEN 'READ'
-						ELSE 'SENT'
-					END
-				WHEN m.sender_user_id = $2::uuid AND m.transport = 'SMS' THEN 'SENT'
+				WHEN m.sender_user_id = $2::uuid AND m.transport IN ('OTT', 'OHMF') AND read_meta.read_at IS NOT NULL THEN 'READ'
+				WHEN m.sender_user_id = $2::uuid AND m.transport IN ('OTT', 'OHMF') AND delivered_meta.delivered_at IS NOT NULL THEN 'DELIVERED'
+				WHEN m.sender_user_id = $2::uuid THEN 'SENT'
 				ELSE ''
 			END AS delivery_status,
-			m.created_at
+			m.created_at,
+			delivered_meta.delivered_at,
+			read_meta.read_at
 		FROM messages m
+		LEFT JOIN LATERAL (
+			SELECT MAX(md.updated_at) AS delivered_at
+			FROM message_deliveries md
+			WHERE md.message_id = m.id
+			  AND md.state = 'DELIVERED'
+			  AND md.recipient_user_id IS NOT NULL
+		) delivered_meta ON TRUE
+		LEFT JOIN LATERAL (
+			SELECT MAX(other.last_read_at) AS read_at
+			FROM conversation_members other
+			WHERE other.conversation_id = m.conversation_id
+			  AND other.user_id <> $2::uuid
+			  AND other.last_read_server_order >= m.server_order
+			  AND other.last_read_at IS NOT NULL
+		) read_meta ON TRUE
 		WHERE m.conversation_id = $1::uuid
 		ORDER BY server_order ASC
 		LIMIT 100
@@ -511,7 +533,9 @@ func (s *Service) List(ctx context.Context, actor, conversationID string) ([]Mes
 		var clientGenID sql.NullString
 		var status string
 		var created time.Time
-		if err := rows.Scan(&m.MessageID, &m.ConversationID, &m.SenderUserID, &m.ContentType, &contentRaw, &clientGenID, &m.Transport, &m.ServerOrder, &status, &created); err != nil {
+		var deliveredAt sql.NullTime
+		var readAt sql.NullTime
+		if err := rows.Scan(&m.MessageID, &m.ConversationID, &m.SenderUserID, &m.ContentType, &contentRaw, &clientGenID, &m.Transport, &m.ServerOrder, &status, &created, &deliveredAt, &readAt); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal(contentRaw, &m.Content)
@@ -522,6 +546,21 @@ func (s *Service) List(ctx context.Context, actor, conversationID string) ([]Mes
 			m.Status = status
 		}
 		m.CreatedAt = created.UTC().Format(time.RFC3339)
+		m.SentAt = m.CreatedAt
+		if deliveredAt.Valid {
+			m.DeliveredAt = deliveredAt.Time.UTC().Format(time.RFC3339)
+		}
+		if readAt.Valid {
+			m.ReadAt = readAt.Time.UTC().Format(time.RFC3339)
+		}
+		switch m.Status {
+		case "READ":
+			m.StatusUpdatedAt = m.ReadAt
+		case "DELIVERED":
+			m.StatusUpdatedAt = m.DeliveredAt
+		case "SENT":
+			m.StatusUpdatedAt = m.SentAt
+		}
 		items = append(items, m)
 	}
 	return items, rows.Err()
@@ -673,7 +712,8 @@ func (s *Service) ListUnified(ctx context.Context, actor, conversationID string,
 func (s *Service) MarkRead(ctx context.Context, actor, conversationID string, through int64) error {
 	res, err := s.db.Exec(ctx, `
 		UPDATE conversation_members
-		SET last_read_server_order = GREATEST(last_read_server_order, $3)
+		SET last_read_server_order = GREATEST(last_read_server_order, $3),
+		    last_read_at = CASE WHEN $3 > last_read_server_order THEN now() ELSE last_read_at END
 		WHERE conversation_id = $1::uuid AND user_id = $2::uuid
 	`, conversationID, actor, through)
 	if err != nil {
@@ -687,7 +727,99 @@ func (s *Service) MarkRead(ctx context.Context, actor, conversationID string, th
 		SET updated_at = now()
 		WHERE id = $1::uuid
 	`, conversationID)
+	if s.redis != nil {
+		readAt := time.Now().UTC().Format(time.RFC3339Nano)
+		rows, qErr := s.db.Query(ctx, `
+			SELECT DISTINCT sender_user_id::text
+			FROM messages
+			WHERE conversation_id = $1::uuid
+			  AND sender_user_id <> $2::uuid
+			  AND server_order <= $3
+			  AND transport IN ('OTT', 'OHMF')
+		`, conversationID, actor, through)
+		if qErr == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var senderID string
+				if err := rows.Scan(&senderID); err != nil {
+					continue
+				}
+				body, _ := json.Marshal(receiptEvent{
+					SenderUserID:       senderID,
+					ReaderUserID:       actor,
+					ConversationID:     conversationID,
+					ThroughServerOrder: through,
+					Status:             "READ",
+					StatusUpdatedAt:    readAt,
+				})
+				_ = s.redis.Publish(ctx, "delivery:user:"+senderID, body).Err()
+			}
+		}
+	}
 	return nil
+}
+
+func (s *Service) DeliverPendingToUser(ctx context.Context, recipientUserID string) ([]map[string]any, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT m.id::text, m.conversation_id::text, m.sender_user_id::text, m.server_order, m.transport
+		FROM messages m
+		JOIN conversation_members cm
+		  ON cm.conversation_id = m.conversation_id
+		 AND cm.user_id = $1::uuid
+		WHERE m.sender_user_id <> $1::uuid
+		  AND m.transport IN ('OTT', 'OHMF')
+		  AND NOT EXISTS (
+			  SELECT 1
+			  FROM message_deliveries md
+			  WHERE md.message_id = m.id
+			    AND md.recipient_user_id = $1::uuid
+			    AND md.state = 'DELIVERED'
+		  )
+		ORDER BY m.created_at ASC
+	`, recipientUserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	events := make([]map[string]any, 0)
+	statusUpdatedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	for rows.Next() {
+		var messageID, conversationID, senderID, transport string
+		var serverOrder int64
+		if err := rows.Scan(&messageID, &conversationID, &senderID, &serverOrder, &transport); err != nil {
+			return nil, err
+		}
+		tag, err := s.db.Exec(ctx, `
+			INSERT INTO message_deliveries (
+				id, message_id, recipient_user_id, transport, state, submitted_at, updated_at
+			)
+			SELECT gen_random_uuid(), $1::uuid, $2::uuid, $3, 'DELIVERED', now(), now()
+			WHERE NOT EXISTS (
+				SELECT 1
+				FROM message_deliveries md
+				WHERE md.message_id = $1::uuid
+				  AND md.recipient_user_id = $2::uuid
+				  AND md.state = 'DELIVERED'
+			)
+		`, messageID, recipientUserID, transport)
+		if err != nil {
+			return nil, err
+		}
+		if tag.RowsAffected() == 0 {
+			continue
+		}
+		events = append(events, map[string]any{
+			"sender_user_id":    senderID,
+			"recipient_user_id": recipientUserID,
+			"message_id":        messageID,
+			"conversation_id":   conversationID,
+			"server_order":      serverOrder,
+			"status":            "DELIVERED",
+			"status_updated_at": statusUpdatedAt,
+		})
+	}
+	return events, rows.Err()
 }
 
 func (s *Service) enforceSendRate(ctx context.Context, userID, conversationID, ip string) error {

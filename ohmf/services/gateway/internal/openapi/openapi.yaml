@@ -50,6 +50,9 @@ components:
             device_name: { type: string }
             push_token: { type: string }
             public_key: { type: string }
+            capabilities:
+              type: array
+              items: { type: string }
     TokenPair:
       type: object
       properties:
@@ -165,6 +168,21 @@ components:
           type: object
           additionalProperties: true
         state_version: { type: integer }
+        consent_required: { type: boolean }
+        joinable: { type: boolean }
+    MiniAppCardContent:
+      type: object
+      properties:
+        card_version: { type: integer }
+        share_mode: { type: string, enum: [shared_session] }
+        app_id: { type: string }
+        manifest_id: { type: string }
+        app_session_id: { type: string }
+        title: { type: string }
+        summary: { type: string }
+        icon_url: { type: string }
+        cta_label: { type: string }
+        joinable: { type: boolean }
     MiniAppSession:
       type: object
       properties:
@@ -172,15 +190,26 @@ components:
         manifest_id: { type: string }
         app_id: { type: string }
         conversation_id: { type: string }
+        viewer: { $ref: '#/components/schemas/MiniAppParticipant' }
         participants:
           type: array
           items: { $ref: '#/components/schemas/MiniAppParticipant' }
         capabilities_granted:
           type: array
           items: { type: string }
+        participant_permissions:
+          type: object
+          additionalProperties:
+            type: array
+            items: { type: string }
         state: { $ref: '#/components/schemas/MiniAppSessionState' }
         state_version: { type: integer }
         launch_context: { $ref: '#/components/schemas/MiniAppLaunchContext' }
+        consent_required: { type: boolean }
+        joinable: { type: boolean }
+        ended_at:
+          type: string
+          format: date-time
     MiniAppRegisterRequest:
       type: object
       required: [manifest]
@@ -207,6 +236,52 @@ components:
           additionalProperties: true
         ttl_seconds: { type: integer }
         resume_existing: { type: boolean }
+    MiniAppJoinSessionRequest:
+      type: object
+      properties:
+        capabilities_granted:
+          type: array
+          items: { type: string }
+    MiniAppShareRequest:
+      type: object
+      required: [conversation_id]
+      properties:
+        manifest_id: { type: string }
+        app_id: { type: string }
+        conversation_id: { type: string }
+        capabilities_granted:
+          type: array
+          items: { type: string }
+        state_snapshot:
+          type: object
+          additionalProperties: true
+        resume_existing: { type: boolean }
+    MiniAppShareResponse:
+      type: object
+      properties:
+        message:
+          type: object
+          properties:
+            message_id: { type: string }
+            conversation_id: { type: string }
+            sender_user_id: { type: string }
+            content_type: { type: string, enum: [app_card] }
+            content: { $ref: '#/components/schemas/MiniAppCardContent' }
+            transport: { type: string }
+            server_order: { type: integer }
+            created_at:
+              type: string
+              format: date-time
+            status: { type: string }
+        app_session_id: { type: string }
+        manifest_id: { type: string }
+        app_id: { type: string }
+        capabilities_granted:
+          type: array
+          items: { type: string }
+        launch_context: { $ref: '#/components/schemas/MiniAppLaunchContext' }
+        state: { $ref: '#/components/schemas/MiniAppSessionState' }
+        state_version: { type: integer }
     MiniAppAppendEventRequest:
       type: object
       required: [event_name]
@@ -222,9 +297,6 @@ components:
           type: object
           additionalProperties: true
         state_version: { type: integer }
-        capabilities_granted:
-          type: array
-          items: { type: string }
 security:
   - bearerAuth: []
 paths:
@@ -414,6 +486,21 @@ paths:
       responses:
         '204':
           description: No Content
+  /v1/apps/sessions/{id}/join:
+    post:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MiniAppJoinSessionRequest' }
+      responses:
+        '200':
+          description: OK
   /v1/apps/sessions/{id}/events:
     post:
       parameters:
@@ -444,3 +531,16 @@ paths:
       responses:
         '200':
           description: OK
+  /v1/apps/shares:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MiniAppShareRequest' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MiniAppShareResponse' }
