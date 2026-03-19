@@ -23,6 +23,7 @@ import (
 "ohmf/services/gateway/internal/middleware"
 "ohmf/services/gateway/internal/otp"
 "ohmf/services/gateway/internal/phone"
+"ohmf/services/gateway/internal/sqlutil"
 "ohmf/services/gateway/internal/token"
 )
 
@@ -365,7 +366,7 @@ err = tx.QueryRow(ctx,
 INSERT INTO devices (user_id, platform, device_name, capabilities, push_token, public_key, last_seen_at)
 VALUES ($1, $2, $3, $4, $5, $6, now())
 RETURNING id::text
-, userID, req.Device.Platform, req.Device.DeviceName, deviceCapabilities, nullable(req.Device.PushToken), nullable(req.Device.PublicKey)).Scan(&deviceID)
+, userID, req.Device.Platform, req.Device.DeviceName, deviceCapabilities, sqlutil.Nullable(req.Device.PushToken), sqlutil.Nullable(req.Device.PublicKey)).Scan(&deviceID)
 if err != nil {
 return nil, err
 }
@@ -568,9 +569,4 @@ h := sha256.Sum256([]byte(raw))
 return hex.EncodeToString(h[:])
 }
 
-func nullable(v string) any {
-if v == "" {
-return nil
-}
-return v
-}
+// removed: duplicate nullable() helper - moved to sqlutil package
