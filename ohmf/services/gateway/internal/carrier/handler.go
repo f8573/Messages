@@ -15,12 +15,18 @@ import (
 	"log"
 )
 
+// Handler manages carrier message operations.
+// Routes:
+//   POST   /v1/carrier/messages/import          - Import carrier message
+//   GET    /v1/carrier/messages                 - List carrier messages
+//   POST   /v1/carrier/messages/{id}/link       - Link carrier to server message
+//   GET    /v1/carrier/messages/{id}/links      - List message links
+//   GET    /v1/admin/carrier_message_links      - Admin: list all links
 type Handler struct {
 	db DB
 }
 
 // removed: trivial constructor wrapper
-// POST /v1/carrier/messages/import
 func (h *Handler) Import(w http.ResponseWriter, r *http.Request) {
 	userID, ok := middleware.UserIDFromContext(r.Context())
 	if !ok {
@@ -116,7 +122,6 @@ func (h *Handler) Import(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(out)
 }
 
-// GET /v1/carrier/messages?since=...&limit=...
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	userID, ok := middleware.UserIDFromContext(r.Context())
 	if !ok {
@@ -181,7 +186,6 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"messages": out})
 }
 
-// POST /v1/carrier/messages/{id}/link
 func (h *Handler) Link(w http.ResponseWriter, r *http.Request) {
 	userID, ok := middleware.UserIDFromContext(r.Context())
 	if !ok {
@@ -287,7 +291,6 @@ func (h *Handler) Link(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(out)
 }
 
-// GET /v1/carrier/messages/{id}/links
 func (h *Handler) ListLinks(w http.ResponseWriter, r *http.Request) {
 	userID, ok := middleware.UserIDFromContext(r.Context())
 	if !ok {
@@ -346,7 +349,6 @@ func (h *Handler) ListLinks(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"links": out})
 }
 
-// GET /v1/admin/carrier_message_links?actor=&limit=
 func (h *Handler) AdminListLinks(w http.ResponseWriter, r *http.Request) {
 	// Require ADMIN profile
 	if !middleware.HasProfile(r.Context(), "ADMIN") {
