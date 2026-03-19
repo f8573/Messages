@@ -3,6 +3,12 @@ postgres-data/
 ohmf/services/gateway/bin/
 ohmf/services/gateway/.env
 ohmf/services/gateway/coverage.out
+ohmf/services/gateway/api.exe
+ohmf/services/gateway/*-output.txt
 ohmf/services/messages-processor/*.exe
+ohmf/services/messages-processor/processor
 ohmf/services/delivery-processor/*.exe
+ohmf/services/delivery-processor/processor
 ohmf/services/sms-processor/*.exe
+ohmf/services/sms-processor/processor
+# removed: generated binaries and captured outputs do not belong in source control

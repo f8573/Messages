@@ -236,23 +236,9 @@ function normalizeMiniappMessagePreview(raw) {
   };
 }
 
-function appCardPreviewCounter(content) {
-  const counter = Number(content?.preview_state?.counter);
-  if (!Number.isFinite(counter)) return null;
-  return Math.trunc(counter);
-}
-
 function appCardDisplayName(content, limit = 120) {
   return sanitizeText(content?.title || content?.app_id || "Shared app", limit);
-}
-
-function appCardIconURL(content) {
-  return normalizePreviewURL(content?.icon_url);
-}
-
-function appCardIconFallbackText(content) {
-  return initials(appCardDisplayName(content, 40)).slice(0, 1) || "#";
-}
+} // removed: single-use app card wrappers inlined at render sites
 
 function appCardPresentationModes(thread) {
   const modes = {};
@@ -878,7 +864,7 @@ async function claimDeviceBundles(userId) {
   return Array.isArray(payload?.items) ? payload.items : [];
 }
 
-function ensureTrustedRemoteBundles(device, bundles, { allowPrompt = false } = {}) {
+function confirmTrustedRemoteBundles(device, bundles) {
   const nextPins = { ...(device?.trustPins || {}) };
   const changed = [];
   for (const bundle of bundles) {
@@ -890,10 +876,7 @@ function ensureTrustedRemoteBundles(device, bundles, { allowPrompt = false } = {
     if (!nextPins[key]) nextPins[key] = fingerprint;
     else if (nextPins[key] !== fingerprint) changed.push({ userId, deviceId, fingerprint });
   }
-  if (changed.length && !allowPrompt) {
-    throw new Error(`Untrusted device key change detected for ${changed.map((item) => item.deviceId.slice(0, 8)).join(", ")}`);
-  }
-  if (changed.length && allowPrompt) {
+  if (changed.length) {
     const accepted = window.confirm(`Device key changed for ${changed.length} device(s). Trust the new keys and continue?`);
     if (!accepted) {
       throw new Error("Untrusted device key change. Message send cancelled.");
@@ -903,7 +886,7 @@ function ensureTrustedRemoteBundles(device, bundles, { allowPrompt = false } = {
     }
   }
   return persistCryptoDeviceState({ ...device, trustPins: nextPins });
-}
+} // removed: prompt flag eliminated because only the confirm path is used
 
 async function generateSignalPrekey(prekeyId) {
   const keyPair = await signalGenerateAgreementKeyPair();
@@ -1167,14 +1150,20 @@ async function publishCryptoBundle() {
   return next;
 }
 
-async function fetchDeviceBundles(userId, force = false) {
+async function fetchDeviceBundles(userId) {
   const cacheKey = sanitizeText(userId, 80);
-  if (!force && state.crypto.bundleCache[cacheKey]) return state.crypto.bundleCache[cacheKey];
+  if (state.crypto.bundleCache[cacheKey]) return state.crypto.bundleCache[cacheKey];
   const payload = await apiRequest(`/v1/device-keys/${encodeURIComponent(cacheKey)}`, { method: "GET" });
   const items = Array.isArray(payload?.items) ? payload.items : [];
   state.crypto.bundleCache[cacheKey] = items;
   return items;
 }
+
+async function refetchDeviceBundles(userId) {
+  const cacheKey = sanitizeText(userId, 80);
+  delete state.crypto.bundleCache[cacheKey];
+  return fetchDeviceBundles(cacheKey);
+} // removed: boolean cache bypass replaced with named refresh helper
 
 async function ensureEncryptedConversation(thread) {
   if (!thread || thread.kind !== "dm") return null;
@@ -1182,13 +1171,13 @@ async function ensureEncryptedConversation(thread) {
   if (!otherUserId) return null;
   let device = await publishCryptoBundle();
   const [selfBundles, recipientBundles] = await Promise.all([
-    fetchDeviceBundles(state.auth.userId, true),
-    fetchDeviceBundles(otherUserId, true),
+    refetchDeviceBundles(state.auth.userId),
+    refetchDeviceBundles(otherUserId),
   ]);
   const signalSelfBundles = selfBundles.filter(signalBundleSupported);
   const signalRecipientBundles = recipientBundles.filter(signalBundleSupported);
   if (!signalRecipientBundles.length) return null;
-  device = ensureTrustedRemoteBundles(device, signalRecipientBundles, { allowPrompt: true });
+  device = confirmTrustedRemoteBundles(device, signalRecipientBundles);
   if (sanitizeText(thread.encryptionState, 40) !== "ENCRYPTED") {
     const updated = await apiRequest(`/v1/conversations/${encodeURIComponent(thread.id)}/metadata`, {
       method: "PATCH",
@@ -1305,7 +1294,7 @@ async function encryptConversationContent(thread, plainContent, innerContentType
   const encryptionContext = await ensureEncryptedConversation(thread);
   if (!encryptionContext?.device) return null;
   let device = encryptionContext.device;
-  device = ensureTrustedRemoteBundles(device, encryptionContext.recipientBundles, { allowPrompt: true });
+  device = confirmTrustedRemoteBundles(device, encryptionContext.recipientBundles);
   const signingPrivateKey = await signalImportSigningPrivateKey(device.signingPrivateKeyJwk);
   const otherUserId = otherUserIdForThread(thread);
   const remoteClaimedBundles = otherUserId ? await claimDeviceBundles(otherUserId).catch(() => []) : [];
@@ -1419,7 +1408,7 @@ async function decryptConversationContent(message) {
       if (ratchetPublicKey) {
         const senderUserId = sanitizeText(encryption.sender_user_id, 80);
         const senderDeviceId = sanitizeText(encryption.sender_device_id, 80);
-        const senderBundles = await fetchDeviceBundles(senderUserId, true);
+        const senderBundles = await refetchDeviceBundles(senderUserId);
         const senderBundle = senderBundles.find((item) => sanitizeText(item?.device_id, 80) === senderDeviceId) || {};
         const signingPublicKeyValue = sanitizeText(senderBundle?.signing_public_key, 4000);
         if (signingPublicKeyValue) {
@@ -1437,9 +1426,7 @@ async function decryptConversationContent(message) {
               sanitizeText(encryption.sender_signature, 8000)
             );
             if (!valid) throw new Error("Invalid legacy sender signature");
-          } catch {
-            // Best-effort compatibility: proceed if legacy sender signing bundle is no longer available.
-          }
+          } catch {} // removed: descriptive compatibility comment
         }
         let session = getRatchetSession(legacyDevice, senderUserId, senderDeviceId) || normalizeRatchetSession(null, legacyDevice);
         let messageKey = takeSkippedMessageKey(session, ratchetPublicKey, Number(recipient.message_number || 0));
@@ -1519,7 +1506,7 @@ async function decryptConversationContent(message) {
     if (ratchetPublicKey && sanitizeText(encryption.sender_signature, 8000)) {
       const senderUserId = sanitizeText(encryption.sender_user_id, 80);
       const senderDeviceId = sanitizeText(encryption.sender_device_id, 80);
-      const senderBundles = await fetchDeviceBundles(senderUserId, true);
+      const senderBundles = await refetchDeviceBundles(senderUserId);
       const senderBundle = senderBundles.find((item) => sanitizeText(item?.device_id, 80) === senderDeviceId);
       const signingPublicKeyValue = sanitizeText(senderBundle?.signing_public_key, 4000);
       if (!signingPublicKeyValue) throw new Error("Missing sender signing key");
@@ -1701,10 +1688,15 @@ function loadConversationStore() {
   }
 }
 
-function setAuthStatus(message, isError = false) {
+function setAuthMessage(message) {
   el.authStatus.textContent = sanitizeText(message, 200);
-  el.authStatus.classList.toggle("error", Boolean(isError));
+  el.authStatus.classList.remove("error");
 }
+
+function setAuthError(message) {
+  el.authStatus.textContent = sanitizeText(message, 200);
+  el.authStatus.classList.add("error");
+} // removed: boolean auth status flag split into named helpers
 
 function syncAuthHint() {
   if (!el.authHint) return;
@@ -1768,16 +1760,17 @@ async function registerServiceWorkerAndPush() {
   });
 }
 
-async function apiRequest(path, options = {}, allowRetry = true) {
-  const headers = new Headers(options.headers || {});
-  headers.set("Content-Type", "application/json");
-  if (state.auth?.accessToken) headers.set("Authorization", `Bearer ${state.auth.accessToken}`);
+async function apiRequest(path, options = {}) {
+  const request = () => {
+    const headers = new Headers(options.headers || {});
+    headers.set("Content-Type", "application/json");
+    if (state.auth?.accessToken) headers.set("Authorization", `Bearer ${state.auth.accessToken}`);
+    return fetch(`${API_BASE_URL}${path}`, { ...options, headers, credentials: "omit" });
+  };
 
-  const response = await fetch(`${API_BASE_URL}${path}`, { ...options, headers, credentials: "omit" });
-
-  if (response.status === 401 && allowRetry && state.auth?.refreshToken) {
-    const refreshed = await refreshAuthTokens();
-    if (refreshed) return apiRequest(path, options, false);
+  let response = await request();
+  if (response.status === 401 && state.auth?.refreshToken && await refreshAuthTokens()) {
+    response = await request();
   }
 
   const text = await response.text();
@@ -1856,11 +1849,16 @@ function accessTokenExpiresSoon(skewSec = 60) {
   return exp <= Math.floor(Date.now() / 1000) + skewSec;
 }
 
-async function ensureFreshAccessToken(force = false) {
+async function ensureFreshAccessToken() {
   if (!state.auth?.refreshToken) return false;
-  if (!force && !accessTokenExpiresSoon()) return true;
+  if (!accessTokenExpiresSoon()) return true;
   return Boolean(await refreshAuthTokens());
 }
+
+async function forceRefreshAccessToken() {
+  if (!state.auth?.refreshToken) return false;
+  return Boolean(await refreshAuthTokens());
+} // removed: retry and refresh boolean flags now use named flows
 
 function randomId(prefix) {
   if (window.crypto && typeof window.crypto.randomUUID === "function") {
@@ -1878,11 +1876,7 @@ function miniappSupportReason(thread = getActiveThread()) {
   if (thread.closed) return "Reopen or choose an active conversation to launch an app.";
   if (thread.kind === "draft_phone") return "Save the conversation before sending an app.";
   return "";
-}
-
-function activeThreadSupportsMiniapps(thread = getActiveThread()) {
-  return miniappSupportReason(thread) === "";
-}
+} // removed: support wrapper collapsed into direct reason checks
 
 function rewriteLocalDevEntrypoint(rawUrl) {
   const url = new URL(rawUrl, window.location.href);
@@ -1982,7 +1976,7 @@ function applyMiniappSessionRecord(record, manifest) {
 
 async function ensureMiniappSession() {
   const thread = getActiveThread();
-  if (!activeThreadSupportsMiniapps(thread)) throw new Error("Select a saved conversation first.");
+  if (miniappSupportReason(thread)) throw new Error("Select a saved conversation first.");
   const entry = getMiniappCatalogEntry();
   if (!entry) throw new Error("Select an app first.");
   const manifest = state.miniapp.manifest || await fetchMiniappManifest(entry.manifestUrl);
@@ -2050,8 +2044,9 @@ async function persistMiniappSession(version, eventName, eventBody) {
 
 async function shareMiniappToConversation() {
   const thread = getActiveThread();
-  if (!activeThreadSupportsMiniapps(thread)) {
-    state.miniapp.lastShareError = miniappSupportReason(thread);
+  const supportReason = miniappSupportReason(thread);
+  if (supportReason) {
+    state.miniapp.lastShareError = supportReason;
     renderMiniappLauncher();
     return;
   }
@@ -2475,11 +2470,16 @@ function toggleMessageMenu(threadId, messageId) {
   renderMessages();
 }
 
-function clearMessageMenu(shouldRender = true) {
+function clearMessageMenu() {
   if (!state.openMessageMenu) return;
   state.openMessageMenu = null;
-  if (shouldRender) renderMessages();
+  renderMessages();
 }
+
+function clearMessageMenuWithoutRender() {
+  if (!state.openMessageMenu) return;
+  state.openMessageMenu = null;
+} // removed: boolean render flag split into named menu clearers
 
 function setReplyTarget(thread, message) {
   state.replyTarget = {
@@ -2494,11 +2494,16 @@ function setReplyTarget(thread, message) {
   el.composerInput.focus();
 }
 
-function clearReplyTarget(shouldRender = true) {
+function clearReplyTarget() {
   if (!state.replyTarget) return;
   state.replyTarget = null;
-  if (shouldRender) renderMessages();
+  renderMessages();
 }
+
+function clearReplyTargetWithoutRender() {
+  if (!state.replyTarget) return;
+  state.replyTarget = null;
+} // removed: boolean render flag split into named reply clearers
 
 function composerMessageContent(rawText) {
   const text = sanitizeText(rawText, 1000);
@@ -3237,7 +3242,7 @@ async function startRealtimeSocket() {
   if (!state.auth || realtimeSocket) return;
   const forceRefresh = realtimeConnectFailures > 0;
   const wasExpiring = accessTokenExpiresSoon();
-  const refreshed = await ensureFreshAccessToken(forceRefresh);
+  const refreshed = forceRefresh ? await forceRefreshAccessToken() : await ensureFreshAccessToken();
   if (wasExpiring && !refreshed) return;
   const wsURL = new URL(API_BASE_URL.replace(/^http/i, "ws") + "/v2/ws");
   wsURL.searchParams.set("access_token", state.auth.accessToken);
@@ -3294,9 +3299,9 @@ async function startRealtimeSocket() {
       stopLocalTyping();
       if (!opened) {
         realtimeConnectFailures += 1;
-        await ensureFreshAccessToken(true);
+        await forceRefreshAccessToken();
       } else if (accessTokenExpiresSoon(10)) {
-        await ensureFreshAccessToken(true);
+        await forceRefreshAccessToken();
       }
       scheduleRealtimeReconnect();
     }
@@ -3316,9 +3321,7 @@ async function markConversationRead(thread) {
       body: JSON.stringify({ through_server_order: lastIncoming.serverOrder }),
     });
     upsertThread({ ...thread, unreadCount: 0 });
-  } catch {
-    // Best effort.
-  }
+  } catch {} // removed: descriptive catch comment
 }
 
 async function markConversationDelivered(thread) {
@@ -3332,9 +3335,7 @@ async function markConversationDelivered(thread) {
         device_id: state.sync.deviceId,
       }),
     });
-  } catch {
-    // Best effort.
-  }
+  } catch {} // removed: descriptive catch comment
 }
 
 function buildThreadItem(thread) {
@@ -3370,7 +3371,7 @@ function buildThreadItem(thread) {
     if (state.activeThreadId && state.activeThreadId !== thread.id) {
       stopLocalTyping();
     }
-    clearMessageMenu(false);
+    clearMessageMenuWithoutRender();
     state.activeThreadId = thread.id;
     renderAll();
     openMobileThread();
@@ -3496,7 +3497,7 @@ function appendMessageMenuButton(menu, label, onClick, extraClass = "") {
   button.textContent = label;
   button.addEventListener("click", (event) => {
     event.stopPropagation();
-    clearMessageMenu(false);
+    clearMessageMenuWithoutRender();
     onClick();
   });
   menu.appendChild(button);
@@ -3609,8 +3610,8 @@ function renderMiniappWindow() {
 
 function renderMiniappLauncher() {
   const thread = getActiveThread();
-  const supported = activeThreadSupportsMiniapps(thread);
   const supportReason = miniappSupportReason(thread);
+  const supported = !supportReason;
   const joinable = state.miniapp.launchContext?.joinable !== false;
   el.attachBtn.disabled = false;
   el.attachBtn.title = supported ? "Open apps and attachments" : supportReason;
@@ -3697,7 +3698,7 @@ function buildCompactAppCardBubble(message, joinable, label) {
 
   const icon = document.createElement("span");
   icon.className = "app-card-compact-icon";
-  const iconURL = appCardIconURL(message.content);
+  const iconURL = normalizePreviewURL(message.content?.icon_url);
   if (iconURL) {
     const image = document.createElement("img");
     image.className = "app-card-compact-icon-image";
@@ -3708,7 +3709,7 @@ function buildCompactAppCardBubble(message, joinable, label) {
   } else {
     const fallback = document.createElement("span");
     fallback.className = "app-card-compact-icon-fallback";
-    fallback.textContent = appCardIconFallbackText(message.content);
+    fallback.textContent = initials(appCardDisplayName(message.content, 40)).slice(0, 1) || "#";
     icon.appendChild(fallback);
   }
 
@@ -3724,7 +3725,8 @@ function buildExpandedAppCardBubble(message, joinable, previewLabel) {
   const bubble = document.createElement("article");
   bubble.className = `bubble ${message.direction} app-card-bubble`;
   const preview = normalizeMiniappMessagePreview(message.content?.message_preview);
-  const previewCounter = appCardPreviewCounter(message.content);
+  const previewCounterValue = Number(message.content?.preview_state?.counter);
+  const previewCounter = Number.isFinite(previewCounterValue) ? Math.trunc(previewCounterValue) : null;
   const previewFrame = document.createElement("div");
   previewFrame.className = `app-card-preview ${preview ? `is-fit-${preview.fitMode} is-type-${preview.type === "live" ? "live" : "image"}` : "is-fallback"}`;
 
@@ -3964,7 +3966,7 @@ function renderMessages() {
     el.title.textContent = "Select a conversation";
     el.subtitle.textContent = "No active thread";
     el.composerInput.disabled = true;
-    clearMessageMenu(false);
+    clearMessageMenuWithoutRender();
     closeMiniappLauncher();
     state.miniapp.popupOpen = false;
     el.miniappFrame.src = "about:blank";
@@ -4399,31 +4401,20 @@ async function sendInDraftPhoneConversation(thread, content) {
   }
 }
 
-async function handleComposerSend(content) {
-  const thread = getActiveThread();
-  if (!thread || thread.blocked) return;
-  if (thread.kind === "draft_phone") await sendInDraftPhoneConversation(thread, content);
-  else await sendInConversation(thread, content);
-}
-
 function updatePhonePreview() {
   el.phoneInput.value = formatPhoneLocal(el.phoneInput.value);
   const preview = toE164(el.countryCodeSelect.value, el.phoneInput.value);
   el.phoneE164Preview.textContent = preview ? `Will send OTP to ${preview}` : "Enter at least 8 digits including country code";
 }
 
-function updateNewPhoneFormat() {
-  el.newPhoneInput.value = formatPhoneLocal(el.newPhoneInput.value);
-}
-
 async function startPhoneAuth(event) {
   event.preventDefault();
   const phone = toE164(el.countryCodeSelect.value, el.phoneInput.value);
   if (!phone) {
-    setAuthStatus("Enter a valid phone number.", true);
+    setAuthError("Enter a valid phone number.");
     return;
   }
-  setAuthStatus("Requesting OTP...");
+  setAuthMessage("Requesting OTP...");
   try {
     const payload = await apiRequest("/v1/auth/phone/start", {
       method: "POST",
@@ -4431,9 +4422,9 @@ async function startPhoneAuth(event) {
     });
     state.challengeId = sanitizeText(payload.challenge_id, 80);
     el.phoneVerifyForm.classList.remove("hidden");
-    setAuthStatus("OTP sent. Enter code to continue.");
+    setAuthMessage("OTP sent. Enter code to continue.");
   } catch (error) {
-    setAuthStatus(`OTP start failed: ${error.message}`, true);
+    setAuthError(`OTP start failed: ${error.message}`);
   }
 }
 
@@ -4441,10 +4432,10 @@ async function verifyPhoneAuth(event) {
   event.preventDefault();
   const otp = sanitizeText(el.otpInput.value, 8);
   if (!state.challengeId || otp.length < 4) {
-    setAuthStatus("Challenge and OTP are required.", true);
+    setAuthError("Challenge and OTP are required.");
     return;
   }
-  setAuthStatus("Verifying...");
+  setAuthMessage("Verifying...");
   try {
     const payload = await apiRequest("/v1/auth/phone/verify", {
       method: "POST",
@@ -4471,7 +4462,7 @@ async function verifyPhoneAuth(event) {
     updatePhonePreview();
     await bootAfterAuth();
   } catch (error) {
-    setAuthStatus(`Verify failed: ${error.message}`, true);
+    setAuthError(`Verify failed: ${error.message}`);
   }
 }
 
@@ -4604,7 +4595,7 @@ function logout() {
   state.selfProfile = null;
   state.crypto = { device: null, published: false, bundleCache: {} };
   showAuthShell();
-  setAuthStatus("Signed out.");
+  setAuthMessage("Signed out.");
   renderAll();
 }
 
@@ -4713,13 +4704,17 @@ el.composer.addEventListener("submit", async (event) => {
   stopLocalTyping();
   renderMessages();
   try {
-    await handleComposerSend(content);
-    clearReplyTarget(false);
+    const thread = getActiveThread();
+    if (thread && !thread.blocked) {
+      if (thread.kind === "draft_phone") await sendInDraftPhoneConversation(thread, content);
+      else await sendInConversation(thread, content);
+    }
+    clearReplyTargetWithoutRender();
   } catch (error) {
     console.error(error);
   }
   renderAll();
-});
+}); // removed: single-use composer send helper inlined into submit handler
 
 el.composerReplyCancel.addEventListener("click", () => {
   clearReplyTarget();
@@ -4772,9 +4767,7 @@ el.newChatForm.addEventListener("submit", (event) => {
 el.logoutBtn.addEventListener("click", async () => {
   try {
     await apiRequest("/v1/auth/logout", { method: "POST", body: JSON.stringify({}) });
-  } catch {
-    // Best effort logout.
-  }
+  } catch {} // removed: descriptive logout comment
   logout();
 });
 
@@ -4841,7 +4834,9 @@ el.phoneStartForm.addEventListener("submit", startPhoneAuth);
 el.phoneVerifyForm.addEventListener("submit", verifyPhoneAuth);
 el.phoneInput.addEventListener("input", updatePhonePreview);
 el.countryCodeSelect.addEventListener("change", updatePhonePreview);
-el.newPhoneInput.addEventListener("input", updateNewPhoneFormat);
+el.newPhoneInput.addEventListener("input", () => {
+  el.newPhoneInput.value = formatPhoneLocal(el.newPhoneInput.value);
+}); // removed: single-use phone formatting helper inlined into listener
 
 window.addEventListener("resize", () => {
   if (!window.matchMedia("(max-width: 880px)").matches) closeMobileThread();
@@ -4911,7 +4906,7 @@ async function init() {
     return;
   }
   showAuthShell();
-  setAuthStatus("");
+  setAuthMessage("");
   renderAll();
 }
 

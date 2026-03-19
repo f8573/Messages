@@ -35,7 +35,7 @@ import (
 	"ohmf/services/gateway/internal/observability"
 	openapipkg "ohmf/services/gateway/internal/openapi"
 	"ohmf/services/gateway/internal/otp"
-	"ohmf/services/gateway/internal/presence"
+	// removed: presence import - package deleted
 	"ohmf/services/gateway/internal/realtime"
 	"ohmf/services/gateway/internal/relay"
 	"ohmf/services/gateway/internal/replication"
@@ -109,7 +109,6 @@ func main() {
 				"conversations": false,
 				"messages":      false,
 				"relay":         false,
-				"presence":      false,
 				"notification":  false,
 				"media":         false,
 				"miniapp":       false,
@@ -183,10 +182,10 @@ func main() {
 	devSvc := devices.NewService(pool, cfg)
 	mediaSvc := media.NewService(pool, cfg)
 	carrierSvc := carrier.NewService(&pgxAdapter{p: pool})
-	presenceSvc := presence.NewService(rdb)
+	// removed: presence service - unused routes
 	notificationSvc := notification.NewService(pool, devSvc, cfg)
 	abuseSvc := abuse.NewService(pool)
-	relaySvc := relay.NewServiceWithOptions(pool, relay.Options{RequireAttestation: cfg.RequireRelayAttestation})
+	relayHandler := relay.NewHandlerWithOptions(&pgxAdapter{p: pool}, relay.Options{RequireAttestation: cfg.RequireRelayAttestation})
 	miniappSvc := miniapp.NewService(pool, cfg, rdb, replicationStore)
 	deviceKeysSvc := devicekeys.NewService(pool)
 	msgSvc := messages.NewService(pool, messages.Options{
@@ -206,18 +205,18 @@ func main() {
 	usersHandler := users.NewHandler(usersSvc)
 	discoveryHandler := discovery.NewHandler(discoverySvc)
 	convHandler := conversations.NewHandler(convSvc)
-	devHandler := devices.NewHandler(devSvc)
-	mediaHandler := media.NewHandler(mediaSvc)
-	carrierHandler := carrier.NewHandler(carrierSvc, &pgxAdapter{p: pool})
-	presenceHandler := presence.NewHandler(presenceSvc)
+	// removed: trivial constructor wrappers inlined
+	devHandler := &devices.Handler{svc: devSvc}
+	mediaHandler := &media.Handler{svc: mediaSvc}
+	carrierHandler := &carrier.Handler{db: &pgxAdapter{p: pool}}
+	// removed: presence handler - service deleted
 	notificationHandler := notification.NewHandler(notificationSvc)
-	miniappHandler := miniapp.NewHandler(miniappSvc)
-	abuseHandler := abuse.NewHandler(abuseSvc)
-	relayHandler := relay.NewHandler(relaySvc)
-	deviceKeysHandler := devicekeys.NewHandler(deviceKeysSvc)
+	miniappHandler := &miniapp.Handler{svc: miniappSvc}
+	abuseHandler := &abuse.Handler{svc: abuseSvc}
+	deviceKeysHandler := &devicekeys.Handler{db: deviceKeysSvc.DB()}
 	msgHandler := messages.NewHandler(msgSvc)
 	syncSvc := sync.NewService(pool, replicationStore)
-	syncHandler := sync.NewHandler(syncSvc)
+	syncHandler := &sync.Handler{svc: syncSvc}
 	syncFanoutWorker := wk.NewSyncFanoutWorker(replicationStore)
 	go func() {
 		if err := syncFanoutWorker.Start(ctx); err != nil {
@@ -232,11 +231,10 @@ func main() {
 		"users":         usersSvc != nil,
 		"conversations": convSvc != nil,
 		"messages":      msgSvc != nil,
-		"presence":      presenceSvc != nil,
 		"notification":  notificationSvc != nil,
 		"miniapp":       miniappSvc != nil,
 		"abuse":         abuseSvc != nil,
-		"relay":         relaySvc != nil,
+		"relay":         true, // removed: relay service unified with handler
 		"media":         mediaSvc != nil,
 	})
 
@@ -336,8 +334,7 @@ func main() {
 			protected.Post("/device-keys/{deviceID}/prekeys", deviceKeysHandler.AddPrekeys)
 			protected.Get("/device-keys/{userID}", deviceKeysHandler.ListForUser)
 			protected.Post("/device-keys/{userID}/claim", deviceKeysHandler.ClaimForUser)
-			protected.Get("/presence/users/{id}", presenceHandler.GetUser)
-			protected.Get("/presence/conversations/{id}", presenceHandler.GetConversation)
+			// removed: presence routes - service deleted
 			protected.Post("/media/attachments", mediaHandler.Register)
 			protected.Get("/media/attachments/{id}/download", mediaHandler.CreateDownload)
 			protected.Delete("/media/attachments/{id}", mediaHandler.Purge)

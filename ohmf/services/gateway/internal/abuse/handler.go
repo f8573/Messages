@@ -14,8 +14,7 @@ type Handler struct {
 	svc *Service
 }
 
-func NewHandler(svc *Service) *Handler { return &Handler{svc: svc} }
-
+// removed: trivial constructor wrapper
 func (h *Handler) Record(w http.ResponseWriter, r *http.Request) {
 	userID, _ := middleware.UserIDFromContext(r.Context())
 	var req struct {
