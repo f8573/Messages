@@ -12,6 +12,7 @@ Behavior covered
 - projected message send through the host
 - session-scoped key/value storage
 - session state updates with host-pushed `session.stateUpdated` events
+- square live preview mode at `index.html?preview=1` for app-card/message previews without requiring bridge parameters
 
 Local run
 - Serve `ohmf/apps/web` with a static server on `http://localhost:5174`.

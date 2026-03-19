@@ -7,6 +7,12 @@
     "url": "http://localhost:5174/miniapps/counter/index.html",
     "mime_type": "text/html"
   },
+  "message_preview": {
+    "type": "live",
+    "url": "http://localhost:5174/miniapps/counter/index.html?preview=1",
+    "alt_text": "Counter Lab live preview",
+    "fit_mode": "scale"
+  },
   "permissions": [
     "conversation.read_context",
     "conversation.send_message",

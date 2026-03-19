@@ -1,6 +1,8 @@
 package observability
 
 import (
+	"bufio"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -35,4 +37,31 @@ func TestMetricsHandlerExposesGatewayMetrics(t *testing.T) {
 	if !strings.Contains(body, "ohmf_gateway_ws_messages_total") {
 		t.Fatalf("expected ws metrics in body")
 	}
+}
+
+func TestStatusRecorderPreservesHijacker(t *testing.T) {
+	rec := &hijackableRecorder{ResponseRecorder: httptest.NewRecorder()}
+	handler := HTTPMetricsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		h, ok := w.(http.Hijacker)
+		if !ok {
+			t.Fatalf("wrapped response writer no longer implements Hijacker")
+		}
+		if _, _, err := h.Hijack(); err != nil {
+			t.Fatalf("hijack failed: %v", err)
+		}
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/v2/ws", nil)
+	handler.ServeHTTP(rec, req)
+}
+
+type hijackableRecorder struct {
+	*httptest.ResponseRecorder
+}
+
+func (r *hijackableRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	server, client := net.Pipe()
+	rw := bufio.NewReadWriter(bufio.NewReader(server), bufio.NewWriter(server))
+	_ = client.Close()
+	return server, rw, nil
 }

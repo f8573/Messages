@@ -10,33 +10,42 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/redis/go-redis/v9"
 	"ohmf/services/gateway/internal/limit"
 	"ohmf/services/gateway/internal/messages"
 	appmw "ohmf/services/gateway/internal/middleware"
 	"ohmf/services/gateway/internal/observability"
+	"ohmf/services/gateway/internal/replication"
 	"ohmf/services/gateway/internal/token"
 )
 
 const presenceTTL = 90 * time.Second
 
 type Handler struct {
-	tokens     *token.Service
-	messages   *messages.Service
-	redis      *redis.Client
-	limiter    *limit.TokenBucket
-	enableSend bool
-	upgrader   websocket.Upgrader
+	tokens      *token.Service
+	messages    *messages.Service
+	redis       *redis.Client
+	limiter     *limit.TokenBucket
+	enableSend  bool
+	replication *replication.Store
+	upgrader    websocket.Upgrader
 
 	mu      sync.RWMutex
 	clients map[string]map[*client]struct{}
 }
 
 type client struct {
-	userID string
-	conn   *websocket.Conn
-	send   chan []byte
+	userID    string
+	conn      *websocket.Conn
+	send      chan []byte
+	deviceID  string
+	sessionID string
+	v2        bool
+
+	sendMu sync.RWMutex
+	closed bool
 }
 
 type wsEnvelope struct {
@@ -56,13 +65,14 @@ type presenceSubscribePayload struct {
 	ConversationIDs []string `json:"conversation_ids"`
 }
 
-func NewHandler(tokens *token.Service, messageService *messages.Service, redisClient *redis.Client, limiter *limit.TokenBucket, enableSend bool) *Handler {
+func NewHandler(tokens *token.Service, messageService *messages.Service, redisClient *redis.Client, limiter *limit.TokenBucket, enableSend bool, store *replication.Store) *Handler {
 	return &Handler{
-		tokens:     tokens,
-		messages:   messageService,
-		redis:      redisClient,
-		limiter:    limiter,
-		enableSend: enableSend,
+		tokens:      tokens,
+		messages:    messageService,
+		redis:       redisClient,
+		limiter:     limiter,
+		enableSend:  enableSend,
+		replication: store,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(_ *http.Request) bool { return true },
 		},
@@ -88,9 +98,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	c := &client{
-		userID: userID,
-		conn:   conn,
-		send:   make(chan []byte, 128),
+		userID:    userID,
+		conn:      conn,
+		send:      make(chan []byte, 128),
+		sessionID: "wsv1:" + uuid.NewString(),
 	}
 	h.register(c)
 	h.markPresence(ctx, userID)
@@ -108,6 +119,39 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	go h.subscribeDelivery(ctx, c)
 	go h.subscribeMessages(ctx, c)
 	h.readLoop(c, ip)
+}
+
+func (h *Handler) ServeV2(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	ip := ipOnly(r.RemoteAddr)
+	if err := h.allowConnect(ctx, ip); err != nil {
+		http.Error(w, "rate_limited", http.StatusTooManyRequests)
+		return
+	}
+	userID, err := h.authenticate(r)
+	if err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	conn, err := h.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+
+	c := &client{
+		userID:    userID,
+		conn:      conn,
+		send:      make(chan []byte, 128),
+		v2:        true,
+		sessionID: "wsv2:" + uuid.NewString(),
+	}
+	h.register(c)
+	h.markPresence(ctx, userID)
+	h.registerSession(ctx, c)
+
+	go h.writeLoop(c)
+	go h.subscribeUserEvents(ctx, c)
+	h.readLoopV2(c, ip)
 }
 
 func (h *Handler) allowConnect(ctx context.Context, ip string) error {
@@ -222,7 +266,7 @@ func (h *Handler) readLoop(c *client, ip string) {
 				h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": "invalid send_message payload"})
 				continue
 			}
-			result, err := h.messages.Send(context.Background(), c.userID, req.ConversationID, req.IdempotencyKey, req.ContentType, req.Content, req.ClientGeneratedID, "ws-"+time.Now().UTC().Format(time.RFC3339Nano), ip)
+			result, err := h.messages.Send(context.Background(), c.userID, c.deviceID, req.ConversationID, req.IdempotencyKey, req.ContentType, req.Content, req.ClientGeneratedID, "ws-"+time.Now().UTC().Format(time.RFC3339Nano), ip)
 			if err != nil {
 				h.sendJSON(c, "error", map[string]any{"code": "send_failed", "message": err.Error()})
 				continue
@@ -351,9 +395,14 @@ func (h *Handler) readLoop(c *client, ip string) {
 
 func (h *Handler) writeLoop(c *client) {
 	defer func() {
-		_ = c.conn.Close()
+		if c.conn != nil {
+			_ = c.conn.Close()
+		}
 	}()
 	for msg := range c.send {
+		if c.conn == nil {
+			return
+		}
 		if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
 			return
 		}
@@ -379,12 +428,22 @@ func (h *Handler) unregister(c *client) {
 		delete(bucket, c)
 		if len(bucket) == 0 {
 			delete(h.clients, c.userID)
-			_ = h.redis.Del(context.Background(), "presence:user:"+c.userID).Err()
+			if h.redis != nil {
+				_ = h.redis.Del(context.Background(), "presence:user:"+c.userID).Err()
+			}
 		}
 	}
+	h.unregisterSession(context.Background(), c)
 	observability.DecWSConnection()
-	close(c.send)
-	_ = c.conn.Close()
+	c.sendMu.Lock()
+	if !c.closed {
+		c.closed = true
+		close(c.send)
+	}
+	c.sendMu.Unlock()
+	if c.conn != nil {
+		_ = c.conn.Close()
+	}
 }
 
 func (h *Handler) sendJSON(c *client, event string, data any) {
@@ -396,6 +455,11 @@ func (h *Handler) sendJSON(c *client, event string, data any) {
 		return
 	}
 	observability.RecordWSMessage("sent", event)
+	c.sendMu.RLock()
+	defer c.sendMu.RUnlock()
+	if c.closed {
+		return
+	}
 	select {
 	case c.send <- payload:
 	default:
@@ -407,6 +471,29 @@ func (h *Handler) markPresence(ctx context.Context, userID string) {
 		return
 	}
 	_ = h.redis.Set(ctx, "presence:user:"+userID, "online", presenceTTL).Err()
+}
+
+func (h *Handler) registerSession(ctx context.Context, c *client) {
+	if h.redis == nil || c.sessionID == "" {
+		return
+	}
+	body, _ := json.Marshal(map[string]any{
+		"user_id":    c.userID,
+		"device_id":  c.deviceID,
+		"session_id": c.sessionID,
+		"version":    map[bool]string{true: "v2", false: "v1"}[c.v2],
+	})
+	_ = h.redis.Set(ctx, "session:"+c.sessionID, body, presenceTTL).Err()
+	_ = h.redis.SAdd(ctx, "user_sessions:"+c.userID, c.sessionID).Err()
+	_ = h.redis.Expire(ctx, "user_sessions:"+c.userID, presenceTTL).Err()
+}
+
+func (h *Handler) unregisterSession(ctx context.Context, c *client) {
+	if h.redis == nil || c.sessionID == "" {
+		return
+	}
+	_ = h.redis.Del(ctx, "session:"+c.sessionID).Err()
+	_ = h.redis.SRem(ctx, "user_sessions:"+c.userID, c.sessionID).Err()
 }
 
 func (h *Handler) subscribeDelivery(ctx context.Context, c *client) {
@@ -431,6 +518,254 @@ func (h *Handler) subscribeMessages(ctx context.Context, c *client) {
 	for msg := range ch {
 		h.sendJSON(c, "message_created", json.RawMessage(msg.Payload))
 	}
+}
+
+func (h *Handler) subscribeUserEvents(ctx context.Context, c *client) {
+	if h.redis == nil || h.replication == nil {
+		return
+	}
+	pubsub := h.redis.Subscribe(ctx, h.replication.ChannelForUser(c.userID))
+	defer pubsub.Close()
+	for msg := range pubsub.Channel() {
+		h.sendJSON(c, "event", json.RawMessage(msg.Payload))
+	}
+}
+
+func (h *Handler) readLoopV2(c *client, ip string) {
+	defer h.unregister(c)
+	_ = c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	c.conn.SetPongHandler(func(_ string) error {
+		_ = c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		h.markPresence(context.Background(), c.userID)
+		h.registerSession(context.Background(), c)
+		return nil
+	})
+
+	heartbeat := time.NewTicker(30 * time.Second)
+	defer heartbeat.Stop()
+	go func() {
+		for range heartbeat.C {
+			h.markPresence(context.Background(), c.userID)
+			h.registerSession(context.Background(), c)
+			_ = c.conn.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(5*time.Second))
+		}
+	}()
+
+	for {
+		_, payload, err := c.conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		if err := h.allowControlEvent(context.Background(), c.userID); err != nil {
+			h.sendJSON(c, "error", map[string]any{"code": "rate_limited", "message": "ws control rate limit"})
+			continue
+		}
+		var env wsEnvelope
+		if err := json.Unmarshal(payload, &env); err != nil {
+			h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": "invalid event envelope"})
+			continue
+		}
+		observability.RecordWSMessage("received", env.Event)
+		switch env.Event {
+		case "hello":
+			var req struct {
+				DeviceID       string `json:"device_id"`
+				LastUserCursor int64  `json:"last_user_cursor"`
+			}
+			if err := json.Unmarshal(env.Data, &req); err != nil {
+				h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": "invalid hello payload"})
+				continue
+			}
+			if strings.TrimSpace(req.DeviceID) == "" {
+				req.DeviceID = "web"
+			}
+			c.deviceID = req.DeviceID
+			h.registerSession(context.Background(), c)
+			h.sendJSON(c, "hello_ack", map[string]any{
+				"session_id":            c.sessionID,
+				"resume_supported":      true,
+				"heartbeat_interval_ms": 30000,
+			})
+			if h.replication != nil {
+				resp, err := h.replication.ListEvents(context.Background(), c.userID, req.LastUserCursor, 250)
+				if err == nil {
+					for _, evt := range resp.Events {
+						h.sendJSON(c, "event", evt)
+					}
+					if resp.HasMore {
+						h.sendJSON(c, "resync_required", map[string]any{"cursor_hint": resp.NextCursor})
+					}
+				}
+			}
+		case "ack":
+			var req struct {
+				ThroughUserEventID int64  `json:"through_user_event_id"`
+				DeviceID           string `json:"device_id"`
+			}
+			if err := json.Unmarshal(env.Data, &req); err != nil {
+				h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": "invalid ack payload"})
+				continue
+			}
+			deviceID := strings.TrimSpace(req.DeviceID)
+			if deviceID == "" {
+				deviceID = c.deviceID
+			}
+			if deviceID == "" {
+				deviceID = "web"
+			}
+			if h.replication != nil {
+				if err := h.replication.AcknowledgeCursor(context.Background(), c.userID, deviceID, req.ThroughUserEventID); err != nil {
+					h.sendJSON(c, "error", map[string]any{"code": "ack_failed", "message": err.Error()})
+				}
+			}
+		case "send_message":
+			if !h.enableSend {
+				h.sendJSON(c, "error", map[string]any{"code": "ws_send_disabled", "message": "ws send disabled"})
+				continue
+			}
+			var raw interface{}
+			if err := json.Unmarshal(env.Data, &raw); err != nil {
+				h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": "invalid send_message payload"})
+				continue
+			}
+			if err := appmw.ValidateData("ws-send_message", raw); err != nil {
+				h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": err.Error()})
+				continue
+			}
+			var req sendMessagePayload
+			if err := json.Unmarshal(env.Data, &req); err != nil {
+				h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": "invalid send_message payload"})
+				continue
+			}
+			result, err := h.messages.Send(context.Background(), c.userID, c.deviceID, req.ConversationID, req.IdempotencyKey, req.ContentType, req.Content, req.ClientGeneratedID, "ws-"+time.Now().UTC().Format(time.RFC3339Nano), ip)
+			if err != nil {
+				h.sendJSON(c, "error", map[string]any{"code": "send_failed", "message": err.Error()})
+				continue
+			}
+			h.sendJSON(c, "ack", map[string]any{
+				"message_id":      result.Message.MessageID,
+				"conversation_id": result.Message.ConversationID,
+				"server_order":    result.Message.ServerOrder,
+				"status":          "SENT",
+				"queued":          result.Queued,
+				"ack_timeout_ms":  result.AckTimeoutMS,
+			})
+		case "typing.started", "typing.stopped", "presence_subscribe", "subscribe", "auth", "resync":
+			h.handleLegacyCompatibleEvent(c, env, ip)
+		default:
+			h.sendJSON(c, "error", map[string]any{"code": "unsupported_event", "message": env.Event})
+		}
+	}
+}
+
+func (h *Handler) handleLegacyCompatibleEvent(c *client, env wsEnvelope, ip string) {
+	switch env.Event {
+	case "subscribe", "presence_subscribe":
+		var raw interface{}
+		if err := json.Unmarshal(env.Data, &raw); err != nil {
+			h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": "invalid subscribe payload"})
+			return
+		}
+		if err := appmw.ValidateData("ws-subscribe", raw); err != nil {
+			h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": err.Error()})
+			return
+		}
+		var req presenceSubscribePayload
+		if err := json.Unmarshal(env.Data, &req); err != nil {
+			h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": "invalid subscribe payload"})
+			return
+		}
+		for _, convID := range req.ConversationIDs {
+			if convID == "" {
+				continue
+			}
+			_ = h.redis.Set(context.Background(), "presence:conv:"+convID+":user:"+c.userID, "1", presenceTTL).Err()
+		}
+		if env.Event == "subscribe" {
+			h.sendJSON(c, "subscribe_ack", map[string]any{"status": "ok", "conversation_ids": req.ConversationIDs})
+			return
+		}
+		h.sendJSON(c, "presence_update", map[string]any{"status": "online", "user_id": c.userID})
+	case "auth":
+		h.sendJSON(c, "auth", map[string]any{"status": "ok", "user_id": c.userID})
+	case "resync":
+		var payload map[string]any
+		if err := json.Unmarshal(env.Data, &payload); err != nil {
+			h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": "invalid resync payload"})
+			return
+		}
+		conv, _ := payload["conversation_id"]
+		h.sendJSON(c, "resync_required", map[string]any{"conversation_id": conv})
+	case "typing.started":
+		var p struct {
+			ConversationID string `json:"conversation_id"`
+		}
+		if err := json.Unmarshal(env.Data, &p); err != nil {
+			h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": "invalid typing payload"})
+			return
+		}
+		if p.ConversationID == "" {
+			h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": "conversation_id required"})
+			return
+		}
+		if ok, err := h.messages.IsMember(context.Background(), c.userID, p.ConversationID); err != nil || !ok {
+			if err != nil {
+				h.sendJSON(c, "error", map[string]any{"code": "server_error", "message": "membership_check_failed"})
+			} else {
+				h.sendJSON(c, "error", map[string]any{"code": "forbidden", "message": "not a member"})
+			}
+			return
+		}
+		if h.redis != nil {
+			_ = h.redis.Set(context.Background(), "typing:conv:"+p.ConversationID+":user:"+c.userID, "1", 5*time.Second).Err()
+			_ = h.redis.Publish(context.Background(), "typing:conv:"+p.ConversationID, map[string]any{"type": "typing.started", "conversation_id": p.ConversationID, "user_id": c.userID}).Err()
+		}
+		h.mu.RLock()
+		for uid, bucket := range h.clients {
+			if uid == c.userID {
+				continue
+			}
+			if ok, _ := h.messages.IsMember(context.Background(), uid, p.ConversationID); !ok {
+				continue
+			}
+			for cli := range bucket {
+				h.sendJSON(cli, "typing.started", map[string]any{"conversation_id": p.ConversationID, "user_id": c.userID})
+			}
+		}
+		h.mu.RUnlock()
+	case "typing.stopped":
+		var p struct {
+			ConversationID string `json:"conversation_id"`
+		}
+		if err := json.Unmarshal(env.Data, &p); err != nil {
+			h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": "invalid typing payload"})
+			return
+		}
+		if p.ConversationID == "" {
+			h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": "conversation_id required"})
+			return
+		}
+		if h.redis != nil {
+			_ = h.redis.Del(context.Background(), "typing:conv:"+p.ConversationID+":user:"+c.userID).Err()
+			_ = h.redis.Publish(context.Background(), "typing:conv:"+p.ConversationID, map[string]any{"type": "typing.stopped", "conversation_id": p.ConversationID, "user_id": c.userID}).Err()
+		}
+		h.mu.RLock()
+		for uid, bucket := range h.clients {
+			if uid == c.userID {
+				continue
+			}
+			if ok, _ := h.messages.IsMember(context.Background(), uid, p.ConversationID); !ok {
+				continue
+			}
+			for cli := range bucket {
+				h.sendJSON(cli, "typing.stopped", map[string]any{"conversation_id": p.ConversationID, "user_id": c.userID})
+			}
+		}
+		h.mu.RUnlock()
+	default:
+		h.sendJSON(c, "error", map[string]any{"code": "unsupported_event", "message": env.Event})
+	}
+	_ = ip
 }
 
 func (h *Handler) allowControlEvent(ctx context.Context, userID string) error {

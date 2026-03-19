@@ -53,19 +53,21 @@ var (
 	ErrInvalidOTP        = errors.New("invalid_otp")
 	ErrInvalidRefresh    = errors.New("invalid_refresh")
 	ErrRateLimited       = errors.New("rate_limited")
+	ErrOTPDeliveryFailed = errors.New("otp_delivery_failed")
 )
 
 type Service struct {
 	db         *pgxpool.Pool
 	redis      *redis.Client
 	tokens     *token.Service
+	otp        otp.Provider
 	accessTTL  time.Duration
 	refreshTTL time.Duration
 	cfg        config.Config
 }
 
-func NewService(db *pgxpool.Pool, redis *redis.Client, tokens *token.Service, accessTTL, refreshTTL time.Duration, cfg config.Config) *Service {
-	return &Service{db: db, redis: redis, tokens: tokens, accessTTL: accessTTL, refreshTTL: refreshTTL, cfg: cfg}
+func NewService(db *pgxpool.Pool, redis *redis.Client, tokens *token.Service, otpProvider otp.Provider, accessTTL, refreshTTL time.Duration, cfg config.Config) *Service {
+	return &Service{db: db, redis: redis, tokens: tokens, otp: otpProvider, accessTTL: accessTTL, refreshTTL: refreshTTL, cfg: cfg}
 }
 
 func (s *Service) StartPhoneVerification(ctx context.Context, req StartRequest, ip string) (map[string]any, error) {
@@ -106,12 +108,31 @@ func (s *Service) StartPhoneVerification(ctx context.Context, req StartRequest, 
 	}
 
 	id := uuid.New()
-	code := "123456"
-	_, err = s.db.Exec(ctx, `
+	code, err := s.generateOTPCode()
+	if err != nil {
+		return nil, err
+	}
+
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	_, err = tx.Exec(ctx, `
 		INSERT INTO phone_verification_challenges (id, phone_e164, otp_code_hash, channel, attempts_remaining, expires_at)
 		VALUES ($1, $2, $3, $4, 5, now() + interval '5 minute')
 	`, id, phoneE164, otp.Hash(code), req.Channel)
 	if err != nil {
+		return nil, err
+	}
+	if s.otp == nil {
+		return nil, ErrOTPDeliveryFailed
+	}
+	if err := s.otp.SendCode(ctx, phoneE164, code); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrOTPDeliveryFailed, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 	// If the phone or IP has elevated activity, signal escalation to client
@@ -131,6 +152,7 @@ func (s *Service) StartPhoneVerification(ctx context.Context, req StartRequest, 
 		"retry_after_sec": 30,
 		"otp_strategy":    "SMS",
 		"escalated":       escalated,
+		"provider":        s.otp.Name(),
 	}, nil
 }
 
@@ -290,7 +312,7 @@ func (s *Service) VerifyPhone(ctx context.Context, req VerifyRequest, ip string)
 
 	// determine feature profiles to include in the access token
 	profiles := s.decideProfilesForPlatform(req.Device.Platform)
-	access, err := s.tokens.IssueAccess(userID, s.accessTTL, profiles)
+	access, err := s.tokens.IssueAccess(userID, deviceID, s.accessTTL, profiles)
 	if err != nil {
 		return nil, err
 	}
@@ -354,11 +376,11 @@ func (s *Service) Refresh(ctx context.Context, req RefreshRequest) (map[string]a
 	var profiles []string
 	if deviceID != "" {
 		var platform string
-		if err := tx.QueryRow(ctx, `SELECT platform FROM devices WHERE id = $1`, deviceID).Scan(&platform); err == nil {
+		if err := s.db.QueryRow(ctx, `SELECT platform FROM devices WHERE id = $1`, deviceID).Scan(&platform); err == nil {
 			profiles = s.decideProfilesForPlatform(platform)
 		}
 	}
-	access, err := s.tokens.IssueAccess(userID, s.accessTTL, profiles)
+	access, err := s.tokens.IssueAccess(userID, deviceID, s.accessTTL, profiles)
 	if err != nil {
 		return nil, err
 	}
@@ -399,6 +421,33 @@ func normalizeDeviceCapabilities(platform string, requested []string) []string {
 		}
 	}
 	return out
+}
+
+func randomOTPCode() (string, error) {
+	var value uint32
+	if err := binaryReadRand(&value); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%06d", value%1000000), nil
+}
+
+func (s *Service) generateOTPCode() (string, error) {
+	if s == nil || s.otp == nil {
+		return randomOTPCode()
+	}
+	if s.otp.Name() == "dev" {
+		return "123456", nil
+	}
+	return randomOTPCode()
+}
+
+func binaryReadRand(dst *uint32) error {
+	var raw [4]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return err
+	}
+	*dst = uint32(raw[0])<<24 | uint32(raw[1])<<16 | uint32(raw[2])<<8 | uint32(raw[3])
+	return nil
 }
 
 func (s *Service) Logout(ctx context.Context, userID string, req LogoutRequest) error {

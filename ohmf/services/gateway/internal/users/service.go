@@ -3,17 +3,87 @@ package users
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"ohmf/services/gateway/internal/replication"
 )
 
 type Service struct {
-	db *pgxpool.Pool
+	db          *pgxpool.Pool
+	replication *replication.Store
 }
 
-func NewService(db *pgxpool.Pool) *Service { return &Service{db: db} }
+type Profile struct {
+	UserID      string `json:"user_id"`
+	DisplayName string `json:"display_name,omitempty"`
+	AvatarURL   string `json:"avatar_url,omitempty"`
+	PhoneE164   string `json:"primary_phone_e164,omitempty"`
+}
+
+func NewService(db *pgxpool.Pool, store *replication.Store) *Service {
+	return &Service{db: db, replication: store}
+}
+
+func (s *Service) GetProfile(ctx context.Context, userID string) (Profile, error) {
+	var profile Profile
+	if err := s.db.QueryRow(ctx, `
+		SELECT id::text, COALESCE(display_name, ''), COALESCE(avatar_url, ''), COALESCE(primary_phone_e164, '')
+		FROM users
+		WHERE id = $1::uuid
+	`, userID).Scan(&profile.UserID, &profile.DisplayName, &profile.AvatarURL, &profile.PhoneE164); err != nil {
+		return Profile{}, err
+	}
+	return profile, nil
+}
+
+func (s *Service) UpdateProfile(ctx context.Context, userID string, displayName, avatarURL *string) (Profile, error) {
+	var displayNameArg any
+	if displayName != nil {
+		displayNameArg = strings.TrimSpace(*displayName)
+	}
+	var avatarURLArg any
+	if avatarURL != nil {
+		avatarURLArg = strings.TrimSpace(*avatarURL)
+	}
+	if _, err := s.db.Exec(ctx, `
+		UPDATE users
+		SET display_name = CASE WHEN $2::bool THEN NULLIF($3::text, '') ELSE display_name END,
+		    avatar_url = CASE WHEN $4::bool THEN NULLIF($5::text, '') ELSE avatar_url END,
+		    updated_at = now()
+		WHERE id = $1::uuid
+	`, userID, displayName != nil, displayNameArg, avatarURL != nil, avatarURLArg); err != nil {
+		return Profile{}, err
+	}
+	return s.GetProfile(ctx, userID)
+}
+
+func (s *Service) ResolveProfiles(ctx context.Context, userIDs []string) ([]Profile, error) {
+	if len(userIDs) == 0 {
+		return []Profile{}, nil
+	}
+	rows, err := s.db.Query(ctx, `
+		SELECT id::text, COALESCE(display_name, ''), COALESCE(avatar_url, ''), COALESCE(primary_phone_e164, '')
+		FROM users
+		WHERE id = ANY($1::uuid[])
+	`, dedupeUUIDs(userIDs))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]Profile, 0, len(userIDs))
+	for rows.Next() {
+		var profile Profile
+		if err := rows.Scan(&profile.UserID, &profile.DisplayName, &profile.AvatarURL, &profile.PhoneE164); err != nil {
+			return nil, err
+		}
+		out = append(out, profile)
+	}
+	return out, rows.Err()
+}
 
 // ExportAccount returns a simple export payload for the given user.
 // This is a best-effort export intended for developer/ops use; it includes
@@ -122,13 +192,19 @@ func (s *Service) BlockUser(ctx context.Context, actorID, targetID string) error
 		VALUES ($1::uuid, $2::uuid, now())
 		ON CONFLICT DO NOTHING
 	`, actorID, targetID)
-	return err
+	if err != nil {
+		return err
+	}
+	return s.emitBlockStateUpdates(ctx, actorID, targetID)
 }
 
 // UnblockUser removes a block record.
 func (s *Service) UnblockUser(ctx context.Context, actorID, targetID string) error {
 	_, err := s.db.Exec(ctx, `DELETE FROM user_blocks WHERE blocker_user_id = $1::uuid AND blocked_user_id = $2::uuid`, actorID, targetID)
-	return err
+	if err != nil {
+		return err
+	}
+	return s.emitBlockStateUpdates(ctx, actorID, targetID)
 }
 
 // HasBlocked returns true if blocker has blocked blockedID.
@@ -142,4 +218,81 @@ func (s *Service) HasBlocked(ctx context.Context, blockerID, blockedID string) (
 		return false, err
 	}
 	return true, nil
+}
+
+func (s *Service) emitBlockStateUpdates(ctx context.Context, actorID, targetID string) error {
+	if s.replication == nil {
+		return nil
+	}
+	actorBlockedTarget, err := s.HasBlocked(ctx, actorID, targetID)
+	if err != nil {
+		return err
+	}
+	targetBlockedActor, err := s.HasBlocked(ctx, targetID, actorID)
+	if err != nil {
+		return err
+	}
+
+	rows, err := s.db.Query(ctx, `
+		SELECT c.id::text
+		FROM conversations c
+		JOIN conversation_members me
+		  ON me.conversation_id = c.id
+		 AND me.user_id = $1::uuid
+		JOIN conversation_members them
+		  ON them.conversation_id = c.id
+		 AND them.user_id = $2::uuid
+	`, actorID, targetID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	updatedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	for rows.Next() {
+		var conversationID string
+		if err := rows.Scan(&conversationID); err != nil {
+			return err
+		}
+		_, err = s.replication.EmitUserEvent(ctx, actorID, conversationID, replication.UserEventConversationStateUpdated, map[string]any{
+			"conversation_id":   conversationID,
+			"blocked":           actorBlockedTarget || targetBlockedActor,
+			"blocked_by_viewer": actorBlockedTarget,
+			"blocked_by_other":  targetBlockedActor,
+			"updated_at":        updatedAt,
+		})
+		if err != nil {
+			return err
+		}
+		_, err = s.replication.EmitUserEvent(ctx, targetID, conversationID, replication.UserEventConversationStateUpdated, map[string]any{
+			"conversation_id":   conversationID,
+			"blocked":           actorBlockedTarget || targetBlockedActor,
+			"blocked_by_viewer": targetBlockedActor,
+			"blocked_by_other":  actorBlockedTarget,
+			"updated_at":        updatedAt,
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+func dedupeUUIDs(items []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if item == "" {
+			continue
+		}
+		if _, err := uuid.Parse(item); err != nil {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		out = append(out, item)
+	}
+	return out
 }

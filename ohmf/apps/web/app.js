@@ -1,13 +1,13 @@
 "use strict";
 
 function normalizeAPIBaseURL(value) {
-  const fallback = (window.OHMF_WEB_CONFIG?.api_base_url || "http://localhost:18081").replace(/\/+$/, "");
+  const fallback = (window.OHMF_WEB_CONFIG?.api_base_url || "http://localhost:18080").replace(/\/+$/, "");
   if (!value) return fallback;
   try {
     const url = new URL(value);
     const localHosts = new Set(["localhost", "127.0.0.1"]);
-    const targetPort = String(window.OHMF_WEB_CONFIG?.api_host_port || "18081");
-    if (localHosts.has(url.hostname) && (url.port === "18080" || url.port === "8080")) {
+    const targetPort = String(window.OHMF_WEB_CONFIG?.api_host_port || "18080");
+    if (localHosts.has(url.hostname) && url.port !== targetPort) {
       url.port = targetPort;
       const normalized = url.toString().replace(/\/+$/, "");
       window.localStorage.setItem("ohmf.apiBaseUrl", normalized);
@@ -19,14 +19,27 @@ function normalizeAPIBaseURL(value) {
   }
 }
 
-const API_BASE_URL = normalizeAPIBaseURL(window.OHMF_WEB_CONFIG?.api_base_url || window.localStorage.getItem("ohmf.apiBaseUrl") || "http://localhost:18081");
+const API_BASE_URL = normalizeAPIBaseURL(window.OHMF_WEB_CONFIG?.api_base_url || window.localStorage.getItem("ohmf.apiBaseUrl") || "http://localhost:18080");
 const AUTH_STORAGE_KEY = "ohmf.auth.session.v1";
 const STORE_VERSION = 2;
+const SYNC_CURSOR_VERSION = 1;
+const SYNC_DEVICE_KEY = "ohmf.sync.device.v1";
+const CRYPTO_STORAGE_PREFIX = "ohmf.crypto.device.v1";
 const TRANSPORT_SMS = "SMS";
 const TRANSPORT_OHMF = "OHMF";
 const CONTENT_TYPE_TEXT = "text";
+const CONTENT_TYPE_ATTACHMENT = "attachment";
 const CONTENT_TYPE_APP_CARD = "app_card";
 const CONTENT_TYPE_APP_EVENT = "app_event";
+const CONTENT_TYPE_ENCRYPTED = "encrypted";
+const ENCRYPTION_SCHEME = "OHMF_SIGNAL_V1";
+const LEGACY_ENCRYPTION_SCHEME = "OHMF_DOUBLE_RATCHET_P256_AESGCM_V3";
+const ATTACHMENT_ENCRYPTION_SCHEME = "OHMF_ATTACHMENT_AESGCM_V1";
+const SIGNAL_PREKEY_BATCH_SIZE = 100;
+const SIGNAL_PREKEY_REPLENISH_AT = 20;
+const CRYPTO_DB_NAME = "ohmf.crypto";
+const CRYPTO_DB_VERSION = 1;
+const CRYPTO_DEVICE_STORE = "device_state";
 const SMS_DELIVERY_STATUSES = Object.freeze({
   SENT: "SENT",
   FAIL_SEND: "FAIL_SEND",
@@ -38,6 +51,7 @@ const OHMF_DELIVERY_STATUSES = Object.freeze({
   FAIL_DELIVERY: "FAIL_DELIVERY",
   FAIL_SEND: "FAIL_SEND",
 });
+const LIVE_SYNC_INTERVAL_MS = 5000;
 const MINIAPP_CATALOG = Object.freeze([
   {
     appId: "app.ohmf.counter-lab",
@@ -54,8 +68,12 @@ const state = {
   activeThreadId: null,
   threads: [],
   typingDraft: "",
+  remoteTypingByThread: {},
+  replyTarget: null,
+  openMessageMenu: null,
   miniapp: {
     drawerOpen: false,
+    popupOpen: false,
     selectedAppId: "",
     manifest: null,
     launchContext: null,
@@ -67,6 +85,17 @@ const state = {
     consentRequired: false,
     lastShareError: "",
   },
+  sync: {
+    deviceId: "",
+    lastUserCursor: 0,
+  },
+  profiles: {},
+  selfProfile: null,
+  crypto: {
+    device: null,
+    published: false,
+    bundleCache: {},
+  },
 };
 let liveSyncInFlight = false;
 let eventStreamAbort = null;
@@ -75,11 +104,17 @@ let refreshAuthInFlight = null;
 let eventStreamDisabled = false;
 let realtimeSocket = null;
 let realtimeReconnectTimer = 0;
+let realtimeConnectFailures = 0;
+let liveRefreshTimer = 0;
+let typingStopTimer = 0;
+let localTypingThreadId = "";
+let localTypingSent = false;
 
 const el = {
   authShell: document.getElementById("auth-shell"),
   appShell: document.getElementById("app-shell"),
   authStatus: document.getElementById("auth-status"),
+  authHint: document.getElementById("auth-hint"),
   phoneStartForm: document.getElementById("phone-start-form"),
   phoneVerifyForm: document.getElementById("phone-verify-form"),
   countryCodeSelect: document.getElementById("country-code-select"),
@@ -92,10 +127,15 @@ const el = {
   title: document.getElementById("chat-title"),
   subtitle: document.getElementById("chat-subtitle"),
   composer: document.getElementById("composer"),
+  composerReply: document.getElementById("composer-reply"),
+  composerReplyLabel: document.getElementById("composer-reply-label"),
+  composerReplyText: document.getElementById("composer-reply-text"),
+  composerReplyCancel: document.getElementById("composer-reply-cancel"),
   composerInput: document.getElementById("composer-input"),
   emptyState: document.getElementById("empty-state"),
   backBtn: document.getElementById("back-btn"),
   newChatBtn: document.getElementById("new-chat-btn"),
+  newGroupBtn: document.getElementById("new-group-btn"),
   logoutBtn: document.getElementById("logout-btn"),
   newChatForm: document.getElementById("new-chat-form"),
   newCountryCodeSelect: document.getElementById("new-country-code-select"),
@@ -105,8 +145,12 @@ const el = {
   closeThreadBtn: document.getElementById("close-thread-btn"),
   attachBtn: document.getElementById("attach-btn"),
   miniappLauncher: document.getElementById("miniapp-launcher"),
+  miniappWindow: document.getElementById("miniapp-window"),
+  miniappBackdrop: document.getElementById("miniapp-backdrop"),
   miniappCloseBtn: document.getElementById("miniapp-close-btn"),
+  miniappWindowCloseBtn: document.getElementById("miniapp-window-close-btn"),
   miniappPicker: document.getElementById("miniapp-picker"),
+  miniappUploadCard: document.getElementById("miniapp-upload-card"),
   miniappCounterCard: document.getElementById("miniapp-counter-card"),
   miniappStage: document.getElementById("miniapp-stage"),
   miniappPreviewTitle: document.getElementById("miniapp-preview-title"),
@@ -117,7 +161,10 @@ const el = {
   miniappShareBtn: document.getElementById("miniapp-share-btn"),
   miniappOpenBtn: document.getElementById("miniapp-open-btn"),
   miniappResetBtn: document.getElementById("miniapp-reset-btn"),
+  miniappWindowTitle: document.getElementById("miniapp-window-title"),
+  miniappWindowSubtitle: document.getElementById("miniapp-window-subtitle"),
   miniappFrame: document.getElementById("miniapp-frame"),
+  attachmentInput: document.getElementById("attachment-input"),
 };
 
 function nowISO() {
@@ -130,11 +177,125 @@ function formatShortTime(value) {
   return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 }
 
+function messageSnippet(message, limit = 72) {
+  if (!message) return "";
+  if (message.deleted) return "Message deleted";
+  if (isAppCardMessage(message)) return sanitizeText(message?.content?.title || "Shared app", limit);
+  return sanitizeText(message.text, limit);
+}
+
+function normalizeReplyReference(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const messageId = sanitizeText(raw.message_id, 80);
+  if (!messageId) return null;
+  return {
+    messageId,
+    senderUserId: sanitizeText(raw.sender_user_id, 80),
+    contentType: sanitizeText(raw.content_type, 40) || CONTENT_TYPE_TEXT,
+    text: sanitizeText(raw.text, 180) || "Original message",
+  };
+}
+
+function buildReplyReference(thread, message) {
+  return {
+    message_id: message.id,
+    sender_user_id: sanitizeText(message.senderUserId, 80) || (message.direction === "out" ? state.auth?.userId || "" : ""),
+    content_type: sanitizeText(message.contentType, 40) || CONTENT_TYPE_TEXT,
+    text: messageSnippet(message, 180) || "Original message",
+  };
+}
+
 function sanitizeText(value, limit = 1000) {
   return String(value || "")
     .replace(/[\u0000-\u001f\u007f]/g, "")
     .trim()
     .slice(0, limit);
+}
+
+function normalizePreviewURL(value) {
+  if (!value) return "";
+  try {
+    const url = new URL(String(value), window.location.href);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return "";
+    return url.toString();
+  } catch {
+    return "";
+  }
+}
+
+function normalizeMiniappMessagePreview(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const type = String(raw.type || "").trim();
+  const url = normalizePreviewURL(raw.url);
+  if (!url || (type !== "static_image" && type !== "live")) return null;
+  return {
+    type,
+    url,
+    altText: sanitizeText(raw.alt_text, 140),
+    fitMode: String(raw.fit_mode || "scale").trim() === "crop" ? "crop" : "scale",
+  };
+}
+
+function appCardPreviewCounter(content) {
+  const counter = Number(content?.preview_state?.counter);
+  if (!Number.isFinite(counter)) return null;
+  return Math.trunc(counter);
+}
+
+function appCardDisplayName(content, limit = 120) {
+  return sanitizeText(content?.title || content?.app_id || "Shared app", limit);
+}
+
+function appCardIconURL(content) {
+  return normalizePreviewURL(content?.icon_url);
+}
+
+function appCardIconFallbackText(content) {
+  return initials(appCardDisplayName(content, 40)).slice(0, 1) || "#";
+}
+
+function appCardPresentationModes(thread) {
+  const modes = {};
+  const seenAppIds = new Set();
+  for (let index = (thread?.messages || []).length - 1; index >= 0; index -= 1) {
+    const message = thread.messages[index];
+    if (!isAppCardMessage(message) || message.deleted) continue;
+    const appId = sanitizeText(message?.content?.app_id, 120);
+    if (!appId) {
+      modes[message.id] = "expanded";
+      continue;
+    }
+    if (seenAppIds.has(appId)) modes[message.id] = "compact";
+    else {
+      seenAppIds.add(appId);
+      modes[message.id] = "expanded";
+    }
+  }
+  return modes;
+}
+
+function replyIndexByTarget(thread) {
+  const index = {};
+  for (const message of thread?.messages || []) {
+    if (message.deleted) continue;
+    const replyReference = normalizeReplyReference(message.content?.reply_to);
+    if (!replyReference) continue;
+    if (!index[replyReference.messageId]) index[replyReference.messageId] = [];
+    index[replyReference.messageId].push(message);
+  }
+  return index;
+}
+
+function normalizeReactionCounts(raw) {
+  if (!raw || typeof raw !== "object") return {};
+  const normalized = {};
+  for (const [emoji, count] of Object.entries(raw)) {
+    const key = sanitizeText(emoji, 8);
+    const value = Number(count);
+    if (!key || !Number.isFinite(value) || value <= 0) continue;
+    normalized[key] = Math.trunc(value);
+  }
+  return normalized;
 }
 
 function onlyDigits(value, limit = 32) {
@@ -163,19 +324,124 @@ function makeIdempotencyKey(prefix = "msg") {
 
 async function uploadMediaFile(file) {
   if (!file) throw new Error("no file");
-  // Initialize upload
+  const buffer = await file.arrayBuffer();
+  const checksum = await sha256Hex(buffer);
   const init = await apiRequest(`/v1/media/uploads`, {
     method: "POST",
-    body: JSON.stringify({ items: [{ mime_type: file.type, size_bytes: file.size, kind: "media" }] }),
+    body: JSON.stringify({
+      mime_type: file.type || "application/octet-stream",
+      size_bytes: file.size,
+      file_name: sanitizeText(file.name || "attachment", 140),
+      checksum_sha256: checksum,
+    }),
   });
   const uploadUrl = init?.upload_url;
   const uploadId = init?.upload_id;
+  const token = init?.token;
+  const attachmentId = init?.attachment_id;
   if (!uploadUrl) throw new Error("no upload url returned");
 
-  // Perform upload (placeholder, assumes PUT to upload_url)
-  await fetch(uploadUrl, { method: "PUT", body: file });
+  const response = await fetch(uploadUrl, {
+    method: init?.method || "PUT",
+    headers: init?.headers || { "Content-Type": file.type || "application/octet-stream" },
+    body: buffer,
+  });
+  if (!response.ok) throw new Error("upload failed");
+  if (!token) throw new Error("missing upload token");
+  await apiRequest(`/v1/media/uploads/${encodeURIComponent(token)}/complete`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
 
-  return { upload_id: uploadId, upload_url: uploadUrl };
+  return {
+    upload_id: uploadId,
+    upload_url: uploadUrl,
+    attachment_id: attachmentId,
+    checksum_sha256: checksum,
+    file_name: sanitizeText(file.name || "attachment", 140),
+    mime_type: file.type || "application/octet-stream",
+    size_bytes: file.size,
+  };
+}
+
+async function sha256Hex(buffer) {
+  const digest = await window.crypto.subtle.digest("SHA-256", buffer);
+  return Array.from(new Uint8Array(digest))
+    .map((value) => value.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function encryptAttachmentBytes(buffer) {
+  const keyBytes = window.crypto.getRandomValues(new Uint8Array(32));
+  const nonce = window.crypto.getRandomValues(new Uint8Array(12));
+  const key = await window.crypto.subtle.importKey("raw", keyBytes, { name: "AES-GCM" }, false, ["encrypt"]);
+  const ciphertext = await window.crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, key, buffer);
+  return {
+    ciphertext,
+    fileKey: bytesToBase64(keyBytes),
+    fileNonce: bytesToBase64(nonce),
+    scheme: ATTACHMENT_ENCRYPTION_SCHEME,
+  };
+}
+
+async function decryptAttachmentBytes(buffer, descriptor) {
+  const fileKey = sanitizeText(descriptor?.file_key, 4000);
+  const fileNonce = sanitizeText(descriptor?.file_nonce, 4000);
+  if (!fileKey || !fileNonce) return buffer;
+  const key = await window.crypto.subtle.importKey("raw", base64ToBytes(fileKey), { name: "AES-GCM" }, false, ["decrypt"]);
+  return window.crypto.subtle.decrypt({ name: "AES-GCM", iv: base64ToBytes(fileNonce) }, key, buffer);
+}
+
+async function uploadEncryptedMediaFile(thread, file) {
+  if (!thread || thread.kind !== "dm") return uploadMediaFile(file);
+  const recipients = await ensureEncryptedConversation(thread);
+  if (!recipients) return uploadMediaFile(file);
+
+  const sourceBuffer = await file.arrayBuffer();
+  const encrypted = await encryptAttachmentBytes(sourceBuffer);
+  const checksum = await sha256Hex(encrypted.ciphertext);
+  const init = await apiRequest(`/v1/media/uploads`, {
+    method: "POST",
+    body: JSON.stringify({
+      mime_type: "application/octet-stream",
+      size_bytes: encrypted.ciphertext.byteLength,
+      file_name: "",
+      checksum_sha256: checksum,
+    }),
+  });
+  const uploadUrl = init?.upload_url;
+  const uploadId = init?.upload_id;
+  const token = init?.token;
+  const attachmentId = init?.attachment_id;
+  if (!uploadUrl) throw new Error("no upload url returned");
+
+  const response = await fetch(uploadUrl, {
+    method: init?.method || "PUT",
+    headers: init?.headers || { "Content-Type": "application/octet-stream" },
+    body: encrypted.ciphertext,
+  });
+  if (!response.ok) throw new Error("upload failed");
+  if (!token) throw new Error("missing upload token");
+  await apiRequest(`/v1/media/uploads/${encodeURIComponent(token)}/complete`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+
+  return {
+    upload_id: uploadId,
+    upload_url: uploadUrl,
+    attachment_id: attachmentId,
+    checksum_sha256: checksum,
+    file_name: sanitizeText(file.name || "attachment", 140),
+    mime_type: file.type || "application/octet-stream",
+    size_bytes: file.size,
+    file_key: encrypted.fileKey,
+    file_nonce: encrypted.fileNonce,
+    encryption_scheme: encrypted.scheme,
+    stored_mime_type: "application/octet-stream",
+    stored_size_bytes: encrypted.ciphertext.byteLength,
+    encrypted: true,
+  };
 }
 
 function initials(name) {
@@ -213,6 +479,1175 @@ function conversationStoreKey() {
   return `ohmf.conversations.${state.auth?.userId || "anon"}.v${STORE_VERSION}`;
 }
 
+function syncCursorStoreKey() {
+  return `ohmf.sync.cursor.${state.auth?.userId || "anon"}.v${SYNC_CURSOR_VERSION}`;
+}
+
+function ensureSyncDeviceId() {
+  let current = sanitizeText(window.localStorage.getItem(SYNC_DEVICE_KEY), 120);
+  if (!current) {
+    current = randomId("web");
+    window.localStorage.setItem(SYNC_DEVICE_KEY, current);
+  }
+  state.sync.deviceId = current;
+  return current;
+}
+
+function saveSyncCursor() {
+  if (!state.auth?.userId) return;
+  window.localStorage.setItem(syncCursorStoreKey(), JSON.stringify({
+    version: SYNC_CURSOR_VERSION,
+    last_user_cursor: Number(state.sync.lastUserCursor || 0),
+  }));
+}
+
+function loadSyncCursor() {
+  const raw = window.localStorage.getItem(syncCursorStoreKey());
+  state.sync.lastUserCursor = 0;
+  if (!raw) return;
+  try {
+    const parsed = JSON.parse(raw);
+    state.sync.lastUserCursor = Number(parsed?.last_user_cursor || 0);
+  } catch {
+    state.sync.lastUserCursor = 0;
+  }
+}
+
+function cryptoStoreKey() {
+  return `${CRYPTO_STORAGE_PREFIX}.${sanitizeText(state.auth?.userId, 80)}.${sanitizeText(state.auth?.deviceId, 80)}`;
+}
+
+let cryptoDBPromise = null;
+
+function openCryptoDB() {
+  if (cryptoDBPromise) return cryptoDBPromise;
+  cryptoDBPromise = new Promise((resolve, reject) => {
+    const request = window.indexedDB.open(CRYPTO_DB_NAME, CRYPTO_DB_VERSION);
+    request.onerror = () => reject(request.error || new Error("indexeddb_open_failed"));
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(CRYPTO_DEVICE_STORE)) {
+        db.createObjectStore(CRYPTO_DEVICE_STORE);
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+  });
+  return cryptoDBPromise;
+}
+
+async function cryptoStoreLoad() {
+  try {
+    const db = await openCryptoDB();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(CRYPTO_DEVICE_STORE, "readonly");
+      const store = tx.objectStore(CRYPTO_DEVICE_STORE);
+      const request = store.get(cryptoStoreKey());
+      request.onerror = () => reject(request.error || new Error("crypto_store_read_failed"));
+      request.onsuccess = () => resolve(request.result || null);
+    });
+  } catch {
+    try {
+      const raw = window.localStorage.getItem(cryptoStoreKey());
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  }
+}
+
+async function cryptoStoreSave(value) {
+  try {
+    const db = await openCryptoDB();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(CRYPTO_DEVICE_STORE, "readwrite");
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error || new Error("crypto_store_write_failed"));
+      tx.objectStore(CRYPTO_DEVICE_STORE).put(value, cryptoStoreKey());
+    });
+    window.localStorage.removeItem(cryptoStoreKey());
+  } catch {
+    window.localStorage.setItem(cryptoStoreKey(), JSON.stringify(value));
+  }
+}
+
+function bytesToBase64(bytes) {
+  const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  let binary = "";
+  for (const value of view) binary += String.fromCharCode(value);
+  return window.btoa(binary);
+}
+
+function base64ToBytes(value) {
+  const raw = window.atob(String(value || ""));
+  const bytes = new Uint8Array(raw.length);
+  for (let index = 0; index < raw.length; index += 1) bytes[index] = raw.charCodeAt(index);
+  return bytes;
+}
+
+async function exportPublicKey(publicKey) {
+  const spki = await window.crypto.subtle.exportKey("spki", publicKey);
+  return bytesToBase64(spki);
+}
+
+async function importECDHPublicKey(spkiB64) {
+  return window.crypto.subtle.importKey(
+    "spki",
+    base64ToBytes(spkiB64),
+    { name: "ECDH", namedCurve: "P-256" },
+    true,
+    []
+  );
+}
+
+async function importECDSAPublicKey(spkiB64) {
+  return window.crypto.subtle.importKey(
+    "spki",
+    base64ToBytes(spkiB64),
+    { name: "ECDSA", namedCurve: "P-256" },
+    true,
+    ["verify"]
+  );
+}
+
+async function importECDHPrivateKey(jwk) {
+  return window.crypto.subtle.importKey(
+    "jwk",
+    jwk,
+    { name: "ECDH", namedCurve: "P-256" },
+    true,
+    ["deriveBits"]
+  );
+}
+
+async function importECDSAPrivateKey(jwk) {
+  return window.crypto.subtle.importKey(
+    "jwk",
+    jwk,
+    { name: "ECDSA", namedCurve: "P-256" },
+    true,
+    ["sign"]
+  );
+}
+
+async function deriveWrapKey(privateKey, peerPublicKey) {
+  const bits = await window.crypto.subtle.deriveBits({ name: "ECDH", public: peerPublicKey }, privateKey, 256);
+  const digest = await window.crypto.subtle.digest("SHA-256", bits);
+  return window.crypto.subtle.importKey("raw", digest, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+}
+
+async function deriveSharedSecretBytes(privateKey, peerPublicKey) {
+  return new Uint8Array(await window.crypto.subtle.deriveBits({ name: "ECDH", public: peerPublicKey }, privateKey, 256));
+}
+
+function utf8Bytes(value) {
+  return new TextEncoder().encode(String(value || ""));
+}
+
+function concatBytes(...parts) {
+  const total = parts.reduce((sum, part) => sum + (part?.length || 0), 0);
+  const output = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    if (!part?.length) continue;
+    output.set(part, offset);
+    offset += part.length;
+  }
+  return output;
+}
+
+async function hmacSHA256(keyBytes, dataBytes) {
+  const key = await window.crypto.subtle.importKey("raw", keyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return new Uint8Array(await window.crypto.subtle.sign("HMAC", key, dataBytes));
+}
+
+async function hkdfExpand(ikmBytes, saltBytes, info, length) {
+  const salt = saltBytes?.length ? saltBytes : new Uint8Array(32);
+  const prk = await hmacSHA256(salt, ikmBytes);
+  const infoBytes = utf8Bytes(info);
+  const blocks = [];
+  let previous = new Uint8Array(0);
+  let generated = 0;
+  let counter = 1;
+  while (generated < length) {
+    previous = await hmacSHA256(prk, concatBytes(previous, infoBytes, new Uint8Array([counter])));
+    blocks.push(previous);
+    generated += previous.length;
+    counter += 1;
+  }
+  return concatBytes(...blocks).slice(0, length);
+}
+
+async function kdfRoot(rootKeyB64, sharedSecretBytes) {
+  const output = await hkdfExpand(sharedSecretBytes, base64ToBytes(rootKeyB64), "OHMF_DOUBLE_RATCHET_ROOT_V1", 64);
+  return {
+    rootKey: bytesToBase64(output.slice(0, 32)),
+    chainKey: bytesToBase64(output.slice(32, 64)),
+  };
+}
+
+async function kdfChain(chainKeyB64) {
+  const chainKey = base64ToBytes(chainKeyB64);
+  const nextChainKey = await hmacSHA256(chainKey, utf8Bytes("chain"));
+  const messageKey = await hmacSHA256(chainKey, utf8Bytes("message"));
+  return {
+    nextChainKey: bytesToBase64(nextChainKey),
+    messageKey: bytesToBase64(messageKey),
+  };
+}
+
+async function importAESKey(rawBytes, usages = ["encrypt", "decrypt"]) {
+  return window.crypto.subtle.importKey("raw", rawBytes, { name: "AES-GCM" }, false, usages);
+}
+
+function ratchetSessionId(userId, deviceId) {
+  return `${sanitizeText(userId, 80)}:${sanitizeText(deviceId, 80)}`;
+}
+
+function normalizeRatchetSession(session, device) {
+  return {
+    rootKey: sanitizeText(session?.rootKey, 4000),
+    sendChainKey: sanitizeText(session?.sendChainKey, 4000),
+    receiveChainKey: sanitizeText(session?.receiveChainKey, 4000),
+    sendCount: Number(session?.sendCount || 0),
+    receiveCount: Number(session?.receiveCount || 0),
+    previousSendCount: Number(session?.previousSendCount || 0),
+    localRatchetPublicKey: sanitizeText(session?.localRatchetPublicKey || device?.agreementPublicKey, 4000),
+    localRatchetPrivateKeyJwk: session?.localRatchetPrivateKeyJwk || device?.agreementPrivateKeyJwk || null,
+    remoteRatchetPublicKey: sanitizeText(session?.remoteRatchetPublicKey, 4000),
+    pendingRatchet: Boolean(session?.pendingRatchet),
+    skippedKeys: session?.skippedKeys && typeof session.skippedKeys === "object" ? session.skippedKeys : {},
+  };
+}
+
+function persistCryptoDeviceState(device) {
+  const next = {
+    ...device,
+    ratchetSessions: device?.ratchetSessions && typeof device.ratchetSessions === "object" ? device.ratchetSessions : {},
+    signalRatchetSessions: device?.signalRatchetSessions && typeof device.signalRatchetSessions === "object" ? device.signalRatchetSessions : {},
+    trustPins: device?.trustPins && typeof device.trustPins === "object" ? device.trustPins : {},
+    legacyRatchetSessions: device?.legacyRatchetSessions && typeof device.legacyRatchetSessions === "object" ? device.legacyRatchetSessions : {},
+  };
+  void cryptoStoreSave(next);
+  state.crypto.device = next;
+  return next;
+}
+
+function getRatchetSession(device, userId, deviceId) {
+  if (!device) return null;
+  const session = device.ratchetSessions?.[ratchetSessionId(userId, deviceId)];
+  return session ? normalizeRatchetSession(session, device) : null;
+}
+
+function setRatchetSession(device, userId, deviceId, session) {
+  const next = {
+    ...device,
+    ratchetSessions: {
+      ...(device?.ratchetSessions || {}),
+      [ratchetSessionId(userId, deviceId)]: normalizeRatchetSession(session, device),
+    },
+  };
+  return persistCryptoDeviceState(next);
+}
+
+function takeSkippedMessageKey(session, ratchetPublicKey, messageNumber) {
+  const key = `${String(ratchetPublicKey || "")}|${Number(messageNumber || 0)}`;
+  if (!session?.skippedKeys?.[key]) return "";
+  const messageKey = sanitizeText(session.skippedKeys[key], 4000);
+  delete session.skippedKeys[key];
+  return messageKey;
+}
+
+function stashSkippedMessageKey(session, ratchetPublicKey, messageNumber, messageKey) {
+  const key = `${String(ratchetPublicKey || "")}|${Number(messageNumber || 0)}`;
+  const next = {
+    ...(session.skippedKeys || {}),
+    [key]: sanitizeText(messageKey, 4000),
+  };
+  const keys = Object.keys(next);
+  while (keys.length > 64) {
+    delete next[keys.shift()];
+  }
+  session.skippedKeys = next;
+}
+
+async function signalExportPublicKey(publicKey) {
+  return bytesToBase64(await window.crypto.subtle.exportKey("raw", publicKey));
+}
+
+async function signalImportAgreementPublicKey(rawB64) {
+  return window.crypto.subtle.importKey("raw", base64ToBytes(rawB64), { name: "X25519" }, true, []);
+}
+
+async function signalImportSigningPublicKey(rawB64) {
+  return window.crypto.subtle.importKey("raw", base64ToBytes(rawB64), { name: "Ed25519" }, true, ["verify"]);
+}
+
+async function signalImportAgreementPrivateKey(jwk) {
+  return window.crypto.subtle.importKey("jwk", jwk, { name: "X25519" }, true, ["deriveBits"]);
+}
+
+async function signalImportSigningPrivateKey(jwk) {
+  return window.crypto.subtle.importKey("jwk", jwk, { name: "Ed25519" }, true, ["sign"]);
+}
+
+async function signalGenerateAgreementKeyPair() {
+  return window.crypto.subtle.generateKey({ name: "X25519" }, true, ["deriveBits"]);
+}
+
+async function signalGenerateSigningKeyPair() {
+  return window.crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+}
+
+async function signalDeriveSharedSecretBytes(privateKey, peerPublicKey) {
+  return new Uint8Array(await window.crypto.subtle.deriveBits({ name: "X25519", public: peerPublicKey }, privateKey, 256));
+}
+
+async function signalDeriveWrapKey(privateKey, peerPublicKey) {
+  const bits = await signalDeriveSharedSecretBytes(privateKey, peerPublicKey);
+  const digest = await window.crypto.subtle.digest("SHA-256", bits);
+  return window.crypto.subtle.importKey("raw", digest, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+}
+
+async function signalSignDetached(privateKey, payload) {
+  return bytesToBase64(await window.crypto.subtle.sign("Ed25519", privateKey, utf8Bytes(payload)));
+}
+
+async function signalVerifyDetached(publicKey, payload, signatureB64) {
+  return window.crypto.subtle.verify("Ed25519", publicKey, base64ToBytes(signatureB64), utf8Bytes(payload));
+}
+
+function signalRatchetSessionId(userId, deviceId) {
+  return `signal:${sanitizeText(userId, 80)}:${sanitizeText(deviceId, 80)}`;
+}
+
+function normalizeSignalRatchetSession(session, device) {
+  return {
+    rootKey: sanitizeText(session?.rootKey, 4000),
+    sendChainKey: sanitizeText(session?.sendChainKey, 4000),
+    receiveChainKey: sanitizeText(session?.receiveChainKey, 4000),
+    sendCount: Number(session?.sendCount || 0),
+    receiveCount: Number(session?.receiveCount || 0),
+    previousSendCount: Number(session?.previousSendCount || 0),
+    localRatchetPublicKey: sanitizeText(session?.localRatchetPublicKey || device?.signedPrekeyPublicKey || "", 4000),
+    localRatchetPrivateKeyJwk: session?.localRatchetPrivateKeyJwk || device?.signedPrekeyPrivateKeyJwk || null,
+    remoteRatchetPublicKey: sanitizeText(session?.remoteRatchetPublicKey, 4000),
+    pendingRatchet: Boolean(session?.pendingRatchet),
+    skippedKeys: session?.skippedKeys && typeof session.skippedKeys === "object" ? session.skippedKeys : {},
+  };
+}
+
+function getSignalRatchetSession(device, userId, deviceId) {
+  if (!device) return null;
+  const session = device.signalRatchetSessions?.[signalRatchetSessionId(userId, deviceId)];
+  return session ? normalizeSignalRatchetSession(session, device) : null;
+}
+
+function setSignalRatchetSession(device, userId, deviceId, session) {
+  const next = {
+    ...device,
+    signalRatchetSessions: {
+      ...(device?.signalRatchetSessions || {}),
+      [signalRatchetSessionId(userId, deviceId)]: normalizeSignalRatchetSession(session, device),
+    },
+  };
+  return persistCryptoDeviceState(next);
+}
+
+function trustPinId(userId, deviceId) {
+  return `${sanitizeText(userId, 80)}:${sanitizeText(deviceId, 80)}`;
+}
+
+function signalBundleSupported(bundle) {
+  return sanitizeText(bundle?.bundle_version, 80) === ENCRYPTION_SCHEME
+    && sanitizeText(bundle?.agreement_identity_public_key, 4000)
+    && sanitizeText(bundle?.signing_public_key, 4000)
+    && sanitizeText(bundle?.fingerprint, 128);
+}
+
+function signedPrekeyForBundle(bundle) {
+  const signedPrekey = bundle?.signed_prekey && typeof bundle.signed_prekey === "object" ? bundle.signed_prekey : {};
+  return {
+    prekey_id: Number(signedPrekey?.prekey_id || bundle?.signed_prekey_id || 0),
+    public_key: sanitizeText(signedPrekey?.public_key || bundle?.signed_prekey_public_key, 4000),
+    signature: sanitizeText(signedPrekey?.signature || bundle?.signed_prekey_signature, 8000),
+  };
+}
+
+async function claimDeviceBundles(userId) {
+  const payload = await apiRequest(`/v1/device-keys/${encodeURIComponent(sanitizeText(userId, 80))}/claim`, { method: "POST" });
+  return Array.isArray(payload?.items) ? payload.items : [];
+}
+
+function ensureTrustedRemoteBundles(device, bundles, { allowPrompt = false } = {}) {
+  const nextPins = { ...(device?.trustPins || {}) };
+  const changed = [];
+  for (const bundle of bundles) {
+    const userId = sanitizeText(bundle?.user_id, 80);
+    const deviceId = sanitizeText(bundle?.device_id, 80);
+    const fingerprint = sanitizeText(bundle?.fingerprint, 128);
+    if (!userId || !deviceId || !fingerprint) continue;
+    const key = trustPinId(userId, deviceId);
+    if (!nextPins[key]) nextPins[key] = fingerprint;
+    else if (nextPins[key] !== fingerprint) changed.push({ userId, deviceId, fingerprint });
+  }
+  if (changed.length && !allowPrompt) {
+    throw new Error(`Untrusted device key change detected for ${changed.map((item) => item.deviceId.slice(0, 8)).join(", ")}`);
+  }
+  if (changed.length && allowPrompt) {
+    const accepted = window.confirm(`Device key changed for ${changed.length} device(s). Trust the new keys and continue?`);
+    if (!accepted) {
+      throw new Error("Untrusted device key change. Message send cancelled.");
+    }
+    for (const item of changed) {
+      nextPins[trustPinId(item.userId, item.deviceId)] = item.fingerprint;
+    }
+  }
+  return persistCryptoDeviceState({ ...device, trustPins: nextPins });
+}
+
+async function generateSignalPrekey(prekeyId) {
+  const keyPair = await signalGenerateAgreementKeyPair();
+  return {
+    prekey_id: Number(prekeyId),
+    public_key: await signalExportPublicKey(keyPair.publicKey),
+    private_key_jwk: await window.crypto.subtle.exportKey("jwk", keyPair.privateKey),
+  };
+}
+
+async function topUpSignalPrekeys(device, minimum = SIGNAL_PREKEY_BATCH_SIZE) {
+  const next = { ...device, oneTimePrekeys: { ...(device?.oneTimePrekeys || {}) } };
+  const available = Object.values(next.oneTimePrekeys).filter((item) => item && !item.consumed_at).length;
+  let nextPrekeyId = Number(next.nextPrekeyId || 1);
+  for (let index = available; index < minimum; index += 1) {
+    const generated = await generateSignalPrekey(nextPrekeyId);
+    next.oneTimePrekeys[String(generated.prekey_id)] = generated;
+    nextPrekeyId += 1;
+  }
+  next.nextPrekeyId = nextPrekeyId;
+  return persistCryptoDeviceState(next);
+}
+
+async function initializeOutboundRatchetSession(device, bundle) {
+  const peerAgreementKey = agreementKeyForBundle(bundle);
+  if (!peerAgreementKey) throw new Error("Missing peer agreement key");
+  const agreementPrivateKey = await importECDHPrivateKey(device.agreementPrivateKeyJwk);
+  const peerPublicKey = await importECDHPublicKey(peerAgreementKey);
+  const handshakeSharedSecret = await deriveSharedSecretBytes(agreementPrivateKey, peerPublicKey);
+  const handshake = await kdfRoot("", handshakeSharedSecret);
+  const localRatchetKeyPair = await window.crypto.subtle.generateKey(
+    { name: "ECDH", namedCurve: "P-256" },
+    true,
+    ["deriveBits"]
+  );
+  const sharedSecret = await deriveSharedSecretBytes(localRatchetKeyPair.privateKey, peerPublicKey);
+  const seed = await kdfRoot(handshake.rootKey, sharedSecret);
+  return normalizeRatchetSession({
+    rootKey: seed.rootKey,
+    sendChainKey: seed.chainKey,
+    receiveChainKey: "",
+    sendCount: 0,
+    receiveCount: 0,
+    previousSendCount: 0,
+    localRatchetPublicKey: await exportPublicKey(localRatchetKeyPair.publicKey),
+    localRatchetPrivateKeyJwk: await window.crypto.subtle.exportKey("jwk", localRatchetKeyPair.privateKey),
+    remoteRatchetPublicKey: peerAgreementKey,
+    pendingRatchet: false,
+    skippedKeys: {},
+  }, device);
+}
+
+async function rotateSendingRatchet(session) {
+  const localRatchetKeyPair = await window.crypto.subtle.generateKey(
+    { name: "ECDH", namedCurve: "P-256" },
+    true,
+    ["deriveBits"]
+  );
+  const localPrivateKey = localRatchetKeyPair.privateKey;
+  const remotePublicKey = await importECDHPublicKey(session.remoteRatchetPublicKey);
+  const sharedSecret = await deriveSharedSecretBytes(localPrivateKey, remotePublicKey);
+  const next = await kdfRoot(session.rootKey, sharedSecret);
+  session.rootKey = next.rootKey;
+  session.sendChainKey = next.chainKey;
+  session.previousSendCount = Number(session.sendCount || 0);
+  session.sendCount = 0;
+  session.localRatchetPublicKey = await exportPublicKey(localRatchetKeyPair.publicKey);
+  session.localRatchetPrivateKeyJwk = await window.crypto.subtle.exportKey("jwk", localPrivateKey);
+  session.pendingRatchet = false;
+  return session;
+}
+
+async function advanceSendingRatchet(device, bundle) {
+  let session = getRatchetSession(device, bundle.user_id, bundle.device_id);
+  if (!session) {
+    session = await initializeOutboundRatchetSession(device, bundle);
+  } else if (session.pendingRatchet || !session.sendChainKey) {
+    session = await rotateSendingRatchet(session);
+  }
+  const step = await kdfChain(session.sendChainKey);
+  const header = {
+    ratchet_public_key: sanitizeText(session.localRatchetPublicKey, 4000),
+    previous_chain_length: Number(session.previousSendCount || 0),
+    message_number: Number(session.sendCount || 0),
+  };
+  session.sendChainKey = step.nextChainKey;
+  session.sendCount = Number(session.sendCount || 0) + 1;
+  return {
+    device: setRatchetSession(device, bundle.user_id, bundle.device_id, session),
+    header,
+    messageKey: step.messageKey,
+  };
+}
+
+function recipientHeaderSummary(recipients) {
+  return (Array.isArray(recipients) ? recipients : [])
+    .map((item) => [
+      sanitizeText(item?.user_id, 80),
+      sanitizeText(item?.device_id, 80),
+      sanitizeText(item?.ratchet_public_key, 4000),
+      String(Number(item?.previous_chain_length || 0)),
+      String(Number(item?.message_number || 0)),
+      sanitizeText(item?.initial_session?.sender_ephemeral_public_key, 4000),
+      String(Number(item?.initial_session?.signed_prekey_id || 0)),
+      String(Number(item?.initial_session?.one_time_prekey_id || 0)),
+    ].join(":"))
+    .sort()
+    .join(";");
+}
+
+function ratchetSignaturePayloadForEnvelope({ scheme, conversationEpoch, nonce, ciphertext, recipients }) {
+  return [
+    String(scheme || ""),
+    String(Number(conversationEpoch || 1)),
+    String(nonce || ""),
+    String(ciphertext || ""),
+    recipientHeaderSummary(recipients),
+  ].join("|");
+}
+
+function signaturePayloadForEnvelope({ scheme, conversationEpoch, senderEphemeralPublicKey, nonce, ciphertext }) {
+  return [
+    String(scheme || ""),
+    String(Number(conversationEpoch || 1)),
+    String(senderEphemeralPublicKey || ""),
+    String(nonce || ""),
+    String(ciphertext || ""),
+  ].join("|");
+}
+
+async function signDetached(privateKey, payload) {
+  const data = new TextEncoder().encode(String(payload || ""));
+  const signature = await window.crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, privateKey, data);
+  return bytesToBase64(signature);
+}
+
+async function verifyDetached(publicKey, payload, signatureB64) {
+  const data = new TextEncoder().encode(String(payload || ""));
+  return window.crypto.subtle.verify(
+    { name: "ECDSA", hash: "SHA-256" },
+    publicKey,
+    base64ToBytes(signatureB64),
+    data
+  );
+}
+
+function agreementKeyForBundle(bundle) {
+  return sanitizeText(bundle?.agreement_identity_public_key || bundle?.identity_public_key, 4000);
+}
+
+async function ensureCryptoDeviceState() {
+  if (!state.auth?.deviceId) {
+    await ensureCurrentDeviceId();
+  }
+  if (state.crypto.device?.deviceId === state.auth?.deviceId) return state.crypto.device;
+
+  const stored = await cryptoStoreLoad();
+  if (stored?.agreementPublicKey && stored?.agreementPrivateKeyJwk && stored?.signingPublicKey && stored?.signingPrivateKeyJwk && stored?.signedPrekeyPublicKey && stored?.signedPrekeyPrivateKeyJwk) {
+    const normalized = {
+      ...stored,
+      deviceId: state.auth?.deviceId || stored.deviceId || "",
+      ratchetSessions: stored?.ratchetSessions && typeof stored.ratchetSessions === "object" ? stored.ratchetSessions : {},
+      signalRatchetSessions: stored?.signalRatchetSessions && typeof stored.signalRatchetSessions === "object" ? stored.signalRatchetSessions : {},
+      legacyRatchetSessions: stored?.legacyRatchetSessions && typeof stored.legacyRatchetSessions === "object" ? stored.legacyRatchetSessions : {},
+      trustPins: stored?.trustPins && typeof stored.trustPins === "object" ? stored.trustPins : {},
+      oneTimePrekeys: stored?.oneTimePrekeys && typeof stored.oneTimePrekeys === "object" ? stored.oneTimePrekeys : {},
+      nextPrekeyId: Number(stored?.nextPrekeyId || 1),
+    };
+    state.crypto.device = normalized;
+    return normalized;
+  }
+
+  const legacyRaw = stored || (() => {
+    try {
+      const raw = window.localStorage.getItem(cryptoStoreKey());
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  })();
+  const agreementKeyPair = await signalGenerateAgreementKeyPair();
+  const signingKeyPair = await signalGenerateSigningKeyPair();
+  const signedPrekeyPair = await signalGenerateAgreementKeyPair();
+  const next = {
+    deviceId: state.auth?.deviceId || legacyRaw?.deviceId || "",
+    agreementPublicKey: await signalExportPublicKey(agreementKeyPair.publicKey),
+    agreementPrivateKeyJwk: await window.crypto.subtle.exportKey("jwk", agreementKeyPair.privateKey),
+    signingPublicKey: await signalExportPublicKey(signingKeyPair.publicKey),
+    signingPrivateKeyJwk: await window.crypto.subtle.exportKey("jwk", signingKeyPair.privateKey),
+    signedPrekeyId: Number(legacyRaw?.signedPrekeyId || 1),
+    signedPrekeyPublicKey: await signalExportPublicKey(signedPrekeyPair.publicKey),
+    signedPrekeyPrivateKeyJwk: await window.crypto.subtle.exportKey("jwk", signedPrekeyPair.privateKey),
+    publishedAt: "",
+    ratchetSessions: {},
+    signalRatchetSessions: {},
+    legacyRatchetSessions: legacyRaw?.ratchetSessions && typeof legacyRaw.ratchetSessions === "object" ? legacyRaw.ratchetSessions : {},
+    trustPins: {},
+    oneTimePrekeys: {},
+    nextPrekeyId: 1,
+    legacyAgreementPublicKey: sanitizeText(legacyRaw?.agreementPublicKey || legacyRaw?.publicKey, 4000),
+    legacyAgreementPrivateKeyJwk: legacyRaw?.agreementPrivateKeyJwk || legacyRaw?.privateKeyJwk || null,
+    legacySigningPublicKey: sanitizeText(legacyRaw?.signingPublicKey, 4000),
+    legacySigningPrivateKeyJwk: legacyRaw?.signingPrivateKeyJwk || null,
+  };
+  const withPrekeys = await topUpSignalPrekeys(next, SIGNAL_PREKEY_BATCH_SIZE);
+  state.crypto.device = withPrekeys;
+  return withPrekeys;
+}
+
+async function publishCryptoBundle() {
+  if (!state.auth?.deviceId) return null;
+  let device = await ensureCryptoDeviceState();
+  device = await topUpSignalPrekeys(device, SIGNAL_PREKEY_BATCH_SIZE);
+  if (state.crypto.published && device.publishedAt) {
+    const available = Object.values(device.oneTimePrekeys || {}).filter((item) => item && !item.consumed_at).length;
+    if (available >= SIGNAL_PREKEY_REPLENISH_AT) return device;
+  }
+  const signingPrivateKey = await signalImportSigningPrivateKey(device.signingPrivateKeyJwk);
+  const signedPrekeySignature = await signalSignDetached(signingPrivateKey, `OHMF_SIGNAL_V1|signed_prekey|${Number(device.signedPrekeyId || 1)}|${device.signedPrekeyPublicKey}`);
+  const oneTimePrekeys = Object.values(device.oneTimePrekeys || {})
+    .filter((item) => item && !item.consumed_at)
+    .map((item) => ({
+      prekey_id: Number(item.prekey_id || 0),
+      public_key: sanitizeText(item.public_key, 4000),
+    }));
+  const payload = await apiRequest(`/v1/device-keys/${encodeURIComponent(state.auth.deviceId)}`, {
+    method: "PUT",
+    body: JSON.stringify({
+      bundle_version: ENCRYPTION_SCHEME,
+      identity_key_alg: "X25519",
+      identity_public_key: device.agreementPublicKey,
+      agreement_identity_public_key: device.agreementPublicKey,
+      signing_key_alg: "Ed25519",
+      signing_public_key: device.signingPublicKey,
+      signed_prekey: {
+        prekey_id: Number(device.signedPrekeyId || 1),
+        public_key: device.signedPrekeyPublicKey,
+        signature: signedPrekeySignature,
+      },
+      key_version: 1,
+      trust_level: "TRUSTED_SELF",
+      one_time_prekeys: oneTimePrekeys,
+    }),
+  });
+  const next = {
+    ...device,
+    publishedAt: payload?.updated_at || nowISO(),
+    fingerprint: sanitizeText(payload?.fingerprint, 128),
+  };
+  persistCryptoDeviceState(next);
+  state.crypto.published = true;
+  await apiRequest(`/v1/devices/${encodeURIComponent(state.auth.deviceId)}`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      platform: "WEB",
+      capabilities: ["MINI_APPS", "E2EE_OTT_V2", "WEB_PUSH_V1"],
+    }),
+  }).catch((error) => {
+    console.error(error);
+  });
+  return next;
+}
+
+async function fetchDeviceBundles(userId, force = false) {
+  const cacheKey = sanitizeText(userId, 80);
+  if (!force && state.crypto.bundleCache[cacheKey]) return state.crypto.bundleCache[cacheKey];
+  const payload = await apiRequest(`/v1/device-keys/${encodeURIComponent(cacheKey)}`, { method: "GET" });
+  const items = Array.isArray(payload?.items) ? payload.items : [];
+  state.crypto.bundleCache[cacheKey] = items;
+  return items;
+}
+
+async function ensureEncryptedConversation(thread) {
+  if (!thread || thread.kind !== "dm") return null;
+  const otherUserId = otherUserIdForThread(thread);
+  if (!otherUserId) return null;
+  let device = await publishCryptoBundle();
+  const [selfBundles, recipientBundles] = await Promise.all([
+    fetchDeviceBundles(state.auth.userId, true),
+    fetchDeviceBundles(otherUserId, true),
+  ]);
+  const signalSelfBundles = selfBundles.filter(signalBundleSupported);
+  const signalRecipientBundles = recipientBundles.filter(signalBundleSupported);
+  if (!signalRecipientBundles.length) return null;
+  device = ensureTrustedRemoteBundles(device, signalRecipientBundles, { allowPrompt: true });
+  if (sanitizeText(thread.encryptionState, 40) !== "ENCRYPTED") {
+    const updated = await apiRequest(`/v1/conversations/${encodeURIComponent(thread.id)}/metadata`, {
+      method: "PATCH",
+      body: JSON.stringify({ encryption_state: "ENCRYPTED" }),
+    });
+    const existing = getThreadById(thread.id) || thread;
+    upsertThread({ ...existing, ...mapConversation(updated), messages: existing.messages, loadedMessages: existing.loadedMessages });
+    saveConversationStore();
+  }
+  return {
+    device,
+    selfBundles: signalSelfBundles,
+    recipientBundles: signalRecipientBundles,
+  };
+}
+
+async function signalDeriveX3DHRoot(device, bundle, claimedBundle) {
+  const identityPrivateKey = await signalImportAgreementPrivateKey(device.agreementPrivateKeyJwk);
+  const ephemeralKeyPair = await signalGenerateAgreementKeyPair();
+  const recipientIdentityPublicKey = await signalImportAgreementPublicKey(agreementKeyForBundle(bundle));
+  const recipientSignedPrekey = signedPrekeyForBundle(bundle);
+  const recipientSignedPrekeyPublicKey = await signalImportAgreementPublicKey(recipientSignedPrekey.public_key);
+  const segments = [];
+  segments.push(await signalDeriveSharedSecretBytes(identityPrivateKey, recipientSignedPrekeyPublicKey));
+  segments.push(await signalDeriveSharedSecretBytes(ephemeralKeyPair.privateKey, recipientIdentityPublicKey));
+  segments.push(await signalDeriveSharedSecretBytes(ephemeralKeyPair.privateKey, recipientSignedPrekeyPublicKey));
+  const claimedPrekey = claimedBundle?.claimed_one_time_prekey && typeof claimedBundle.claimed_one_time_prekey === "object"
+    ? claimedBundle.claimed_one_time_prekey
+    : null;
+  if (claimedPrekey?.public_key) {
+    const oneTimePrekeyPublicKey = await signalImportAgreementPublicKey(sanitizeText(claimedPrekey.public_key, 4000));
+    segments.push(await signalDeriveSharedSecretBytes(ephemeralKeyPair.privateKey, oneTimePrekeyPublicKey));
+  }
+  const rootMaterial = await hkdfExpand(concatBytes(...segments), new Uint8Array(32), "OHMF_SIGNAL_X3DH_V1", 32);
+  return {
+    rootKey: bytesToBase64(rootMaterial),
+    senderEphemeralPublicKey: await signalExportPublicKey(ephemeralKeyPair.publicKey),
+  };
+}
+
+async function initializeSignalOutboundSession(device, bundle, claimedBundle = null) {
+  const recipientSignedPrekey = signedPrekeyForBundle(bundle);
+  if (!recipientSignedPrekey.public_key) throw new Error("Missing recipient signed prekey");
+  const localRatchetKeyPair = await signalGenerateAgreementKeyPair();
+  const x3dh = await signalDeriveX3DHRoot(device, bundle, claimedBundle);
+  const recipientSignedPrekeyPublicKey = await signalImportAgreementPublicKey(recipientSignedPrekey.public_key);
+  const ratchetSharedSecret = await signalDeriveSharedSecretBytes(localRatchetKeyPair.privateKey, recipientSignedPrekeyPublicKey);
+  const seeded = await kdfRoot(x3dh.rootKey, ratchetSharedSecret);
+  return {
+    session: normalizeSignalRatchetSession({
+      rootKey: seeded.rootKey,
+      sendChainKey: seeded.chainKey,
+      receiveChainKey: "",
+      sendCount: 0,
+      receiveCount: 0,
+      previousSendCount: 0,
+      localRatchetPublicKey: await signalExportPublicKey(localRatchetKeyPair.publicKey),
+      localRatchetPrivateKeyJwk: await window.crypto.subtle.exportKey("jwk", localRatchetKeyPair.privateKey),
+      remoteRatchetPublicKey: recipientSignedPrekey.public_key,
+      pendingRatchet: false,
+      skippedKeys: {},
+    }, device),
+    initialSession: {
+      sender_ephemeral_public_key: x3dh.senderEphemeralPublicKey,
+      signed_prekey_id: recipientSignedPrekey.prekey_id,
+      one_time_prekey_id: Number(claimedBundle?.claimed_one_time_prekey?.prekey_id || 0) || undefined,
+    },
+  };
+}
+
+async function rotateSignalSendingRatchet(session) {
+  const localRatchetKeyPair = await signalGenerateAgreementKeyPair();
+  const localPrivateKey = localRatchetKeyPair.privateKey;
+  const remotePublicKey = await signalImportAgreementPublicKey(session.remoteRatchetPublicKey);
+  const sharedSecret = await signalDeriveSharedSecretBytes(localPrivateKey, remotePublicKey);
+  const next = await kdfRoot(session.rootKey, sharedSecret);
+  session.rootKey = next.rootKey;
+  session.sendChainKey = next.chainKey;
+  session.previousSendCount = Number(session.sendCount || 0);
+  session.sendCount = 0;
+  session.localRatchetPublicKey = await signalExportPublicKey(localRatchetKeyPair.publicKey);
+  session.localRatchetPrivateKeyJwk = await window.crypto.subtle.exportKey("jwk", localPrivateKey);
+  session.pendingRatchet = false;
+  return session;
+}
+
+async function advanceSignalSendingRatchet(device, bundle, claimedBundle = null) {
+  let session = getSignalRatchetSession(device, bundle.user_id, bundle.device_id);
+  let initialSession = null;
+  if (!session) {
+    const initialized = await initializeSignalOutboundSession(device, bundle, claimedBundle);
+    session = initialized.session;
+    initialSession = initialized.initialSession;
+  } else if (session.pendingRatchet || !session.sendChainKey) {
+    session = await rotateSignalSendingRatchet(session);
+  }
+  const step = await kdfChain(session.sendChainKey);
+  const header = {
+    ratchet_public_key: sanitizeText(session.localRatchetPublicKey, 4000),
+    previous_chain_length: Number(session.previousSendCount || 0),
+    message_number: Number(session.sendCount || 0),
+  };
+  if (initialSession) header.initial_session = initialSession;
+  session.sendChainKey = step.nextChainKey;
+  session.sendCount = Number(session.sendCount || 0) + 1;
+  return {
+    device: setSignalRatchetSession(device, bundle.user_id, bundle.device_id, session),
+    header,
+    messageKey: step.messageKey,
+  };
+}
+
+async function encryptConversationContent(thread, plainContent, innerContentType = CONTENT_TYPE_TEXT) {
+  const encryptionContext = await ensureEncryptedConversation(thread);
+  if (!encryptionContext?.device) return null;
+  let device = encryptionContext.device;
+  device = ensureTrustedRemoteBundles(device, encryptionContext.recipientBundles, { allowPrompt: true });
+  const signingPrivateKey = await signalImportSigningPrivateKey(device.signingPrivateKeyJwk);
+  const otherUserId = otherUserIdForThread(thread);
+  const remoteClaimedBundles = otherUserId ? await claimDeviceBundles(otherUserId).catch(() => []) : [];
+  const claimedByDevice = Object.fromEntries(
+    remoteClaimedBundles
+      .filter(signalBundleSupported)
+      .map((item) => [sanitizeText(item?.device_id, 80), item])
+  );
+  const contentKeyBytes = window.crypto.getRandomValues(new Uint8Array(32));
+  const contentNonce = window.crypto.getRandomValues(new Uint8Array(12));
+  const contentKey = await importAESKey(contentKeyBytes, ["encrypt"]);
+  const plaintext = new TextEncoder().encode(JSON.stringify({
+    content_type: sanitizeText(innerContentType, 40) || CONTENT_TYPE_TEXT,
+    body: plainContent,
+  }));
+  const ciphertext = await window.crypto.subtle.encrypt({ name: "AES-GCM", iv: contentNonce }, contentKey, plaintext);
+  const ciphertextB64 = bytesToBase64(ciphertext);
+  const nonceB64 = bytesToBase64(contentNonce);
+  const conversationEpoch = Number(thread.encryptionEpoch || 1);
+
+  const recipientEntries = [];
+  const recipients = [
+    ...encryptionContext.selfBundles.filter((item) => sanitizeText(item?.device_id, 80) !== sanitizeText(state.auth.deviceId, 80)),
+    ...encryptionContext.recipientBundles,
+  ];
+  for (const bundle of recipients) {
+    const peerAgreementKey = agreementKeyForBundle(bundle);
+    if (!peerAgreementKey) continue;
+    const wrapNonce = window.crypto.getRandomValues(new Uint8Array(12));
+    const claimedBundle = sanitizeText(bundle.user_id, 80) === sanitizeText(state.auth.userId, 80)
+      ? null
+      : claimedByDevice[sanitizeText(bundle.device_id, 80)] || null;
+    const advanced = await advanceSignalSendingRatchet(device, bundle, claimedBundle);
+    device = advanced.device;
+    const wrapKey = await importAESKey(base64ToBytes(advanced.messageKey), ["encrypt"]);
+    const wrappedKey = await window.crypto.subtle.encrypt({ name: "AES-GCM", iv: wrapNonce }, wrapKey, contentKeyBytes);
+    recipientEntries.push({
+      user_id: sanitizeText(bundle.user_id, 80),
+      device_id: sanitizeText(bundle.device_id, 80),
+      wrapped_key: bytesToBase64(wrappedKey),
+      wrap_nonce: bytesToBase64(wrapNonce),
+      ratchet_public_key: advanced.header.ratchet_public_key,
+      previous_chain_length: advanced.header.previous_chain_length,
+      message_number: advanced.header.message_number,
+      ...(advanced.header.initial_session ? { initial_session: advanced.header.initial_session } : {}),
+    });
+  }
+  const selfPrivateKey = await signalImportAgreementPrivateKey(device.agreementPrivateKeyJwk);
+  const selfPublicKey = await signalImportAgreementPublicKey(device.agreementPublicKey);
+  const selfWrapKey = await signalDeriveWrapKey(selfPrivateKey, selfPublicKey);
+  const selfWrapNonce = window.crypto.getRandomValues(new Uint8Array(12));
+  const selfWrappedKey = await window.crypto.subtle.encrypt({ name: "AES-GCM", iv: selfWrapNonce }, selfWrapKey, contentKeyBytes);
+  recipientEntries.push({
+    user_id: sanitizeText(state.auth.userId, 80),
+    device_id: sanitizeText(state.auth.deviceId, 80),
+    wrapped_key: bytesToBase64(selfWrappedKey),
+    wrap_nonce: bytesToBase64(selfWrapNonce),
+  });
+
+  const senderSignature = await signalSignDetached(signingPrivateKey, ratchetSignaturePayloadForEnvelope({
+    scheme: ENCRYPTION_SCHEME,
+    conversationEpoch,
+    nonce: nonceB64,
+    ciphertext: ciphertextB64,
+    recipients: recipientEntries,
+  }));
+
+  return {
+    ciphertext: ciphertextB64,
+    nonce: nonceB64,
+    encryption: {
+      scheme: ENCRYPTION_SCHEME,
+      sender_device_id: sanitizeText(state.auth.deviceId, 80),
+      sender_user_id: sanitizeText(state.auth.userId, 80),
+      sender_signature: senderSignature,
+      signature_alg: "Ed25519",
+      sender_identity_public_key: device.agreementPublicKey,
+      conversation_epoch: conversationEpoch,
+      recipients: recipientEntries,
+    },
+  };
+}
+
+async function decryptConversationContent(message) {
+  if (sanitizeText(message?.contentType, 40) !== CONTENT_TYPE_ENCRYPTED) return message;
+  const envelope = message.content && typeof message.content === "object" ? message.content : {};
+  const encryption = envelope.encryption && typeof envelope.encryption === "object" ? envelope.encryption : {};
+  const recipients = Array.isArray(encryption.recipients) ? encryption.recipients : [];
+  const recipient = recipients.find((item) => sanitizeText(item?.device_id, 80) === sanitizeText(state.auth?.deviceId, 80));
+  if (!recipient) {
+    return {
+      ...message,
+      text: "[Encrypted message for another device]",
+      content: { text: "[Encrypted message for another device]" },
+      isEncrypted: true,
+    };
+  }
+
+  try {
+    let device = await ensureCryptoDeviceState();
+    const scheme = sanitizeText(encryption.scheme || ENCRYPTION_SCHEME, 120);
+    if (scheme === LEGACY_ENCRYPTION_SCHEME) {
+      if (!device.legacyAgreementPrivateKeyJwk) throw new Error("Missing legacy key material");
+      const legacyDevice = {
+        agreementPrivateKeyJwk: device.legacyAgreementPrivateKeyJwk,
+        ratchetSessions: device.legacyRatchetSessions || {},
+      };
+      const legacyAgreementPrivateKey = await importECDHPrivateKey(legacyDevice.agreementPrivateKeyJwk);
+      let wrapKey;
+      const ratchetPublicKey = sanitizeText(recipient.ratchet_public_key, 4000);
+      if (ratchetPublicKey) {
+        const senderUserId = sanitizeText(encryption.sender_user_id, 80);
+        const senderDeviceId = sanitizeText(encryption.sender_device_id, 80);
+        const senderBundles = await fetchDeviceBundles(senderUserId, true);
+        const senderBundle = senderBundles.find((item) => sanitizeText(item?.device_id, 80) === senderDeviceId) || {};
+        const signingPublicKeyValue = sanitizeText(senderBundle?.signing_public_key, 4000);
+        if (signingPublicKeyValue) {
+          try {
+            const signingPublicKey = await importECDSAPublicKey(signingPublicKeyValue);
+            const valid = await verifyDetached(
+              signingPublicKey,
+              ratchetSignaturePayloadForEnvelope({
+                scheme,
+                conversationEpoch: Number(encryption.conversation_epoch || 1),
+                nonce: String(envelope.nonce || ""),
+                ciphertext: String(envelope.ciphertext || ""),
+                recipients,
+              }),
+              sanitizeText(encryption.sender_signature, 8000)
+            );
+            if (!valid) throw new Error("Invalid legacy sender signature");
+          } catch {
+            // Best-effort compatibility: proceed if legacy sender signing bundle is no longer available.
+          }
+        }
+        let session = getRatchetSession(legacyDevice, senderUserId, senderDeviceId) || normalizeRatchetSession(null, legacyDevice);
+        let messageKey = takeSkippedMessageKey(session, ratchetPublicKey, Number(recipient.message_number || 0));
+        if (!messageKey) {
+          if (session.remoteRatchetPublicKey !== ratchetPublicKey || !session.receiveChainKey) {
+            const initialInbound = !session.receiveChainKey;
+            const localPrivateKey = await importECDHPrivateKey(
+              initialInbound ? legacyDevice.agreementPrivateKeyJwk : (session.localRatchetPrivateKeyJwk || legacyDevice.agreementPrivateKeyJwk)
+            );
+            const remotePublicKey = await importECDHPublicKey(ratchetPublicKey);
+            const sharedSecret = await deriveSharedSecretBytes(localPrivateKey, remotePublicKey);
+            let rootBase = session.rootKey;
+            if (initialInbound) {
+              const senderAgreementPublicKey = await importECDHPublicKey(sanitizeText(encryption.sender_identity_public_key, 4000));
+              const handshakeSharedSecret = await deriveSharedSecretBytes(legacyAgreementPrivateKey, senderAgreementPublicKey);
+              const handshake = await kdfRoot("", handshakeSharedSecret);
+              rootBase = handshake.rootKey;
+            }
+            const next = await kdfRoot(rootBase, sharedSecret);
+            session.rootKey = next.rootKey;
+            session.receiveChainKey = next.chainKey;
+            session.receiveCount = 0;
+            session.remoteRatchetPublicKey = ratchetPublicKey;
+            session.pendingRatchet = true;
+          }
+          const targetNumber = Number(recipient.message_number || 0);
+          while (Number(session.receiveCount || 0) < targetNumber) {
+            const skipped = await kdfChain(session.receiveChainKey);
+            stashSkippedMessageKey(session, ratchetPublicKey, session.receiveCount, skipped.messageKey);
+            session.receiveChainKey = skipped.nextChainKey;
+            session.receiveCount = Number(session.receiveCount || 0) + 1;
+          }
+          const current = await kdfChain(session.receiveChainKey);
+          messageKey = current.messageKey;
+          session.receiveChainKey = current.nextChainKey;
+          session.receiveCount = Number(session.receiveCount || 0) + 1;
+        }
+        device = persistCryptoDeviceState({
+          ...device,
+          legacyRatchetSessions: {
+            ...(device.legacyRatchetSessions || {}),
+            ...legacyDevice.ratchetSessions,
+            [ratchetSessionId(senderUserId, senderDeviceId)]: session,
+          },
+        });
+        wrapKey = await importAESKey(base64ToBytes(messageKey), ["decrypt"]);
+      } else {
+        const peerPublicKey = await importECDHPublicKey(sanitizeText(encryption.sender_identity_public_key, 4000));
+        wrapKey = await deriveWrapKey(legacyAgreementPrivateKey, peerPublicKey);
+      }
+      const contentKeyRaw = await window.crypto.subtle.decrypt(
+        { name: "AES-GCM", iv: base64ToBytes(recipient.wrap_nonce) },
+        wrapKey,
+        base64ToBytes(recipient.wrapped_key)
+      );
+      const contentKey = await importAESKey(new Uint8Array(contentKeyRaw), ["decrypt"]);
+      const plaintext = await window.crypto.subtle.decrypt(
+        { name: "AES-GCM", iv: base64ToBytes(envelope.nonce) },
+        contentKey,
+        base64ToBytes(envelope.ciphertext)
+      );
+      const decoded = JSON.parse(new TextDecoder().decode(plaintext));
+      const innerContentType = sanitizeText(decoded?.content_type, 40) || CONTENT_TYPE_TEXT;
+      const innerContent = decoded && typeof decoded.body === "object" ? decoded.body : decoded?.body || decoded || {};
+      return {
+        ...message,
+        text: sanitizeText(innerContent?.text || "[Legacy encrypted message]", 1000),
+        contentType: innerContentType,
+        content: innerContent && typeof innerContent === "object" ? innerContent : { text: sanitizeText(innerContent, 1000) },
+        isEncrypted: true,
+      };
+    }
+
+    const agreementPrivateKey = await signalImportAgreementPrivateKey(device.agreementPrivateKeyJwk);
+    let wrapKey;
+    const ratchetPublicKey = sanitizeText(recipient.ratchet_public_key, 4000);
+    if (ratchetPublicKey && sanitizeText(encryption.sender_signature, 8000)) {
+      const senderUserId = sanitizeText(encryption.sender_user_id, 80);
+      const senderDeviceId = sanitizeText(encryption.sender_device_id, 80);
+      const senderBundles = await fetchDeviceBundles(senderUserId, true);
+      const senderBundle = senderBundles.find((item) => sanitizeText(item?.device_id, 80) === senderDeviceId);
+      const signingPublicKeyValue = sanitizeText(senderBundle?.signing_public_key, 4000);
+      if (!signingPublicKeyValue) throw new Error("Missing sender signing key");
+      const signingPublicKey = await signalImportSigningPublicKey(signingPublicKeyValue);
+      const valid = await signalVerifyDetached(
+        signingPublicKey,
+        ratchetSignaturePayloadForEnvelope({
+          scheme,
+          conversationEpoch: Number(encryption.conversation_epoch || 1),
+          nonce: String(envelope.nonce || ""),
+          ciphertext: String(envelope.ciphertext || ""),
+          recipients,
+        }),
+        sanitizeText(encryption.sender_signature, 8000)
+      );
+      if (!valid) throw new Error("Invalid sender signature");
+
+      let session = getSignalRatchetSession(device, senderUserId, senderDeviceId) || normalizeSignalRatchetSession(null, device);
+      let messageKey = takeSkippedMessageKey(session, ratchetPublicKey, Number(recipient.message_number || 0));
+      if (!messageKey) {
+        if (session.remoteRatchetPublicKey !== ratchetPublicKey || !session.receiveChainKey) {
+          const initialSession = recipient.initial_session && typeof recipient.initial_session === "object" ? recipient.initial_session : null;
+          let localPrivateKey;
+          let rootBase = session.rootKey;
+          if (!session.receiveChainKey && initialSession?.sender_ephemeral_public_key) {
+            const senderIdentityPublicKey = await signalImportAgreementPublicKey(sanitizeText(encryption.sender_identity_public_key, 4000));
+            const senderEphemeralPublicKey = await signalImportAgreementPublicKey(sanitizeText(initialSession.sender_ephemeral_public_key, 4000));
+            const signedPrekeyPrivateKey = await signalImportAgreementPrivateKey(device.signedPrekeyPrivateKeyJwk);
+            const segments = [
+              await signalDeriveSharedSecretBytes(signedPrekeyPrivateKey, senderIdentityPublicKey),
+              await signalDeriveSharedSecretBytes(agreementPrivateKey, senderEphemeralPublicKey),
+              await signalDeriveSharedSecretBytes(signedPrekeyPrivateKey, senderEphemeralPublicKey),
+            ];
+            const oneTimePrekeyId = String(Number(initialSession.one_time_prekey_id || 0));
+            if (oneTimePrekeyId && device.oneTimePrekeys?.[oneTimePrekeyId]?.private_key_jwk) {
+              const oneTimePrivateKey = await signalImportAgreementPrivateKey(device.oneTimePrekeys[oneTimePrekeyId].private_key_jwk);
+              segments.push(await signalDeriveSharedSecretBytes(oneTimePrivateKey, senderEphemeralPublicKey));
+              device = persistCryptoDeviceState({
+                ...device,
+                oneTimePrekeys: {
+                  ...(device.oneTimePrekeys || {}),
+                  [oneTimePrekeyId]: {
+                    ...(device.oneTimePrekeys?.[oneTimePrekeyId] || {}),
+                    consumed_at: nowISO(),
+                  },
+                },
+              });
+            }
+            const rootMaterial = await hkdfExpand(concatBytes(...segments), new Uint8Array(32), "OHMF_SIGNAL_X3DH_V1", 32);
+            rootBase = bytesToBase64(rootMaterial);
+            localPrivateKey = signedPrekeyPrivateKey;
+          } else {
+            localPrivateKey = await signalImportAgreementPrivateKey(session.localRatchetPrivateKeyJwk || device.signedPrekeyPrivateKeyJwk);
+          }
+          const remotePublicKey = await signalImportAgreementPublicKey(ratchetPublicKey);
+          const sharedSecret = await signalDeriveSharedSecretBytes(localPrivateKey, remotePublicKey);
+          const next = await kdfRoot(rootBase, sharedSecret);
+          session.rootKey = next.rootKey;
+          session.receiveChainKey = next.chainKey;
+          session.receiveCount = 0;
+          session.remoteRatchetPublicKey = ratchetPublicKey;
+          session.pendingRatchet = true;
+        }
+        const targetNumber = Number(recipient.message_number || 0);
+        if (targetNumber < Number(session.receiveCount || 0)) {
+          throw new Error("Missing skipped message key");
+        }
+        while (Number(session.receiveCount || 0) < targetNumber) {
+          const skipped = await kdfChain(session.receiveChainKey);
+          stashSkippedMessageKey(session, ratchetPublicKey, session.receiveCount, skipped.messageKey);
+          session.receiveChainKey = skipped.nextChainKey;
+          session.receiveCount = Number(session.receiveCount || 0) + 1;
+        }
+        const current = await kdfChain(session.receiveChainKey);
+        messageKey = current.messageKey;
+        session.receiveChainKey = current.nextChainKey;
+        session.receiveCount = Number(session.receiveCount || 0) + 1;
+      }
+      device = setSignalRatchetSession(device, senderUserId, senderDeviceId, session);
+      wrapKey = await importAESKey(base64ToBytes(messageKey), ["decrypt"]);
+    } else {
+      const peerPublicKey = await signalImportAgreementPublicKey(device.agreementPublicKey);
+      wrapKey = await signalDeriveWrapKey(agreementPrivateKey, peerPublicKey);
+    }
+    const contentKeyRaw = await window.crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: base64ToBytes(recipient.wrap_nonce) },
+      wrapKey,
+      base64ToBytes(recipient.wrapped_key)
+    );
+    const contentKey = await importAESKey(new Uint8Array(contentKeyRaw), ["decrypt"]);
+    const plaintext = await window.crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: base64ToBytes(envelope.nonce) },
+      contentKey,
+      base64ToBytes(envelope.ciphertext)
+    );
+    const decoded = JSON.parse(new TextDecoder().decode(plaintext));
+    const innerContentType = sanitizeText(decoded?.content_type, 40)
+      || (decoded?.body && typeof decoded.body === "object" && decoded.body?.attachment_id ? CONTENT_TYPE_ATTACHMENT : "")
+      || (decoded && typeof decoded === "object" && decoded?.attachment_id ? CONTENT_TYPE_ATTACHMENT : "")
+      || CONTENT_TYPE_TEXT;
+    const innerContent = decoded && typeof decoded.body === "object"
+      ? decoded.body
+      : decoded?.body !== undefined
+      ? decoded.body
+      : decoded && typeof decoded === "object"
+      ? decoded
+      : { text: sanitizeText(decoded, 1000) };
+    const fallbackText = innerContentType === CONTENT_TYPE_ATTACHMENT
+      ? sanitizeText(innerContent?.file_name || innerContent?.attachment_id || "Attachment", 1000)
+      : sanitizeText(innerContent?.text || "[Encrypted message]", 1000);
+    return {
+      ...message,
+      text: fallbackText,
+      contentType: innerContentType,
+      content: innerContent && typeof innerContent === "object" ? innerContent : { text: sanitizeText(innerContent, 1000) },
+      isEncrypted: true,
+    };
+  } catch (error) {
+    console.error(error);
+    return {
+      ...message,
+      text: "[Unable to decrypt message]",
+      content: { text: "[Unable to decrypt message]" },
+      isEncrypted: true,
+    };
+  }
+}
+
 function saveConversationStore() {
   if (!state.auth?.userId) return;
   window.localStorage.setItem(
@@ -234,12 +1669,19 @@ function loadConversationStore() {
     state.threads = parsed.threads.map((thread) => ({
       id: sanitizeText(thread.id, 80),
       kind: sanitizeText(thread.kind, 24) || "dm",
+      serverTitle: sanitizeText(thread.serverTitle, 80),
       title: sanitizeText(thread.title, 80) || "Conversation",
       subtitle: sanitizeText(thread.subtitle, 120),
       nickname: sanitizeText(thread.nickname, 80),
+      encryptionState: sanitizeText(thread.encryptionState, 40),
+      encryptionEpoch: Number(thread.encryptionEpoch || 1),
+      blockedByViewer: Boolean(thread.blockedByViewer),
+      blockedByOther: Boolean(thread.blockedByOther),
       updatedAt: thread.updatedAt || nowISO(),
-      blocked: Boolean(thread.blocked),
+      blocked: Boolean(thread.blockedByViewer) || Boolean(thread.blockedByOther) || Boolean(thread.blocked),
       closed: Boolean(thread.closed),
+      previewText: sanitizeText(thread.previewText, 180),
+      unreadCount: Number(thread.unreadCount || 0),
       externalPhones: Array.isArray(thread.externalPhones) ? thread.externalPhones.map((p) => sanitizeText(p, 32)) : [],
       participants: Array.isArray(thread.participants) ? thread.participants.map((p) => sanitizeText(p, 80)) : [],
       messages: Array.isArray(thread.messages)
@@ -262,6 +1704,68 @@ function loadConversationStore() {
 function setAuthStatus(message, isError = false) {
   el.authStatus.textContent = sanitizeText(message, 200);
   el.authStatus.classList.toggle("error", Boolean(isError));
+}
+
+function syncAuthHint() {
+  if (!el.authHint) return;
+  el.authHint.innerHTML = "";
+  const text = document.createTextNode("Choose your country code and enter your number.");
+  el.authHint.appendChild(text);
+  if (!window.OHMF_WEB_CONFIG?.use_real_otp_provider) {
+    el.authHint.appendChild(document.createTextNode(" In local dev, OTP is "));
+    const code = document.createElement("code");
+    code.textContent = "123456";
+    el.authHint.appendChild(code);
+    el.authHint.appendChild(document.createTextNode("."));
+  }
+}
+
+function base64URLToUint8Array(value) {
+  const normalized = String(value || "").replace(/-/g, "+").replace(/_/g, "/");
+  const padded = normalized + "=".repeat((4 - (normalized.length % 4 || 4)) % 4);
+  const raw = window.atob(padded);
+  const output = new Uint8Array(raw.length);
+  for (let index = 0; index < raw.length; index += 1) output[index] = raw.charCodeAt(index);
+  return output;
+}
+
+async function ensureCurrentDeviceId() {
+  if (state.auth?.deviceId) return state.auth.deviceId;
+  const payload = await apiRequest("/v1/devices");
+  const webDevice = (payload?.devices || []).find((device) => sanitizeText(device.platform, 24).toUpperCase() === "WEB");
+  if (webDevice?.device_id) {
+    authStoreSet({ ...state.auth, deviceId: sanitizeText(webDevice.device_id, 80) });
+    return state.auth.deviceId;
+  }
+  return "";
+}
+
+async function registerServiceWorkerAndPush() {
+  if (!state.auth || !window.OHMF_WEB_CONFIG?.web_push_enabled) return;
+  if (!("serviceWorker" in navigator) || !("PushManager" in window)) return;
+  const vapidKey = sanitizeText(window.OHMF_WEB_CONFIG?.web_push_vapid_public_key, 400);
+  if (!vapidKey) return;
+  const registration = await navigator.serviceWorker.register("./sw.js");
+  const permission = await Notification.requestPermission();
+  if (permission !== "granted") return;
+  let subscription = await registration.pushManager.getSubscription();
+  if (!subscription) {
+    subscription = await registration.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: base64URLToUint8Array(vapidKey),
+    });
+  }
+  const deviceId = await ensureCurrentDeviceId();
+  if (!deviceId) return;
+  await apiRequest(`/v1/devices/${encodeURIComponent(deviceId)}`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      platform: "WEB",
+      push_provider: "WEBPUSH",
+      push_subscription: JSON.stringify(subscription),
+      capabilities: ["MINI_APPS", "WEB_PUSH_V1"],
+    }),
+  });
 }
 
 async function apiRequest(path, options = {}, allowRetry = true) {
@@ -330,6 +1834,32 @@ async function refreshAuthTokens() {
 
 function cloneJson(value) {
   return value === undefined ? null : JSON.parse(JSON.stringify(value));
+}
+
+function decodeJWTPayload(token) {
+  const raw = sanitizeText(token, 4000);
+  if (!raw || !raw.includes(".")) return null;
+  try {
+    const payload = raw.split(".")[1];
+    const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized + "=".repeat((4 - (normalized.length % 4 || 4)) % 4);
+    return JSON.parse(window.atob(padded));
+  } catch {
+    return null;
+  }
+}
+
+function accessTokenExpiresSoon(skewSec = 60) {
+  const payload = decodeJWTPayload(state.auth?.accessToken || "");
+  const exp = Number(payload?.exp || 0);
+  if (!exp) return false;
+  return exp <= Math.floor(Date.now() / 1000) + skewSec;
+}
+
+async function ensureFreshAccessToken(force = false) {
+  if (!state.auth?.refreshToken) return false;
+  if (!force && !accessTokenExpiresSoon()) return true;
+  return Boolean(await refreshAuthTokens());
 }
 
 function randomId(prefix) {
@@ -424,7 +1954,7 @@ function buildMiniappParticipants(thread) {
   const participants = [{ ...viewer }];
   for (const id of ids) {
     if (!id || id === viewer.user_id) continue;
-    participants.push({ user_id: id, role: "PLAYER", display_name: `User ${id.slice(0, 8)}` });
+    participants.push({ user_id: id, role: "PLAYER", display_name: displayNameForUser(id) || `User ${id.slice(0, 8)}` });
   }
   if (participants.length === 1 && thread?.externalPhones?.[0]) {
     participants.push({ user_id: `phone:${thread.externalPhones[0]}`, role: "PLAYER", display_name: thread.externalPhones[0] });
@@ -554,8 +2084,8 @@ async function shareMiniappToConversation() {
     upsertThreadMessage(thread.id, mapMessage(payload.message));
   }
   applyMiniappSessionRecord(payload, manifest);
+  closeMiniappLauncher();
   renderAll();
-  await openEmbeddedMiniapp();
 }
 
 async function openMiniappCard(message) {
@@ -563,8 +2093,8 @@ async function openMiniappCard(message) {
   if (!sessionId) return;
   state.miniapp.drawerOpen = true;
   const record = await fetchMiniappSession(sessionId);
-  renderMiniappLauncher();
-  if (record?.joinable !== false && !state.miniapp.consentRequired) {
+  renderAll();
+  if (record?.joinable !== false) {
     await openEmbeddedMiniapp();
   }
 }
@@ -698,33 +2228,67 @@ function sendMiniappBridgeResponse(targetWindow, requestId, ok, result, error) {
   );
 }
 
+function profileForUser(userId) {
+  return state.profiles[sanitizeText(userId, 80)] || null;
+}
+
+function displayNameForUser(userId) {
+  const profile = profileForUser(userId);
+  return sanitizeText(profile?.display_name || profile?.primary_phone_e164 || "", 80);
+}
+
 function pickTitle(conversation) {
   if (conversation.nickname) return conversation.nickname;
+  if (sanitizeText(conversation.serverTitle, 80)) return sanitizeText(conversation.serverTitle, 80);
   if (conversation.externalPhones?.length) return conversation.externalPhones[0];
   const others = (conversation.participants || []).filter((id) => id !== state.auth?.userId);
-  return others.length ? `User ${others[0].slice(0, 8)}` : `Conversation ${conversation.id.slice(0, 8)}`;
+  if (others.length === 0) return `Conversation ${conversation.id.slice(0, 8)}`;
+  if (conversation.kind === "group") {
+    const labels = others.map((id) => displayNameForUser(id) || `User ${id.slice(0, 8)}`).slice(0, 3);
+    return labels.join(", ");
+  }
+  return displayNameForUser(others[0]) || `User ${others[0].slice(0, 8)}`;
 }
 
 function pickSubtitle(conversation) {
-  if (conversation.blocked) return "Blocked";
+  if (conversation.blockedByViewer) return "Blocked by you";
+  if (conversation.blockedByOther) return "Blocked";
   if (conversation.kind === "phone") return "Phone conversation (OTT preferred)";
+  if (sanitizeText(conversation.encryptionState, 40) === "ENCRYPTED") return "Encrypted conversation";
+  if (conversation.kind === "group") {
+    const total = Array.isArray(conversation.participants) ? conversation.participants.length : 0;
+    return total <= 1 ? "Only you" : `${total} participants`;
+  }
   const others = (conversation.participants || []).filter((id) => id !== state.auth?.userId).length;
   return others <= 0 ? "Only you" : `${others} participant${others > 1 ? "s" : ""}`;
 }
 
 function mapConversation(item) {
-  const kind = item.type === "PHONE_DM" || (Array.isArray(item.external_phones) && item.external_phones.length > 0) ? "phone" : "dm";
+  const kind = item.type === "PHONE_DM" || (Array.isArray(item.external_phones) && item.external_phones.length > 0)
+    ? "phone"
+    : item.type === "GROUP"
+    ? "group"
+    : "dm";
+  const blockedByViewer = Boolean(item.blocked_by_viewer);
+  const blockedByOther = Boolean(item.blocked_by_other);
   const thread = {
     id: sanitizeText(item.conversation_id, 80),
     kind,
+    serverTitle: sanitizeText(item.title, 80),
     title: "",
     subtitle: "",
-    nickname: "",
+    nickname: sanitizeText(item.nickname, 80),
+    encryptionState: sanitizeText(item.encryption_state, 40),
+    encryptionEpoch: Number(item.encryption_epoch || 1),
     updatedAt: item.updated_at || nowISO(),
-    blocked: false,
-    closed: false,
+    blockedByViewer,
+    blockedByOther,
+    blocked: blockedByViewer || blockedByOther || Boolean(item.blocked),
+    closed: Boolean(item.closed),
     participants: Array.isArray(item.participants) ? item.participants.map((v) => sanitizeText(v, 80)) : [],
     externalPhones: Array.isArray(item.external_phones) ? item.external_phones.map((v) => sanitizeText(v, 32)) : [],
+    previewText: sanitizeText(item.last_message_preview, 180),
+    unreadCount: Number(item.unread_count || 0),
     messages: [],
     loadedMessages: false,
   };
@@ -741,11 +2305,17 @@ function mapMessage(item) {
   );
   const contentType = sanitizeText(item?.content_type, 40) || CONTENT_TYPE_TEXT;
   const content = item?.content && typeof item.content === "object" ? item.content : {};
-  const fallbackText = contentType === CONTENT_TYPE_APP_CARD
+  const deleted = Boolean(item?.deleted) || Boolean(item?.deleted_at) || sanitizeText(item?.visibility_state, 40) === "SOFT_DELETED";
+  const fallbackText = deleted
+    ? "Message deleted"
+    : contentType === CONTENT_TYPE_APP_CARD
     ? sanitizeText(content.title || "Shared app", 1000)
+    : contentType === CONTENT_TYPE_ATTACHMENT
+    ? sanitizeText(content.file_name || content.attachment_id || "Attachment", 1000)
     : sanitizeText(item?.content?.text || JSON.stringify(content || {}), 1000);
   return {
     id: sanitizeText(item?.message_id, 80),
+    senderUserId: sanitizeText(item?.sender_user_id, 80),
     direction: item.sender_user_id === state.auth?.userId ? "out" : "in",
     text: fallbackText,
     createdAt: item.created_at || nowISO(),
@@ -754,18 +2324,59 @@ function mapMessage(item) {
     readAt: item.read_at || "",
     serverOrder: Number(item.server_order || 0),
     status,
-    statusUpdatedAt: item.status_updated_at || item.read_at || item.delivered_at || item.sent_at || item.created_at || nowISO(),
+    statusUpdatedAt: item.status_updated_at || item.deleted_at || item.read_at || item.delivered_at || item.sent_at || item.created_at || nowISO(),
     transport,
-    reactions: {},
-    editedAt: "",
-    deleted: false,
+    reactions: normalizeReactionCounts(item?.reactions),
+    editedAt: item.edited_at || "",
+    deleted,
+    deletedAt: item.deleted_at || "",
     contentType,
     content,
   };
 }
 
+async function materializeMessage(item) {
+  const mapped = mapMessage(item);
+  if (mapped.contentType !== CONTENT_TYPE_ENCRYPTED) return mapped;
+  return decryptConversationContent(mapped);
+}
+
+function applyMessageReactions(payload) {
+  const conversationId = sanitizeText(payload?.conversation_id, 80);
+  const messageId = sanitizeText(payload?.message_id, 80);
+  if (!conversationId || !messageId) return;
+  const thread = getThreadById(conversationId);
+  if (!thread) return;
+  const reactions = normalizeReactionCounts(payload?.reactions);
+  let found = false;
+  const nextMessages = (thread.messages || []).map((message) => {
+    if (message.id !== messageId) return message;
+    found = true;
+    return {
+      ...message,
+      reactions,
+      statusUpdatedAt: payload?.acted_at || message.statusUpdatedAt || nowISO(),
+    };
+  });
+  upsertThread({
+    ...thread,
+    messages: nextMessages,
+    updatedAt: payload?.acted_at || thread.updatedAt,
+  });
+  saveConversationStore();
+  if (!found && thread.loadedMessages && state.activeThreadId === conversationId) {
+    void loadMessagesForThread(conversationId).catch((error) => {
+      console.error(error);
+    });
+  }
+}
+
 function isAppCardMessage(message) {
   return sanitizeText(message?.contentType, 40) === CONTENT_TYPE_APP_CARD;
+}
+
+function isAttachmentMessage(message) {
+  return sanitizeText(message?.contentType, 40) === CONTENT_TYPE_ATTACHMENT;
 }
 
 function upsertThreadMessage(threadId, nextMessage) {
@@ -774,7 +2385,14 @@ function upsertThreadMessage(threadId, nextMessage) {
   const nextMessages = [...(thread.messages || []).filter((message) => message.id !== nextMessage.id), nextMessage].sort(
     (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
   );
-  upsertThread({ ...thread, messages: nextMessages, updatedAt: nextMessage.createdAt || nowISO() });
+  const isUnreadIncoming = nextMessage.direction === "in" && state.activeThreadId !== threadId;
+  upsertThread({
+    ...thread,
+    messages: nextMessages,
+    updatedAt: nextMessage.createdAt || nowISO(),
+    previewText: nextMessage.deleted ? "Message deleted" : nextMessage.text,
+    unreadCount: isUnreadIncoming ? Number(thread.unreadCount || 0) + 1 : Number(thread.unreadCount || 0),
+  });
   saveConversationStore();
 }
 
@@ -833,13 +2451,92 @@ function getActiveThread() {
   return getThreadById(state.activeThreadId);
 }
 
+function getMessageById(threadId, messageId) {
+  const thread = getThreadById(threadId);
+  if (!thread) return null;
+  return (thread.messages || []).find((message) => message.id === messageId) || null;
+}
+
+function replyAuthorLabel(thread, message) {
+  if (message?.direction === "out") return "you";
+  return sanitizeText(thread?.title || "this message", 60);
+}
+
+function toggleMessageMenu(threadId, messageId) {
+  if (
+    state.openMessageMenu &&
+    state.openMessageMenu.threadId === threadId &&
+    state.openMessageMenu.messageId === messageId
+  ) {
+    state.openMessageMenu = null;
+  } else {
+    state.openMessageMenu = { threadId, messageId };
+  }
+  renderMessages();
+}
+
+function clearMessageMenu(shouldRender = true) {
+  if (!state.openMessageMenu) return;
+  state.openMessageMenu = null;
+  if (shouldRender) renderMessages();
+}
+
+function setReplyTarget(thread, message) {
+  state.replyTarget = {
+    threadId: thread.id,
+    messageId: message.id,
+    label: replyAuthorLabel(thread, message),
+    snippet: messageSnippet(message),
+    reference: buildReplyReference(thread, message),
+  };
+  state.openMessageMenu = null;
+  renderMessages();
+  el.composerInput.focus();
+}
+
+function clearReplyTarget(shouldRender = true) {
+  if (!state.replyTarget) return;
+  state.replyTarget = null;
+  if (shouldRender) renderMessages();
+}
+
+function composerMessageContent(rawText) {
+  const text = sanitizeText(rawText, 1000);
+  if (!text) return null;
+  const content = { text };
+  const activeThread = getActiveThread();
+  const replyTarget = state.replyTarget;
+  if (!activeThread || !replyTarget || replyTarget.threadId !== activeThread.id) return content;
+  const replyReference = normalizeReplyReference(replyTarget.reference);
+  if (replyReference) content.reply_to = {
+    message_id: replyReference.messageId,
+    sender_user_id: replyReference.senderUserId,
+    content_type: replyReference.contentType,
+    text: replyReference.text,
+  };
+  return content;
+}
+
+function renderComposerReply(thread) {
+  if (!thread || !state.replyTarget || state.replyTarget.threadId !== thread.id) {
+    state.replyTarget = null;
+    el.composerReply.classList.add("hidden");
+    el.composerReplyLabel.textContent = "Replying";
+    el.composerReplyText.textContent = "";
+    return;
+  }
+  el.composerReplyLabel.textContent = `Replying to ${state.replyTarget.label}`;
+  el.composerReplyText.textContent = state.replyTarget.snippet;
+  el.composerReply.classList.remove("hidden");
+}
+
 function visibleThreads() {
   const q = sanitizeText(state.query, 120).toLowerCase();
   return [...state.threads]
     .filter((thread) => !thread.closed)
     .filter((thread) => {
       if (!q) return true;
-      const combined = `${thread.title} ${thread.subtitle} ${(thread.messages || []).map((m) => m.text).join(" ")}`.toLowerCase();
+      const combined = `${thread.title} ${thread.subtitle} ${thread.previewText || ""} ${(thread.messages || []).map((m) => m.text).join(" ")}`.toLowerCase();
       return combined.includes(q);
     })
     .sort(threadSort);
@@ -854,20 +2551,127 @@ function upsertThread(thread) {
   state.threads.sort(threadSort);
 }
 
+function setRemoteTyping(conversationId, userId, active) {
+  if (!conversationId || !userId || userId === state.auth?.userId) return;
+  const next = { ...(state.remoteTypingByThread[conversationId] || {}) };
+  if (active) next[userId] = nowISO();
+  else delete next[userId];
+  if (Object.keys(next).length === 0) delete state.remoteTypingByThread[conversationId];
+  else state.remoteTypingByThread[conversationId] = next;
+}
+
+function remoteTypingUsers(threadId) {
+  return Object.keys(state.remoteTypingByThread[threadId] || {}).filter((userId) => userId !== state.auth?.userId);
+}
+
+function typingIndicatorText(threadId) {
+  const thread = getThreadById(threadId);
+  const users = remoteTypingUsers(threadId);
+  if (!thread || users.length === 0) return "";
+  if (users.length === 1) {
+    if (thread.kind === "dm" || thread.kind === "phone") return `${thread.title} is typing...`;
+    return "Someone is typing...";
+  }
+  return `${users.length} people are typing...`;
+}
+
+function sendTypingEvent(eventName, conversationId) {
+  if (!conversationId || !realtimeSocket || realtimeSocket.readyState !== window.WebSocket.OPEN) return;
+  realtimeSocket.send(JSON.stringify({
+    event: eventName,
+    data: { conversation_id: conversationId },
+  }));
+}
+
+function stopLocalTyping() {
+  if (typingStopTimer) {
+    window.clearTimeout(typingStopTimer);
+    typingStopTimer = 0;
+  }
+  if (localTypingSent && localTypingThreadId) {
+    sendTypingEvent("typing.stopped", localTypingThreadId);
+  }
+  localTypingSent = false;
+  localTypingThreadId = "";
+}
+
+function syncLocalTypingSignal() {
+  const thread = getActiveThread();
+  const conversationId = thread?.id || "";
+  const text = sanitizeText(el.composerInput?.value || "", 1000);
+  const canSignal = Boolean(thread && !thread.blocked && thread.kind !== "draft_phone" && text);
+  if (!canSignal) {
+    stopLocalTyping();
+    return;
+  }
+  if (localTypingSent && localTypingThreadId && localTypingThreadId !== conversationId) {
+    sendTypingEvent("typing.stopped", localTypingThreadId);
+    localTypingSent = false;
+  }
+  if (!localTypingSent || localTypingThreadId !== conversationId) {
+    sendTypingEvent("typing.started", conversationId);
+    localTypingSent = true;
+    localTypingThreadId = conversationId;
+  }
+  if (typingStopTimer) window.clearTimeout(typingStopTimer);
+  typingStopTimer = window.setTimeout(() => {
+    stopLocalTyping();
+  }, 3000);
+}
+
 async function loadConversationsFromApi() {
-  const payload = await apiRequest("/v1/conversations", { method: "GET" });
+  const payload = await apiRequest("/v2/conversations", { method: "GET" });
   const items = Array.isArray(payload?.items) ? payload.items : [];
+  await resolveProfilesForUsers(items.flatMap((item) => Array.isArray(item.participants) ? item.participants : []));
   for (const item of items) {
     const mapped = mapConversation(item);
     const existing = getThreadById(mapped.id);
     if (existing) {
-      upsertThread({ ...mapped, messages: existing.messages, loadedMessages: existing.loadedMessages, nickname: existing.nickname, blocked: existing.blocked, closed: existing.closed });
+      upsertThread({
+        ...mapped,
+        messages: existing.messages,
+        loadedMessages: existing.loadedMessages,
+      });
     } else {
       upsertThread(mapped);
     }
   }
-  if (!state.activeThreadId && visibleThreads().length > 0) state.activeThreadId = visibleThreads()[0].id;
+  const visible = visibleThreads();
+  if (state.activeThreadId && !visible.some((thread) => thread.id === state.activeThreadId)) {
+    state.activeThreadId = visible.length ? visible[0].id : null;
+  }
+  if (!state.activeThreadId && visible.length > 0) state.activeThreadId = visible[0].id;
   saveConversationStore();
+}
+
+async function loadSelfProfile() {
+  try {
+    state.selfProfile = await apiRequest("/v1/me", { method: "GET" });
+    if (state.selfProfile?.user_id) {
+      state.profiles[sanitizeText(state.selfProfile.user_id, 80)] = cloneJson(state.selfProfile);
+    }
+  } catch (error) {
+    console.error(error);
+  }
+}
+
+async function resolveProfilesForUsers(userIds) {
+  const unique = [...new Set((userIds || []).map((item) => sanitizeText(item, 80)).filter(Boolean))]
+    .filter((userId) => !state.profiles[userId]);
+  if (!unique.length) return;
+  try {
+    const payload = await apiRequest("/v1/users/resolve", {
+      method: "POST",
+      body: JSON.stringify({ user_ids: unique }),
+    });
+    for (const item of payload?.items || []) {
+      const userId = sanitizeText(item?.user_id, 80);
+      if (!userId) continue;
+      state.profiles[userId] = cloneJson(item);
+    }
+  } catch (error) {
+    console.error(error);
+  }
 }
 
 async function loadMessagesForThread(threadId) {
@@ -875,22 +2679,304 @@ async function loadMessagesForThread(threadId) {
   if (!thread || thread.kind === "draft_phone") return;
   const payload = await apiRequest(`/v1/conversations/${encodeURIComponent(threadId)}/messages`, { method: "GET" });
   const items = Array.isArray(payload?.items) ? payload.items : [];
-  const messages = items.map(mapMessage);
-  upsertThread({ ...thread, messages, loadedMessages: true, updatedAt: messages.length ? messages[messages.length - 1].createdAt : thread.updatedAt });
+  const messages = await Promise.all(items.map(materializeMessage));
+  upsertThread({
+    ...thread,
+    messages,
+    loadedMessages: true,
+    updatedAt: messages.length ? messages[messages.length - 1].createdAt : thread.updatedAt,
+    unreadCount: 0,
+    previewText: messages.length ? messages[messages.length - 1].text : thread.previewText,
+  });
+  if (state.activeThreadId === threadId) {
+    renderAll();
+  }
   const refreshedThread = getThreadById(threadId) || thread;
+  await markConversationDelivered(refreshedThread);
   await markConversationRead(refreshedThread);
   saveConversationStore();
 }
 
 async function refreshLiveState() {
+  await syncFromCursor();
+}
+
+async function syncThreadReceipts(threadId) {
+  const thread = getThreadById(threadId);
+  if (!thread || thread.kind === "draft_phone") return;
+  await markConversationDelivered(thread);
+  await markConversationRead(thread);
+  saveConversationStore();
+}
+
+function ensureThreadFromEvent(payload) {
+  const conversationId = sanitizeText(payload?.conversation_id, 80);
+  if (!conversationId) return null;
+  const existing = getThreadById(conversationId);
+  if (existing) {
+    if (
+      payload?.nickname !== undefined
+      || payload?.closed !== undefined
+      || payload?.blocked !== undefined
+      || payload?.blocked_by_viewer !== undefined
+      || payload?.blocked_by_other !== undefined
+    ) {
+      return applyConversationStateUpdate(payload);
+    }
+    return existing;
+  }
+  const mapped = mapConversation({
+    conversation_id: conversationId,
+    type: sanitizeText(payload?.conversation_type, 24) || "DM",
+    updated_at: payload?.message?.created_at || payload?.status_updated_at || nowISO(),
+    participants: Array.isArray(payload?.participants) ? payload.participants : [],
+    external_phones: Array.isArray(payload?.external_phones) ? payload.external_phones : [],
+    last_message_preview: sanitizeText(payload?.preview, 180),
+    nickname: sanitizeText(payload?.nickname, 80),
+    closed: Boolean(payload?.closed),
+    blocked: Boolean(payload?.blocked),
+    blocked_by_viewer: Boolean(payload?.blocked_by_viewer),
+    blocked_by_other: Boolean(payload?.blocked_by_other),
+    unread_count: 0,
+  });
+  upsertThread(mapped);
+  return getThreadById(conversationId);
+}
+
+function applyConversationStateUpdate(payload) {
+  const conversationId = sanitizeText(payload?.conversation_id, 80);
+  if (!conversationId) return null;
+  const thread = getThreadById(conversationId);
+  if (!thread) return null;
+  const blockedByViewer = payload?.blocked_by_viewer !== undefined
+    ? Boolean(payload.blocked_by_viewer)
+    : Boolean(thread.blockedByViewer);
+  const blockedByOther = payload?.blocked_by_other !== undefined
+    ? Boolean(payload.blocked_by_other)
+    : Boolean(thread.blockedByOther);
+  const next = {
+    ...thread,
+    nickname: payload?.nickname !== undefined ? sanitizeText(payload.nickname, 80) : thread.nickname,
+    closed: payload?.closed !== undefined ? Boolean(payload.closed) : thread.closed,
+    blockedByViewer,
+    blockedByOther,
+    blocked: payload?.blocked !== undefined
+      ? Boolean(payload.blocked)
+      : (blockedByViewer || blockedByOther),
+    updatedAt: payload?.updated_at || thread.updatedAt,
+  };
+  next.title = pickTitle(next);
+  next.subtitle = pickSubtitle(next);
+  upsertThread(next);
+  const visible = visibleThreads();
+  if (next.closed && state.activeThreadId === next.id) {
+    state.activeThreadId = visible.length ? visible[0].id : null;
+  } else if (!next.closed && !state.activeThreadId) {
+    state.activeThreadId = next.id;
+  }
+  saveConversationStore();
+  return getThreadById(conversationId);
+}
+
+function applyReceiptCheckpoint(kind, conversationId, throughServerOrder, updatedAt) {
+  const thread = getThreadById(conversationId);
+  if (!thread) return;
+  const nextMessages = (thread.messages || []).map((message) => {
+    if (message.direction !== "out" || Number(message.serverOrder || 0) > throughServerOrder) return message;
+    if (kind === "READ") {
+      return {
+        ...message,
+        status: OHMF_DELIVERY_STATUSES.READ,
+        readAt: updatedAt,
+        statusUpdatedAt: updatedAt,
+      };
+    }
+    if (normalizeDeliveryStatus(message.transport, message.status) === OHMF_DELIVERY_STATUSES.READ) return message;
+    return {
+      ...message,
+      status: OHMF_DELIVERY_STATUSES.DELIVERED,
+      deliveredAt: updatedAt,
+      statusUpdatedAt: updatedAt,
+    };
+  });
+  upsertThread({ ...thread, messages: nextMessages, updatedAt: updatedAt || thread.updatedAt });
+}
+
+function applyMessageDeleted(payload) {
+  const conversationId = sanitizeText(payload?.conversation_id || payload?.message?.conversation_id, 80);
+  if (!conversationId) return;
+  const thread = ensureThreadFromEvent(payload) || getThreadById(conversationId);
+  if (!thread) return;
+
+  const messagePayload = payload?.message && typeof payload.message === "object" ? payload.message : payload;
+  const messageId = sanitizeText(messagePayload?.message_id, 80);
+  if (!messageId) return;
+
+  const deletedAt = messagePayload?.deleted_at || payload?.deleted_at || nowISO();
+  let found = false;
+  const nextMessages = (thread.messages || []).map((message) => {
+    if (message.id !== messageId) return message;
+    found = true;
+    return {
+      ...message,
+      text: "Message deleted",
+      content: {},
+      deleted: true,
+      deletedAt,
+      statusUpdatedAt: deletedAt || message.statusUpdatedAt,
+    };
+  });
+
+  const lastMessage = nextMessages[nextMessages.length - 1];
+  const previewText = sanitizeText(payload?.preview, 180)
+    || (lastMessage ? (lastMessage.deleted ? "Message deleted" : lastMessage.text) : thread.previewText);
+  upsertThread({
+    ...thread,
+    messages: nextMessages,
+    previewText,
+    updatedAt: deletedAt || thread.updatedAt,
+  });
+  saveConversationStore();
+
+  if (!found && thread.loadedMessages && state.activeThreadId === conversationId) {
+    void loadMessagesForThread(conversationId).catch((error) => {
+      console.error(error);
+    });
+  }
+}
+
+async function applyMessageEdited(payload) {
+  const conversationId = sanitizeText(payload?.conversation_id || payload?.message?.conversation_id, 80);
+  if (!conversationId) return;
+  const thread = ensureThreadFromEvent(payload) || getThreadById(conversationId);
+  if (!thread) return;
+
+  const messagePayload = payload?.message && typeof payload.message === "object" ? payload.message : payload;
+  const messageId = sanitizeText(messagePayload?.message_id, 80);
+  if (!messageId) return;
+
+  const editedAt = messagePayload?.edited_at || payload?.edited_at || nowISO();
+  const updatedMessage = await materializeMessage(messagePayload);
+  updatedMessage.editedAt = editedAt;
+
+  let found = false;
+  const nextMessages = (thread.messages || []).map((message) => {
+    if (message.id !== messageId) return message;
+    found = true;
+    return {
+      ...message,
+      text: updatedMessage.text,
+      content: updatedMessage.content,
+      editedAt,
+      statusUpdatedAt: editedAt,
+    };
+  });
+
+  const lastMessage = nextMessages[nextMessages.length - 1];
+  const previewText = sanitizeText(payload?.preview, 180)
+    || (lastMessage ? (lastMessage.deleted ? "Message deleted" : lastMessage.text) : thread.previewText);
+  upsertThread({
+    ...thread,
+    messages: nextMessages,
+    previewText,
+    updatedAt: editedAt || thread.updatedAt,
+  });
+  saveConversationStore();
+
+  if (!found && thread.loadedMessages && state.activeThreadId === conversationId) {
+    void loadMessagesForThread(conversationId).catch((error) => {
+      console.error(error);
+    });
+  }
+}
+
+async function applyUserEvent(event) {
+  const eventType = sanitizeText(event?.type, 80);
+  const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+  if (eventType === "conversation_message_appended") {
+    const thread = ensureThreadFromEvent(payload);
+    if (!thread) return;
+    const nextMessage = await materializeMessage(payload?.message || {});
+    upsertThreadMessage(thread.id, nextMessage);
+    if (!state.activeThreadId) {
+      state.activeThreadId = thread.id;
+    }
+    const refreshed = getThreadById(thread.id) || thread;
+    if (state.activeThreadId === thread.id && nextMessage.direction === "in") {
+      void markConversationDelivered(refreshed);
+      void markConversationRead(refreshed);
+      upsertThread({ ...refreshed, unreadCount: 0, previewText: nextMessage.text });
+    } else if (nextMessage.direction === "in") {
+      upsertThread({ ...refreshed, unreadCount: Number(refreshed.unreadCount || 0) + 1, previewText: nextMessage.text });
+    }
+    return;
+  }
+  if (eventType === "conversation_message_edited") {
+    await applyMessageEdited(payload);
+    return;
+  }
+  if (eventType === "conversation_message_deleted") {
+    applyMessageDeleted(payload);
+    return;
+  }
+  if (eventType === "conversation_message_reactions_updated") {
+    applyMessageReactions(payload);
+    return;
+  }
+  if (eventType === "conversation_receipt_updated") {
+    const conversationId = sanitizeText(payload?.conversation_id, 80);
+    const through = Number(payload?.through_server_order || 0);
+    const kind = sanitizeText(payload?.receipt_kind, 24).toUpperCase();
+    if (!conversationId || !through || !kind) return;
+    applyReceiptCheckpoint(kind, conversationId, through, payload?.status_updated_at || nowISO());
+    return;
+  }
+  if (eventType === "conversation_preview_updated") {
+    ensureThreadFromEvent(payload);
+    return;
+  }
+  if (eventType === "conversation_state_updated") {
+    applyConversationStateUpdate(payload);
+  }
+}
+
+function sendRealtimeAck(cursor = state.sync.lastUserCursor) {
+  if (!realtimeSocket || realtimeSocket.readyState !== window.WebSocket.OPEN || !cursor) return;
+  realtimeSocket.send(JSON.stringify({
+    event: "ack",
+    data: {
+      through_user_event_id: Number(cursor),
+      device_id: state.sync.deviceId,
+    },
+  }));
+}
+
+async function syncFromCursor() {
   if (!state.auth || liveSyncInFlight) return;
   liveSyncInFlight = true;
   try {
-    await loadConversationsFromApi();
-    const active = getActiveThread();
-    if (active && active.kind !== "draft_phone") {
-      await loadMessagesForThread(active.id);
+    let cursor = Number(state.sync.lastUserCursor || 0);
+    while (true) {
+      const payload = await apiRequest(`/v2/sync?cursor=${encodeURIComponent(String(cursor))}&limit=200`, { method: "GET" });
+      const events = Array.isArray(payload?.events) ? payload.events : [];
+      for (const event of events) {
+        await applyUserEvent(event);
+        const nextCursor = Number(event?.user_event_id || cursor);
+        if (nextCursor > state.sync.lastUserCursor) {
+          state.sync.lastUserCursor = nextCursor;
+        }
+      }
+      saveConversationStore();
+      saveSyncCursor();
+      const nextCursor = Number(payload?.next_cursor || cursor);
+      if (nextCursor > state.sync.lastUserCursor) {
+        state.sync.lastUserCursor = nextCursor;
+        saveSyncCursor();
+      }
+      cursor = Number(state.sync.lastUserCursor || cursor);
+      if (!payload?.has_more || events.length === 0) break;
     }
+    sendRealtimeAck();
     renderAll();
   } catch (error) {
     console.error(error);
@@ -932,6 +3018,31 @@ function handleSSEEvent(name, rawData) {
   }
 }
 
+function stopLiveRefreshLoop() {
+  if (liveRefreshTimer) {
+    window.clearTimeout(liveRefreshTimer);
+    liveRefreshTimer = 0;
+  }
+}
+
+function scheduleLiveRefreshLoop(delayMs = LIVE_SYNC_INTERVAL_MS) {
+  if (!state.auth || liveRefreshTimer) return;
+  liveRefreshTimer = window.setTimeout(async () => {
+    liveRefreshTimer = 0;
+    if (!state.auth) return;
+    if (!document.hidden) {
+      await refreshLiveState();
+    }
+    if (state.auth && !eventStreamAbort && !eventStreamDisabled) {
+      void startEventStream();
+    }
+    if (state.auth && !realtimeSocket) {
+      startRealtimeSocket();
+    }
+    scheduleLiveRefreshLoop();
+  }, delayMs);
+}
+
 async function startEventStream() {
   if (!state.auth || eventStreamAbort || eventStreamDisabled) return;
   const controller = new AbortController();
@@ -956,9 +3067,7 @@ async function startEventStream() {
       }
     }
     if (response.status >= 500) {
-      eventStreamDisabled = true;
-      console.warn("Event stream unavailable; realtime updates disabled for this session.");
-      return;
+      throw new Error(`stream_http_${response.status}`);
     }
     if (!response.ok || !response.body) {
       throw new Error(`stream_http_${response.status}`);
@@ -1018,21 +3127,6 @@ async function ensureMessagesLoaded(threadId) {
   await loadMessagesForThread(threadId);
 }
 
-async function waitForOutgoingStatus(threadId, messageId, currentStatus, attempts = 8, delayMs = 900) {
-  if (!threadId || !messageId) return;
-  const baseline = normalizeDeliveryStatus(TRANSPORT_OHMF, currentStatus);
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    await loadMessagesForThread(threadId);
-    const thread = getThreadById(threadId);
-    const message = (thread?.messages || []).find((item) => item.id === messageId);
-    const nextStatus = normalizeDeliveryStatus(message?.transport || TRANSPORT_OHMF, message?.status || "");
-    if (nextStatus && nextStatus !== baseline && nextStatus !== OHMF_DELIVERY_STATUSES.SENT) {
-      return;
-    }
-    await new Promise((resolve) => window.setTimeout(resolve, delayMs));
-  }
-}
-
 function stopRealtimeSocket() {
   if (realtimeReconnectTimer) {
     window.clearTimeout(realtimeReconnectTimer);
@@ -1042,14 +3136,16 @@ function stopRealtimeSocket() {
     realtimeSocket.close();
     realtimeSocket = null;
   }
+  realtimeConnectFailures = 0;
 }
 
-function scheduleRealtimeReconnect(delayMs = 1200) {
+function scheduleRealtimeReconnect(delayMs = 0) {
   if (!state.auth || realtimeReconnectTimer || realtimeSocket) return;
+  const nextDelay = delayMs > 0 ? delayMs : Math.min(10000, 1200 * (2 ** Math.min(realtimeConnectFailures, 3)));
   realtimeReconnectTimer = window.setTimeout(() => {
     realtimeReconnectTimer = 0;
     startRealtimeSocket();
-  }, delayMs);
+  }, nextDelay);
 }
 
 function applyDeliveryUpdate(payload) {
@@ -1086,25 +3182,45 @@ function applyDeliveryUpdate(payload) {
   renderAll();
 }
 
+function applyTypingEvent(eventName, payload) {
+  const conversationId = sanitizeText(payload?.conversation_id, 80);
+  const userId = sanitizeText(payload?.user_id, 80);
+  if (!conversationId || !userId) return;
+  setRemoteTyping(conversationId, userId, eventName === "typing.started");
+  if (state.activeThreadId === conversationId) {
+    renderMessages();
+  }
+}
+
 function handleRealtimeEvent(eventName, payload) {
   if (eventName === "message_created") {
-    applyIncomingMessage(payload);
+    void applyIncomingMessage(payload);
     return;
   }
   if (eventName === "delivery_update") {
     applyDeliveryUpdate(payload);
+    return;
+  }
+  if (eventName === "typing.started" || eventName === "typing.stopped") {
+    applyTypingEvent(eventName, payload);
   }
 }
 
-function applyIncomingMessage(payload) {
+async function applyIncomingMessage(payload) {
   const conversationId = sanitizeText(payload?.conversation_id, 80);
   if (!conversationId) return;
-  const nextMessage = mapMessage(payload);
+  const nextMessage = await materializeMessage(payload);
+  if (nextMessage.direction === "in") {
+    setRemoteTyping(conversationId, sanitizeText(payload?.sender_user_id, 80), false);
+  }
   const existingThread = getThreadById(conversationId);
   if (existingThread) {
     upsertThreadMessage(conversationId, nextMessage);
     if (state.activeThreadId === conversationId) {
-      void loadMessagesForThread(conversationId);
+      renderAll();
+      void loadMessagesForThread(conversationId).catch((error) => {
+        console.error(error);
+      });
     } else {
       renderAll();
     }
@@ -1117,25 +3233,71 @@ function applyIncomingMessage(payload) {
   })();
 }
 
-function startRealtimeSocket() {
+async function startRealtimeSocket() {
   if (!state.auth || realtimeSocket) return;
-  const wsURL = new URL(API_BASE_URL.replace(/^http/i, "ws") + "/v1/ws");
+  const forceRefresh = realtimeConnectFailures > 0;
+  const wasExpiring = accessTokenExpiresSoon();
+  const refreshed = await ensureFreshAccessToken(forceRefresh);
+  if (wasExpiring && !refreshed) return;
+  const wsURL = new URL(API_BASE_URL.replace(/^http/i, "ws") + "/v2/ws");
   wsURL.searchParams.set("access_token", state.auth.accessToken);
   const socket = new window.WebSocket(wsURL.toString());
+  let opened = false;
   realtimeSocket = socket;
+
+  socket.addEventListener("open", () => {
+    opened = true;
+    realtimeConnectFailures = 0;
+    socket.send(JSON.stringify({
+      event: "hello",
+      data: {
+        device_id: state.sync.deviceId,
+        last_user_cursor: Number(state.sync.lastUserCursor || 0),
+      },
+    }));
+  });
 
   socket.addEventListener("message", (event) => {
     try {
       const message = JSON.parse(event.data);
-      handleRealtimeEvent(sanitizeText(message?.event, 80), message?.data);
+      const eventName = sanitizeText(message?.event, 80);
+      if (eventName === "event") {
+        applyUserEvent(message?.data);
+        const nextCursor = Number(message?.data?.user_event_id || 0);
+        if (nextCursor > state.sync.lastUserCursor) {
+          state.sync.lastUserCursor = nextCursor;
+          saveSyncCursor();
+          saveConversationStore();
+          sendRealtimeAck(nextCursor);
+        }
+        renderAll();
+        return;
+      }
+      if (eventName === "hello_ack") {
+        sendRealtimeAck();
+        return;
+      }
+      if (eventName === "resync_required") {
+        void syncFromCursor();
+        return;
+      }
+      handleRealtimeEvent(eventName, message?.data);
     } catch (error) {
       console.error(error);
     }
   });
 
-  socket.addEventListener("close", () => {
+  socket.addEventListener("close", async () => {
     if (realtimeSocket === socket) {
       realtimeSocket = null;
+      state.remoteTypingByThread = {};
+      stopLocalTyping();
+      if (!opened) {
+        realtimeConnectFailures += 1;
+        await ensureFreshAccessToken(true);
+      } else if (accessTokenExpiresSoon(10)) {
+        await ensureFreshAccessToken(true);
+      }
       scheduleRealtimeReconnect();
     }
   });
@@ -1149,9 +3311,26 @@ async function markConversationRead(thread) {
   const lastIncoming = [...(thread.messages || [])].reverse().find((msg) => msg.direction === "in" && msg.serverOrder > 0);
   if (!lastIncoming) return;
   try {
-    await apiRequest(`/v1/conversations/${encodeURIComponent(thread.id)}/read`, {
+    await apiRequest(`/v2/conversations/${encodeURIComponent(thread.id)}/read`, {
       method: "POST",
       body: JSON.stringify({ through_server_order: lastIncoming.serverOrder }),
+    });
+    upsertThread({ ...thread, unreadCount: 0 });
+  } catch {
+    // Best effort.
+  }
+}
+
+async function markConversationDelivered(thread) {
+  const lastIncoming = [...(thread.messages || [])].reverse().find((msg) => msg.direction === "in" && msg.serverOrder > 0);
+  if (!lastIncoming) return;
+  try {
+    await apiRequest(`/v2/conversations/${encodeURIComponent(thread.id)}/delivered`, {
+      method: "POST",
+      body: JSON.stringify({
+        through_server_order: lastIncoming.serverOrder,
+        device_id: state.sync.deviceId,
+      }),
     });
   } catch {
     // Best effort.
@@ -1182,17 +3361,22 @@ function buildThreadItem(thread) {
   const preview = document.createElement("p");
   preview.className = "thread-preview";
   const last = thread.messages?.[thread.messages.length - 1];
-  preview.textContent = last ? (last.deleted ? "Message deleted" : last.text) : "No messages yet";
+  preview.textContent = last ? (last.deleted ? "Message deleted" : last.text) : (thread.previewText || "No messages yet");
 
   meta.append(name, time);
   body.append(meta, preview);
   button.append(avatar, body);
   button.addEventListener("click", async () => {
+    if (state.activeThreadId && state.activeThreadId !== thread.id) {
+      stopLocalTyping();
+    }
+    clearMessageMenu(false);
     state.activeThreadId = thread.id;
     renderAll();
     openMobileThread();
     try {
       await ensureMessagesLoaded(thread.id);
+      await syncThreadReceipts(thread.id);
       renderAll();
     } catch (error) {
       console.error(error);
@@ -1217,38 +3401,171 @@ function isNonSMSMessage(message) {
 function addReaction(threadId, messageId) {
   const emoji = sanitizeText(window.prompt("Reaction emoji", "👍"), 4);
   if (!emoji) return;
-  const thread = getThreadById(threadId);
-  if (!thread) return;
-  const nextMessages = (thread.messages || []).map((msg) => {
-    if (msg.id !== messageId) return msg;
-    const reactions = { ...(msg.reactions || {}) };
-    reactions[emoji] = Number(reactions[emoji] || 0) + 1;
-    return { ...msg, reactions };
+  void apiRequest(`/v1/messages/${encodeURIComponent(messageId)}/reactions`, {
+    method: "POST",
+    body: JSON.stringify({ emoji }),
+  }).then((payload) => {
+    applyMessageReactions({
+      conversation_id: threadId,
+      message_id: messageId,
+      reactions: payload?.reactions,
+      acted_at: nowISO(),
+    });
+    renderAll();
+  }).catch((error) => {
+    console.error(error);
   });
-  upsertThread({ ...thread, messages: nextMessages });
-  saveConversationStore();
-  renderAll();
 }
 
-function editMessage(threadId, messageId) {
+async function editMessage(threadId, messageId) {
   const thread = getThreadById(threadId);
   const msg = thread?.messages?.find((m) => m.id === messageId);
   if (!thread || !msg || msg.deleted) return;
   const nextText = sanitizeText(window.prompt("Edit message", msg.text), 1000);
   if (!nextText) return;
-  const nextMessages = thread.messages.map((m) => (m.id === messageId ? { ...m, text: nextText, editedAt: nowISO() } : m));
-  upsertThread({ ...thread, messages: nextMessages, updatedAt: nowISO() });
-  saveConversationStore();
+  const nextContent = { text: nextText };
+  const replyReference = normalizeReplyReference(msg.content?.reply_to);
+  if (replyReference) {
+    nextContent.reply_to = {
+      message_id: replyReference.messageId,
+      sender_user_id: replyReference.senderUserId,
+      content_type: replyReference.contentType,
+      text: replyReference.text,
+    };
+  }
+  await apiRequest(`/v1/messages/${encodeURIComponent(messageId)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ content: nextContent }),
+  });
+  void applyMessageEdited({
+    conversation_id: threadId,
+    preview: thread.messages?.[thread.messages.length - 1]?.id === messageId ? nextText : thread.previewText,
+    message: {
+      message_id: messageId,
+      conversation_id: threadId,
+      sender_user_id: state.auth?.userId || "",
+      content_type: CONTENT_TYPE_TEXT,
+      content: nextContent,
+      transport: msg.transport,
+      server_order: msg.serverOrder,
+      created_at: msg.createdAt,
+      sent_at: msg.sentAt,
+      edited_at: nowISO(),
+    },
+  });
   renderAll();
 }
 
-function deleteMessage(threadId, messageId) {
+async function deleteMessage(threadId, messageId) {
   const thread = getThreadById(threadId);
   if (!thread) return;
-  const nextMessages = thread.messages.map((m) => (m.id === messageId ? { ...m, deleted: true, text: "Message deleted", editedAt: nowISO() } : m));
-  upsertThread({ ...thread, messages: nextMessages, updatedAt: nowISO() });
-  saveConversationStore();
+  const target = thread.messages?.find((message) => message.id === messageId);
+  if (!target || target.deleted) return;
+  await apiRequest(`/v1/messages/${encodeURIComponent(messageId)}`, { method: "DELETE" });
+  applyMessageDeleted({
+    conversation_id: threadId,
+    preview: thread.messages?.[thread.messages.length - 1]?.id === messageId ? "Message deleted" : thread.previewText,
+    message: {
+      message_id: messageId,
+      conversation_id: threadId,
+      deleted: true,
+      deleted_at: nowISO(),
+    },
+  });
   renderAll();
+}
+
+function buildReactionBadge(message) {
+  const reactionKeys = Object.keys(message.reactions || {});
+  if (!reactionKeys.length) return null;
+  const badge = document.createElement("div");
+  badge.className = `message-reactions ${message.direction}`;
+  for (const emoji of reactionKeys) {
+    const chip = document.createElement("span");
+    chip.className = "message-reaction-chip";
+    chip.textContent = `${emoji} ${message.reactions[emoji]}`;
+    badge.appendChild(chip);
+  }
+  return badge;
+}
+
+function appendMessageMenuButton(menu, label, onClick, extraClass = "") {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = extraClass ? `message-action-item ${extraClass}` : "message-action-item";
+  button.textContent = label;
+  button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    clearMessageMenu(false);
+    onClick();
+  });
+  menu.appendChild(button);
+}
+
+function buildMessageActionAnchor(thread, message) {
+  const allowReply = !message.deleted;
+  const allowReact = !message.deleted && !message.isEncrypted;
+  const allowEdit = message.direction === "out" && !message.deleted && !isAppCardMessage(message) && !message.isEncrypted;
+  const allowDelete = message.direction === "out" && !message.deleted && !isAppCardMessage(message);
+  if (!allowReply && !allowReact && !allowEdit && !allowDelete) return null;
+
+  const anchor = document.createElement("div");
+  const menuOpen = Boolean(
+    state.openMessageMenu &&
+    state.openMessageMenu.threadId === thread.id &&
+    state.openMessageMenu.messageId === message.id
+  );
+  anchor.className = `message-action-anchor ${message.direction}${menuOpen ? " menu-open" : ""}`;
+
+  const trigger = document.createElement("button");
+  trigger.type = "button";
+  trigger.className = `message-action-trigger ${message.direction}`;
+  trigger.setAttribute("aria-label", "Message actions");
+  trigger.setAttribute("aria-haspopup", "menu");
+  trigger.setAttribute("aria-expanded", menuOpen ? "true" : "false");
+  for (let i = 0; i < 3; i += 1) {
+    const dot = document.createElement("span");
+    dot.className = "message-action-trigger-dot";
+    trigger.appendChild(dot);
+  }
+  trigger.addEventListener("click", (event) => {
+    event.stopPropagation();
+    toggleMessageMenu(thread.id, message.id);
+  });
+  anchor.appendChild(trigger);
+
+  if (!menuOpen) return anchor;
+
+  const menu = document.createElement("div");
+  menu.className = `message-action-menu ${message.direction}`;
+  menu.setAttribute("role", "menu");
+
+  if (allowReply) {
+    appendMessageMenuButton(menu, "Reply", () => setReplyTarget(thread, message));
+  }
+  if (allowReact) {
+    appendMessageMenuButton(menu, "React", () => addReaction(thread.id, message.id));
+  }
+
+  if (allowEdit) {
+    appendMessageMenuButton(menu, "Edit", () => {
+      void editMessage(thread.id, message.id).catch((error) => {
+        console.error(error);
+        window.alert(sanitizeText(error.message || "Unable to edit message.", 160));
+      });
+    });
+  }
+  if (allowDelete) {
+    appendMessageMenuButton(menu, "Delete", () => {
+      void deleteMessage(thread.id, message.id).catch((error) => {
+        console.error(error);
+        window.alert(sanitizeText(error.message || "Unable to delete message.", 160));
+      });
+    }, "destructive");
+  }
+
+  anchor.appendChild(menu);
+  return anchor;
 }
 
 function scrollMessageListToBottom() {
@@ -1257,10 +3574,37 @@ function scrollMessageListToBottom() {
 
 function closeMiniappLauncher() {
   state.miniapp.drawerOpen = false;
-  state.miniapp.frameWindow = null;
-  state.miniapp.consentRequired = false;
   state.miniapp.lastShareError = "";
+}
+
+async function closeMiniappWindow() {
+  if (state.miniapp.launchContext?.app_session_id) {
+    try {
+      const currentVersion = Number(state.miniapp.sessionState?.stateVersion || state.miniapp.launchContext?.state_version || 1);
+      const persistedVersion = await persistMiniappSession(currentVersion, "WINDOW_CLOSED", { source: "popup_close" });
+      if (state.miniapp.sessionState) {
+        state.miniapp.sessionState.stateVersion = persistedVersion;
+      }
+      if (state.miniapp.launchContext) {
+        state.miniapp.launchContext.state_version = persistedVersion;
+      }
+    } catch (error) {
+      console.error(error);
+      state.miniapp.lastShareError = sanitizeText(error.message || "Unable to save app state.", 180);
+    }
+  }
+  state.miniapp.popupOpen = false;
+  state.miniapp.frameWindow = null;
   el.miniappFrame.src = "about:blank";
+}
+
+function renderMiniappWindow() {
+  const thread = getActiveThread();
+  el.miniappWindow.classList.toggle("hidden", !state.miniapp.popupOpen);
+  el.miniappWindowTitle.textContent = state.miniapp.manifest?.name || "Mini-App";
+  el.miniappWindowSubtitle.textContent = thread
+    ? `Running in ${thread.title}. Close the window to save the latest state.`
+    : "Close the window to save the latest state.";
 }
 
 function renderMiniappLauncher() {
@@ -1280,6 +3624,8 @@ function renderMiniappLauncher() {
       : supportReason;
     el.miniappLaunchMode.textContent = "Ready";
     el.miniappShareBtn.disabled = true;
+    el.miniappOpenBtn.disabled = true;
+    el.miniappResetBtn.disabled = true;
     return;
   }
 
@@ -1314,26 +3660,119 @@ function renderMiniappLauncher() {
     el.miniappPermissions.append(item);
   }
   el.miniappShareBtn.disabled = !supported || !manifest || !joinable;
-  el.miniappShareBtn.textContent = state.miniapp.launchContext?.app_session_id ? "Send Again" : "Send App";
+  el.miniappShareBtn.textContent = "Send";
   el.miniappOpenBtn.disabled = !supported || !manifest || !joinable;
-  el.miniappOpenBtn.textContent = !joinable ? "Session Ended" : (state.miniapp.consentRequired ? "Join & Open" : (state.miniapp.launchContext?.app_session_id ? "Resume App" : "Open App"));
+  el.miniappOpenBtn.textContent = !joinable ? "Session Ended" : (state.miniapp.consentRequired ? "Join & Open" : "Open App");
   el.miniappResetBtn.disabled = !state.miniapp.launchContext?.app_session_id;
 }
 
-function buildAppCardBubble(message) {
+async function openAppCardMessage(message) {
+  try {
+    await openMiniappCard(message);
+  } catch (error) {
+    console.error(error);
+    state.miniapp.lastShareError = sanitizeText(error.message || "Unable to open app card.", 180);
+    renderMiniappLauncher();
+  }
+}
+
+function buildCompactAppCardBubble(message, joinable, label) {
+  const bubble = document.createElement("article");
+  bubble.className = `bubble ${message.direction} app-card-bubble is-compact`;
+  if (joinable) {
+    bubble.tabIndex = 0;
+    bubble.setAttribute("role", "button");
+    bubble.setAttribute("aria-label", `Open ${label}`);
+    bubble.addEventListener("click", () => {
+      void openAppCardMessage(message);
+    });
+    bubble.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      void openAppCardMessage(message);
+    });
+  } else {
+    bubble.setAttribute("aria-disabled", "true");
+  }
+
+  const icon = document.createElement("span");
+  icon.className = "app-card-compact-icon";
+  const iconURL = appCardIconURL(message.content);
+  if (iconURL) {
+    const image = document.createElement("img");
+    image.className = "app-card-compact-icon-image";
+    image.src = iconURL;
+    image.alt = "";
+    image.loading = "lazy";
+    icon.appendChild(image);
+  } else {
+    const fallback = document.createElement("span");
+    fallback.className = "app-card-compact-icon-fallback";
+    fallback.textContent = appCardIconFallbackText(message.content);
+    icon.appendChild(fallback);
+  }
+
+  const text = document.createElement("span");
+  text.className = "app-card-compact-label";
+  text.textContent = label;
+
+  bubble.append(icon, text);
+  return bubble;
+}
+
+function buildExpandedAppCardBubble(message, joinable, previewLabel) {
   const bubble = document.createElement("article");
   bubble.className = `bubble ${message.direction} app-card-bubble`;
-  const joinable = message.content?.joinable !== false;
+  const preview = normalizeMiniappMessagePreview(message.content?.message_preview);
+  const previewCounter = appCardPreviewCounter(message.content);
+  const previewFrame = document.createElement("div");
+  previewFrame.className = `app-card-preview ${preview ? `is-fit-${preview.fitMode} is-type-${preview.type === "live" ? "live" : "image"}` : "is-fallback"}`;
+
+  if (preview) {
+    if (preview.type === "live") {
+      const iframe = document.createElement("iframe");
+      iframe.className = "app-card-preview-frame";
+      iframe.src = preview.url;
+      iframe.loading = "lazy";
+      iframe.referrerPolicy = "no-referrer";
+      iframe.title = preview.altText || previewLabel;
+      iframe.setAttribute("sandbox", "allow-scripts allow-same-origin");
+      iframe.setAttribute("tabindex", "-1");
+      previewFrame.appendChild(iframe);
+    } else {
+      const image = document.createElement("img");
+      image.className = "app-card-preview-image";
+      image.src = preview.url;
+      image.alt = preview.altText || previewLabel;
+      image.loading = "lazy";
+      previewFrame.appendChild(image);
+    }
+  } else {
+    const fallback = document.createElement("div");
+    fallback.className = "app-card-preview-fallback";
+    const fallbackMark = document.createElement("span");
+    fallbackMark.className = "app-card-preview-mark";
+    fallbackMark.textContent = previewCounter === null ? "#" : String(previewCounter);
+    const fallbackText = document.createElement("span");
+    fallbackText.className = "app-card-preview-text";
+    fallbackText.textContent = previewCounter === null ? previewLabel : "shared counter";
+    fallback.append(fallbackMark, fallbackText);
+    previewFrame.appendChild(fallback);
+  }
+  bubble.appendChild(previewFrame);
+
+  const overlay = document.createElement("div");
+  overlay.className = "app-card-overlay";
 
   const title = document.createElement("strong");
   title.className = "app-card-title";
-  title.textContent = sanitizeText(message.content?.title || message.text || "Shared app", 120);
+  title.textContent = previewLabel || "Shared app";
 
   const summary = document.createElement("p");
   summary.className = "app-card-summary";
   summary.textContent = sanitizeText(message.content?.summary || "Open this shared app in the conversation.", 180);
 
-  bubble.append(title, summary);
+  overlay.append(title, summary);
 
   const cta = document.createElement("button");
   cta.type = "button";
@@ -1341,32 +3780,194 @@ function buildAppCardBubble(message) {
   cta.textContent = joinable ? sanitizeText(message.content?.cta_label || "Open", 32) : "Ended";
   cta.disabled = !joinable;
   cta.addEventListener("click", async () => {
-    try {
-      await openMiniappCard(message);
-    } catch (error) {
-      console.error(error);
-      state.miniapp.lastShareError = sanitizeText(error.message || "Unable to open app card.", 180);
-      renderMiniappLauncher();
-    }
+    await openAppCardMessage(message);
   });
-  bubble.appendChild(cta);
+  overlay.appendChild(cta);
+  bubble.appendChild(overlay);
 
+  return bubble;
+}
+
+function buildAppCardBubble(message, presentation = "expanded") {
+  const joinable = message.content?.joinable !== false;
+  const previewLabel = appCardDisplayName(message.content);
+  if (presentation === "compact") return buildCompactAppCardBubble(message, joinable, previewLabel);
+  return buildExpandedAppCardBubble(message, joinable, previewLabel);
+}
+
+function replyReferenceLabel(thread, replyReference, targetMessage) {
+  if (targetMessage) return replyAuthorLabel(thread, targetMessage);
+  if (replyReference?.senderUserId && replyReference.senderUserId === state.auth?.userId) return "you";
+  return sanitizeText(thread?.title || "this message", 60);
+}
+
+function jumpToMessage(threadId, messageId) {
+  if (!threadId || !messageId || state.activeThreadId !== threadId) return;
+  const selector = window.CSS?.escape
+    ? `[data-message-id="${window.CSS.escape(messageId)}"]`
+    : `[data-message-id="${messageId.replace(/"/g, '\\"')}"]`;
+  const target = el.messageList.querySelector(selector);
+  if (!(target instanceof HTMLElement)) return;
+  target.scrollIntoView({ behavior: "smooth", block: "center" });
+  target.classList.remove("reply-jump-highlight");
+  void target.offsetWidth;
+  target.classList.add("reply-jump-highlight");
+  window.setTimeout(() => {
+    target.classList.remove("reply-jump-highlight");
+  }, 1600);
+}
+
+function buildReplyPreview(thread, message) {
+  const replyReference = normalizeReplyReference(message.content?.reply_to);
+  if (!replyReference) return null;
+  const targetMessage = getMessageById(thread.id, replyReference.messageId);
+  const preview = document.createElement(targetMessage ? "button" : "div");
+  if (preview instanceof HTMLButtonElement) preview.type = "button";
+  preview.className = `reply-preview ${message.direction}${targetMessage ? " is-link" : ""}`;
+
+  const label = document.createElement("span");
+  label.className = "reply-preview-label";
+  label.textContent = replyReferenceLabel(thread, replyReference, targetMessage);
+
+  const text = document.createElement("span");
+  text.className = "reply-preview-text";
+  text.textContent = sanitizeText(targetMessage?.text || replyReference.text || "Original message", 180);
+
+  preview.append(label, text);
+
+  if (targetMessage && preview instanceof HTMLButtonElement) {
+    preview.addEventListener("click", (event) => {
+      event.stopPropagation();
+      jumpToMessage(thread.id, replyReference.messageId);
+    });
+  }
+  return preview;
+}
+
+function buildReplyBacklink(thread, message, replies) {
+  if (!Array.isArray(replies) || replies.length === 0) return null;
+  const latestReply = replies[replies.length - 1];
+  if (!latestReply?.id) return null;
+
+  const badge = document.createElement("button");
+  badge.type = "button";
+  badge.className = `reply-thread-badge ${message.direction}`;
+  badge.setAttribute(
+    "aria-label",
+    replies.length === 1 ? "Jump to reply" : `Jump to latest reply (${replies.length} replies)`
+  );
+  badge.title = replies.length === 1 ? "Jump to reply" : `Jump to latest reply (${replies.length})`;
+
+  const arrow = document.createElement("span");
+  arrow.className = "reply-thread-badge-arrow";
+  arrow.textContent = "↩";
+
+  const count = document.createElement("span");
+  count.className = "reply-thread-badge-count";
+  count.textContent = replies.length > 1 ? String(replies.length) : replyAuthorLabel(thread, latestReply);
+
+  badge.append(arrow, count);
+  badge.addEventListener("click", (event) => {
+    event.stopPropagation();
+    jumpToMessage(thread.id, latestReply.id);
+  });
+  return badge;
+}
+
+async function downloadAttachmentMessage(message) {
+  const attachmentId = sanitizeText(message?.content?.attachment_id, 80);
+  if (!attachmentId) throw new Error("Missing attachment id.");
+  const payload = await apiRequest(`/v1/media/attachments/${encodeURIComponent(attachmentId)}/download`);
+  const url = sanitizeText(payload?.download_url, 2000);
+  if (!url) throw new Error("Missing download URL.");
+  const descriptor = message?.content && typeof message.content === "object" ? message.content : {};
+  if (sanitizeText(descriptor.file_key, 4000) && sanitizeText(descriptor.file_nonce, 4000)) {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error("Unable to download attachment.");
+    const encryptedBuffer = await response.arrayBuffer();
+    const decryptedBuffer = await decryptAttachmentBytes(encryptedBuffer, descriptor);
+    const blob = new Blob([decryptedBuffer], { type: sanitizeText(descriptor.mime_type, 200) || "application/octet-stream" });
+    const objectUrl = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = objectUrl;
+    link.download = sanitizeText(descriptor.file_name || payload?.file_name || "attachment", 140);
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(objectUrl), 30_000);
+    return;
+  }
+  window.open(url, "_blank", "noopener");
+}
+
+function buildTextBubble(thread, message) {
+  const bubble = document.createElement("article");
+  bubble.className = `bubble ${message.direction}`;
+  if (message.deleted) {
+    bubble.textContent = "Message deleted";
+    return bubble;
+  }
+
+  if (isAttachmentMessage(message)) {
+    bubble.classList.add("has-reply");
+    const replyPreview = buildReplyPreview(thread, message);
+    const action = document.createElement("button");
+    action.type = "button";
+    action.className = "reply-preview";
+    const label = document.createElement("strong");
+    label.textContent = "Attachment";
+    const body = document.createElement("span");
+    body.textContent = sanitizeText(message.content?.file_name || message.text || "Download attachment", 140);
+    action.append(label, body);
+    action.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      try {
+        await downloadAttachmentMessage(message);
+      } catch (error) {
+        console.error(error);
+        window.alert(sanitizeText(error.message || "Unable to download attachment.", 180));
+      }
+    });
+    if (replyPreview) bubble.append(replyPreview, action);
+    else bubble.append(action);
+    return bubble;
+  }
+
+  const replyPreview = buildReplyPreview(thread, message);
+  if (!replyPreview) {
+    bubble.textContent = message.text;
+    return bubble;
+  }
+
+  bubble.classList.add("has-reply");
+  const body = document.createElement("p");
+  body.className = "bubble-body-text";
+  body.textContent = message.text;
+  bubble.append(replyPreview, body);
   return bubble;
 }
 
 function renderMessages() {
   const thread = getActiveThread();
   const blocked = Boolean(thread?.blocked);
-  el.nicknameBtn.disabled = !thread;
-  el.blockBtn.disabled = !thread;
-  el.closeThreadBtn.disabled = !thread;
-  el.blockBtn.textContent = blocked ? "Unblock" : "Block";
+  const targetUserId = otherUserIdForThread(thread);
+  if (thread && state.openMessageMenu && state.openMessageMenu.threadId !== thread.id) {
+    state.openMessageMenu = null;
+  }
+  el.nicknameBtn.disabled = !thread || thread?.kind === "draft_phone";
+  el.blockBtn.disabled = !thread || !targetUserId;
+  el.closeThreadBtn.disabled = !thread || thread?.kind === "draft_phone";
+  el.blockBtn.textContent = thread?.blockedByViewer ? "Unblock" : "Block";
+  renderComposerReply(thread);
 
   if (!thread) {
     el.title.textContent = "Select a conversation";
     el.subtitle.textContent = "No active thread";
     el.composerInput.disabled = true;
+    clearMessageMenu(false);
     closeMiniappLauncher();
+    state.miniapp.popupOpen = false;
+    el.miniappFrame.src = "about:blank";
     renderMiniappLauncher();
     el.messageList.replaceChildren(el.emptyState);
     return;
@@ -1375,22 +3976,28 @@ function renderMessages() {
   el.title.textContent = thread.title;
   el.subtitle.textContent = thread.subtitle;
   el.composerInput.disabled = blocked;
-  el.composerInput.placeholder = blocked ? "Unblock this user to send messages" : "Message";
+  el.composerInput.placeholder = thread.blockedByOther
+    ? "Messaging unavailable in this conversation"
+    : blocked
+    ? "Unblock this user to send messages"
+    : "Message";
   renderMiniappLauncher();
   el.messageList.replaceChildren();
+  const appCardModes = appCardPresentationModes(thread);
+  const replyIndex = replyIndexByTarget(thread);
 
   for (const message of thread.messages || []) {
     const wrap = document.createElement("div");
     wrap.className = `bubble-wrap ${message.direction}`;
+    wrap.dataset.messageId = message.id;
 
-    const bubble = isAppCardMessage(message)
-      ? buildAppCardBubble(message)
-      : (() => {
-          const plainBubble = document.createElement("article");
-          plainBubble.className = `bubble ${message.direction}`;
-          plainBubble.textContent = message.deleted ? "Message deleted" : message.text;
-          return plainBubble;
-        })();
+    const bubble = isAppCardMessage(message) && !message.deleted
+      ? buildAppCardBubble(message, appCardModes[message.id] || "expanded")
+      : buildTextBubble(thread, message);
+
+    const reactionBadge = isNonSMSMessage(message) ? buildReactionBadge(message) : null;
+    const replyBacklink = buildReplyBacklink(thread, message, replyIndex[message.id]);
+    if (reactionBadge || replyBacklink) wrap.classList.add("has-reactions");
 
     const meta = document.createElement("p");
     meta.className = `bubble-meta ${message.direction}`;
@@ -1419,51 +4026,23 @@ function renderMessages() {
 
     wrap.append(bubble, meta);
 
-    const nonSMS = isNonSMSMessage(message);
-    if (nonSMS) {
-      const reactionKeys = Object.keys(message.reactions || {});
-      if (reactionKeys.length) {
-        const reactionMeta = document.createElement("p");
-        reactionMeta.className = `bubble-meta ${message.direction}`;
-        reactionMeta.textContent = reactionKeys.map((k) => `${k} ${message.reactions[k]}`).join("  ");
-        wrap.appendChild(reactionMeta);
-      }
-
-      const actions = document.createElement("div");
-      actions.className = "bubble-actions";
-
-      const reactBtn = document.createElement("button");
-      reactBtn.type = "button";
-      reactBtn.textContent = "React";
-      reactBtn.addEventListener("click", () => addReaction(thread.id, message.id));
-      actions.appendChild(reactBtn);
-
-      if (message.direction === "out" && !message.deleted && !isAppCardMessage(message)) {
-        const editBtn = document.createElement("button");
-        editBtn.type = "button";
-        editBtn.textContent = "Edit";
-        editBtn.addEventListener("click", () => editMessage(thread.id, message.id));
-        actions.appendChild(editBtn);
-
-        const deleteBtn = document.createElement("button");
-        deleteBtn.type = "button";
-        deleteBtn.textContent = "Delete";
-        deleteBtn.addEventListener("click", () => deleteMessage(thread.id, message.id));
-        actions.appendChild(deleteBtn);
-      }
-
-      wrap.appendChild(actions);
+    if (reactionBadge) wrap.appendChild(reactionBadge);
+    if (replyBacklink) wrap.appendChild(replyBacklink);
+    if (isNonSMSMessage(message)) {
+      const actionAnchor = buildMessageActionAnchor(thread, message);
+      if (actionAnchor) wrap.appendChild(actionAnchor);
     }
 
     el.messageList.appendChild(wrap);
   }
 
-  if (state.typingDraft && !thread.blocked) {
+  const typingText = typingIndicatorText(thread.id);
+  if (typingText) {
     const typingWrap = document.createElement("div");
-    typingWrap.className = "bubble-wrap out";
+    typingWrap.className = "bubble-wrap in";
     const typingBubble = document.createElement("article");
-    typingBubble.className = "bubble out typing";
-    typingBubble.textContent = "Typing...";
+    typingBubble.className = "bubble in typing";
+    typingBubble.textContent = typingText;
     typingWrap.appendChild(typingBubble);
     el.messageList.appendChild(typingWrap);
   }
@@ -1474,6 +4053,7 @@ function renderMessages() {
 function renderAll() {
   renderThreadList();
   renderMessages();
+  renderMiniappWindow();
 }
 
 function openMobileThread() {
@@ -1494,15 +4074,17 @@ function showAuthShell() {
   el.authShell.classList.remove("hidden");
 }
 
-function pushPendingMessage(threadId, text, transport = TRANSPORT_OHMF) {
+function pushPendingMessage(threadId, content, transport = TRANSPORT_OHMF, contentType = CONTENT_TYPE_TEXT) {
   const thread = getThreadById(threadId);
   if (!thread) return null;
   const normalizedTransport = normalizeTransport(transport);
   const status = normalizedTransport === TRANSPORT_SMS ? SMS_DELIVERY_STATUSES.SENT : OHMF_DELIVERY_STATUSES.SENT;
+  const pendingContent = content && typeof content === "object" ? cloneJson(content) : { text: sanitizeText(content, 1000) };
   const pending = {
     id: `tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    senderUserId: state.auth?.userId || "",
     direction: "out",
-    text,
+    text: sanitizeText(pendingContent?.text || pendingContent?.file_name || "Attachment", 1000),
     createdAt: nowISO(),
     status,
     statusUpdatedAt: nowISO(),
@@ -1511,6 +4093,8 @@ function pushPendingMessage(threadId, text, transport = TRANSPORT_OHMF) {
     reactions: {},
     editedAt: "",
     deleted: false,
+    contentType,
+    content: pendingContent,
   };
   upsertThread({ ...thread, messages: [...(thread.messages || []), pending], updatedAt: pending.createdAt });
   saveConversationStore();
@@ -1531,7 +4115,10 @@ function patchMessage(threadId, messageId, patch) {
       statusUpdatedAt: patch.status ? (patch.statusUpdatedAt || nowISO()) : merged.statusUpdatedAt,
     };
   });
-  upsertThread({ ...thread, messages: nextMessages, updatedAt: patch.createdAt || thread.updatedAt });
+  const dedupedMessages = patch.id
+    ? nextMessages.filter((message, index, items) => index === items.findIndex((candidate) => candidate.id === message.id))
+    : nextMessages;
+  upsertThread({ ...thread, messages: dedupedMessages, updatedAt: patch.createdAt || thread.updatedAt });
   saveConversationStore();
 }
 
@@ -1550,6 +4137,55 @@ async function createOrGetPhoneConversation(phone) {
   return mapped.id;
 }
 
+async function createGroupConversation(title, participantPhones) {
+  const payload = await apiRequest("/v1/conversations", {
+    method: "POST",
+    body: JSON.stringify({
+      type: "GROUP",
+      title: sanitizeText(title, 80),
+      participant_phones: participantPhones,
+      encryption_state: "PLAINTEXT",
+    }),
+  });
+  await resolveProfilesForUsers(payload?.participants || []);
+  const mapped = mapConversation(payload || {});
+  upsertThread({
+    ...mapped,
+    messages: [],
+    loadedMessages: true,
+  });
+  state.activeThreadId = mapped.id;
+  saveConversationStore();
+  renderAll();
+  return mapped;
+}
+
+function otherUserIdForThread(thread) {
+  if (!thread) return "";
+  return sanitizeText((thread.participants || []).find((id) => id && id !== state.auth?.userId), 80);
+}
+
+async function updateConversationPreferences(threadId, patch) {
+  const payload = await apiRequest(`/v1/conversations/${encodeURIComponent(threadId)}/preferences`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
+  });
+  const mapped = mapConversation(payload || {});
+  const existing = getThreadById(threadId);
+  if (existing) {
+    upsertThread({
+      ...existing,
+      ...mapped,
+      messages: existing.messages,
+      loadedMessages: existing.loadedMessages,
+    });
+  } else if (mapped.id) {
+    upsertThread(mapped);
+  }
+  saveConversationStore();
+  return getThreadById(threadId) || mapped;
+}
+
 function moveDraftToConversation(draftId, conversationId, phone) {
   const draft = getThreadById(draftId);
   const existing = getThreadById(conversationId);
@@ -1564,6 +4200,8 @@ function moveDraftToConversation(draftId, conversationId, phone) {
     subtitle: existing?.subtitle || "Phone conversation (OTT preferred)",
     externalPhones: [phone],
     participants: existing?.participants || [state.auth.userId],
+    blockedByViewer: Boolean(existing?.blockedByViewer),
+    blockedByOther: Boolean(existing?.blockedByOther),
     messages: merged,
     loadedMessages: Boolean(existing?.loadedMessages),
     updatedAt: nowISO(),
@@ -1571,35 +4209,40 @@ function moveDraftToConversation(draftId, conversationId, phone) {
   state.activeThreadId = conversationId;
 }
 
-async function sendOTT(conversationId, text) {
+async function sendOTT(conversationId, content, contentType = CONTENT_TYPE_TEXT) {
   return apiRequest("/v1/messages", {
     method: "POST",
     body: JSON.stringify({
       conversation_id: conversationId,
       idempotency_key: makeIdempotencyKey("conv"),
-      content_type: "text",
-      content: { text },
+      content_type: contentType,
+      content,
     }),
   });
 }
 
-async function sendSMS(phone, text) {
+async function sendSMS(phone, content, contentType = CONTENT_TYPE_TEXT) {
   return apiRequest("/v1/messages/phone", {
     method: "POST",
     body: JSON.stringify({
       phone_e164: phone,
       idempotency_key: makeIdempotencyKey("phone"),
-      content_type: "text",
-      content: { text },
+      content_type: contentType,
+      content,
     }),
   });
 }
 
-async function sendInConversation(thread, text) {
-  const pendingId = pushPendingMessage(thread.id, text, TRANSPORT_OHMF);
+async function sendInConversation(thread, content) {
+  const encryptedEnvelope = thread.kind === "dm" ? await encryptConversationContent(thread, content, CONTENT_TYPE_TEXT).catch((error) => {
+    console.error(error);
+    return null;
+  }) : null;
+  const effectiveContentType = encryptedEnvelope ? CONTENT_TYPE_ENCRYPTED : CONTENT_TYPE_TEXT;
+  const pendingId = pushPendingMessage(thread.id, content, TRANSPORT_OHMF, effectiveContentType);
   renderAll();
   try {
-    const payload = await sendOTT(thread.id, text);
+    const payload = await sendOTT(thread.id, encryptedEnvelope || content, effectiveContentType);
     const finalMessageId = sanitizeText(payload.message_id, 80) || pendingId;
     patchMessage(thread.id, pendingId, {
       id: finalMessageId,
@@ -1608,8 +4251,9 @@ async function sendInConversation(thread, text) {
       transport: TRANSPORT_OHMF,
       createdAt: nowISO(),
       statusUpdatedAt: nowISO(),
+      contentType: effectiveContentType,
+      content: encryptedEnvelope || content,
     });
-    await waitForOutgoingStatus(thread.id, finalMessageId, OHMF_DELIVERY_STATUSES.SENT);
   } catch (err) {
     const phone = thread.externalPhones?.[0];
     if (thread.kind !== "phone" || !phone) {
@@ -1618,7 +4262,7 @@ async function sendInConversation(thread, text) {
     }
 
     try {
-      const smsPayload = await sendSMS(phone, text);
+      const smsPayload = await sendSMS(phone, content, CONTENT_TYPE_TEXT);
       patchMessage(thread.id, pendingId, {
         id: sanitizeText(smsPayload.message_id, 80) || pendingId,
         serverOrder: Number(smsPayload.server_order || 0),
@@ -1635,6 +4279,59 @@ async function sendInConversation(thread, text) {
   }
 }
 
+async function sendAttachmentInConversation(thread, attachment) {
+  if (!thread || thread.kind === "draft_phone") {
+    throw new Error("Attachments require a saved OHMF conversation.");
+  }
+  const content = {
+    attachment_id: attachment.attachment_id,
+    file_name: attachment.file_name,
+    mime_type: attachment.mime_type,
+    size_bytes: attachment.size_bytes,
+    object_sha256: attachment.checksum_sha256,
+    file_key: sanitizeText(attachment.file_key, 4000),
+    file_nonce: sanitizeText(attachment.file_nonce, 4000),
+    encryption_scheme: sanitizeText(attachment.encryption_scheme, 120),
+    stored_mime_type: sanitizeText(attachment.stored_mime_type, 200),
+    stored_size_bytes: Number(attachment.stored_size_bytes || 0),
+    encrypted: Boolean(attachment.encrypted),
+  };
+  const pendingId = pushPendingMessage(thread.id, content, TRANSPORT_OHMF, CONTENT_TYPE_ATTACHMENT);
+  renderAll();
+  try {
+    const encryptedEnvelope = thread.kind === "dm" && content.encrypted
+      ? await encryptConversationContent(thread, content, CONTENT_TYPE_ATTACHMENT)
+      : null;
+    const payload = await sendOTT(
+      thread.id,
+      encryptedEnvelope || content,
+      encryptedEnvelope ? CONTENT_TYPE_ENCRYPTED : CONTENT_TYPE_ATTACHMENT
+    );
+    await apiRequest("/v1/media/attachments", {
+      method: "POST",
+      body: JSON.stringify({
+        attachment_id: attachment.attachment_id,
+        message_id: payload.message_id,
+        file_name: content.encrypted ? "" : attachment.file_name,
+      }),
+    });
+    patchMessage(thread.id, pendingId, {
+      id: sanitizeText(payload.message_id, 80) || pendingId,
+      serverOrder: Number(payload.server_order || 0),
+      status: OHMF_DELIVERY_STATUSES.SENT,
+      transport: TRANSPORT_OHMF,
+      createdAt: nowISO(),
+      statusUpdatedAt: nowISO(),
+      contentType: CONTENT_TYPE_ATTACHMENT,
+      content,
+      text: sanitizeText(attachment.file_name || "Attachment", 140),
+    });
+  } catch (error) {
+    patchMessage(thread.id, pendingId, { status: OHMF_DELIVERY_STATUSES.FAIL_SEND });
+    throw error;
+  }
+}
+
 function ensureDraftPhoneThread(phone) {
   const existing = state.threads.find((thread) => thread.kind === "draft_phone" && thread.externalPhones?.[0] === phone);
   if (existing) {
@@ -1647,6 +4344,8 @@ function ensureDraftPhoneThread(phone) {
     title: phone,
     subtitle: "New phone conversation",
     nickname: "",
+    blockedByViewer: false,
+    blockedByOther: false,
     blocked: false,
     closed: false,
     updatedAt: nowISO(),
@@ -1661,14 +4360,14 @@ function ensureDraftPhoneThread(phone) {
   return draft;
 }
 
-async function sendInDraftPhoneConversation(thread, text) {
+async function sendInDraftPhoneConversation(thread, content) {
   const phone = thread.externalPhones?.[0] || "";
-  const pendingId = pushPendingMessage(thread.id, text, TRANSPORT_OHMF);
+    const pendingId = pushPendingMessage(thread.id, content, TRANSPORT_OHMF);
   renderAll();
   try {
     const conversationId = await createOrGetPhoneConversation(phone);
     moveDraftToConversation(thread.id, conversationId, phone);
-    const payload = await sendOTT(conversationId, text);
+    const payload = await sendOTT(conversationId, content, CONTENT_TYPE_TEXT);
     const finalMessageId = sanitizeText(payload.message_id, 80) || pendingId;
     patchMessage(conversationId, pendingId, {
       id: finalMessageId,
@@ -1678,10 +4377,9 @@ async function sendInDraftPhoneConversation(thread, text) {
       createdAt: nowISO(),
       statusUpdatedAt: nowISO(),
     });
-    await waitForOutgoingStatus(conversationId, finalMessageId, OHMF_DELIVERY_STATUSES.SENT);
   } catch {
     try {
-      const smsPayload = await sendSMS(phone, text);
+      const smsPayload = await sendSMS(phone, content, CONTENT_TYPE_TEXT);
       const conversationId = sanitizeText(smsPayload.conversation_id, 80);
       if (conversationId) moveDraftToConversation(thread.id, conversationId, phone);
       const targetThreadId = conversationId || thread.id;
@@ -1701,11 +4399,11 @@ async function sendInDraftPhoneConversation(thread, text) {
   }
 }
 
-async function handleComposerSend(text) {
+async function handleComposerSend(content) {
   const thread = getActiveThread();
   if (!thread || thread.blocked) return;
-  if (thread.kind === "draft_phone") await sendInDraftPhoneConversation(thread, text);
-  else await sendInConversation(thread, text);
+  if (thread.kind === "draft_phone") await sendInDraftPhoneConversation(thread, content);
+  else await sendInConversation(thread, content);
 }
 
 function updatePhonePreview() {
@@ -1753,7 +4451,7 @@ async function verifyPhoneAuth(event) {
       body: JSON.stringify({
         challenge_id: state.challengeId,
         otp_code: otp,
-        device: { platform: "WEB", device_name: "OHMF Web", capabilities: ["MINI_APPS"] },
+        device: { platform: "WEB", device_name: "OHMF Web", capabilities: ["MINI_APPS", "E2EE_OTT_V2", "WEB_PUSH_V1"] },
       }),
     });
     const user = payload?.user || {};
@@ -1762,6 +4460,7 @@ async function verifyPhoneAuth(event) {
     authStoreSet({
       userId: sanitizeText(user.user_id, 80),
       phoneE164: sanitizeText(user.primary_phone_e164, 32),
+      deviceId: sanitizeText(payload?.device?.device_id, 80),
       accessToken: sanitizeText(tokens.access_token, 3000),
       refreshToken: sanitizeText(tokens.refresh_token, 3000),
     });
@@ -1780,16 +4479,34 @@ async function bootAfterAuth() {
   state.query = "";
   state.activeThreadId = null;
   state.threads = [];
+  state.profiles = {};
+  state.selfProfile = null;
+  state.crypto = { device: null, published: false, bundleCache: {} };
   eventStreamDisabled = false;
+  ensureSyncDeviceId();
   loadConversationStore();
+  loadSyncCursor();
   showAppShell();
   renderAll();
   try {
+    await loadSelfProfile();
+    await publishCryptoBundle().catch((error) => {
+      console.error(error);
+    });
     await loadConversationsFromApi();
+    const requestedConversationId = sanitizeText(new URLSearchParams(window.location.search).get("conversation_id"), 80);
+    if (requestedConversationId && getThreadById(requestedConversationId)) {
+      state.activeThreadId = requestedConversationId;
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
     if (state.activeThreadId) await ensureMessagesLoaded(state.activeThreadId);
+    await syncFromCursor();
+    await registerServiceWorkerAndPush().catch((error) => {
+      console.error(error);
+    });
     stopEventStream();
     stopRealtimeSocket();
-    void startEventStream();
+    stopLiveRefreshLoop();
     startRealtimeSocket();
     renderAll();
   } catch (error) {
@@ -1801,6 +4518,7 @@ async function selectMiniapp(appId) {
   const entry = getMiniappCatalogEntry(appId);
   if (!entry) return;
   state.miniapp.selectedAppId = appId;
+  state.miniapp.popupOpen = false;
   state.miniapp.launchContext = null;
   state.miniapp.sessionState = normalizeMiniappSessionState(null);
   state.miniapp.frameWindow = null;
@@ -1831,13 +4549,14 @@ async function openEmbeddedMiniapp() {
     } else {
       await ensureMiniappSession();
     }
+    state.miniapp.popupOpen = true;
     el.miniappFrame.setAttribute("sandbox", "allow-scripts allow-same-origin");
     el.miniappFrame.src = buildMiniappFrameURL();
-    renderMiniappLauncher();
+    renderAll();
   } catch (error) {
     console.error(error);
     state.miniapp.lastShareError = sanitizeText(error.message || "Unable to open app.", 180);
-    renderMiniappLauncher();
+    renderAll();
   }
 }
 
@@ -1848,24 +4567,31 @@ async function resetEmbeddedMiniappSession() {
   } catch (error) {
     console.error(error);
   }
+  state.miniapp.popupOpen = false;
   state.miniapp.launchContext = null;
   state.miniapp.sessionState = normalizeMiniappSessionState(null);
   state.miniapp.frameWindow = null;
   state.miniapp.consentRequired = false;
   state.miniapp.lastShareError = "";
   el.miniappFrame.src = "about:blank";
-  renderMiniappLauncher();
+  renderAll();
 }
 
 function logout() {
+  stopLocalTyping();
   stopEventStream();
   stopRealtimeSocket();
+  stopLiveRefreshLoop();
   authStoreClear();
   state.threads = [];
   state.activeThreadId = null;
   state.query = "";
   state.typingDraft = "";
+  state.remoteTypingByThread = {};
+  state.replyTarget = null;
+  state.openMessageMenu = null;
   state.miniapp.drawerOpen = false;
+  state.miniapp.popupOpen = false;
   state.miniapp.selectedAppId = "";
   state.miniapp.manifest = null;
   state.miniapp.launchContext = null;
@@ -1873,10 +4599,30 @@ function logout() {
   state.miniapp.frameWindow = null;
   state.miniapp.consentRequired = false;
   state.miniapp.lastShareError = "";
+  state.sync.lastUserCursor = 0;
+  state.profiles = {};
+  state.selfProfile = null;
+  state.crypto = { device: null, published: false, bundleCache: {} };
   showAuthShell();
   setAuthStatus("Signed out.");
   renderAll();
 }
+
+document.addEventListener("visibilitychange", () => {
+  if (!state.auth || document.hidden) return;
+  void syncFromCursor();
+  if (!realtimeSocket) {
+    startRealtimeSocket();
+  }
+});
+
+window.addEventListener("online", () => {
+  if (!state.auth) return;
+  void syncFromCursor();
+  if (!realtimeSocket) {
+    startRealtimeSocket();
+  }
+});
 
 el.searchInput.addEventListener("input", (event) => {
   state.query = sanitizeText(event.target.value, 120);
@@ -1896,8 +4642,38 @@ el.miniappCloseBtn.addEventListener("click", () => {
   renderMiniappLauncher();
 });
 
+el.miniappBackdrop.addEventListener("click", async () => {
+  await closeMiniappWindow();
+  renderAll();
+});
+
+el.miniappWindowCloseBtn.addEventListener("click", async () => {
+  await closeMiniappWindow();
+  renderAll();
+});
+
 el.miniappCounterCard.addEventListener("click", async () => {
   await selectMiniapp("app.ohmf.counter-lab");
+});
+
+el.miniappUploadCard.addEventListener("click", () => {
+  closeMiniappLauncher();
+  el.attachmentInput.click();
+});
+
+el.attachmentInput.addEventListener("change", async () => {
+  const [file] = Array.from(el.attachmentInput.files || []);
+  el.attachmentInput.value = "";
+  const thread = getActiveThread();
+  if (!file || !thread) return;
+  try {
+    const uploaded = await uploadEncryptedMediaFile(thread, file);
+    await sendAttachmentInConversation(thread, uploaded);
+    renderAll();
+  } catch (error) {
+    console.error(error);
+    window.alert(sanitizeText(error.message || "Unable to send attachment.", 180));
+  }
 });
 
 el.miniappShareBtn.addEventListener("click", async () => {
@@ -1911,7 +4687,11 @@ el.miniappShareBtn.addEventListener("click", async () => {
 });
 
 el.miniappOpenBtn.addEventListener("click", async () => {
-  await openEmbeddedMiniapp();
+  try {
+    await openEmbeddedMiniapp();
+  } catch (error) {
+    console.error(error);
+  }
 });
 
 el.miniappResetBtn.addEventListener("click", async () => {
@@ -1920,22 +4700,30 @@ el.miniappResetBtn.addEventListener("click", async () => {
 
 el.composerInput.addEventListener("input", () => {
   state.typingDraft = sanitizeText(el.composerInput.value, 1000);
+  syncLocalTypingSignal();
   renderMessages();
 });
 
 el.composer.addEventListener("submit", async (event) => {
   event.preventDefault();
-  const text = sanitizeText(el.composerInput.value, 1000);
-  if (!text) return;
+  const content = composerMessageContent(el.composerInput.value);
+  if (!content) return;
   el.composerInput.value = "";
   state.typingDraft = "";
+  stopLocalTyping();
   renderMessages();
   try {
-    await handleComposerSend(text);
+    await handleComposerSend(content);
+    clearReplyTarget(false);
   } catch (error) {
     console.error(error);
   }
   renderAll();
+});
+
+el.composerReplyCancel.addEventListener("click", () => {
+  clearReplyTarget();
+  el.composerInput.focus();
 });
 
 el.backBtn.addEventListener("click", () => closeMobileThread());
@@ -1943,6 +4731,28 @@ el.backBtn.addEventListener("click", () => closeMobileThread());
 el.newChatBtn.addEventListener("click", () => {
   el.newChatForm.classList.toggle("hidden");
   if (!el.newChatForm.classList.contains("hidden")) el.newPhoneInput.focus();
+});
+
+el.newGroupBtn.addEventListener("click", async () => {
+  const title = window.prompt("Group title", "");
+  if (title === null) return;
+  const members = window.prompt("Participant phone numbers in E.164 format (comma separated)", "");
+  if (members === null) return;
+  const participantPhones = members
+    .split(",")
+    .map((item) => sanitizeText(item, 32))
+    .filter(Boolean);
+  if (!participantPhones.length) {
+    window.alert("Enter at least one participant phone number.");
+    return;
+  }
+  try {
+    await createGroupConversation(title, participantPhones);
+    openMobileThread();
+  } catch (error) {
+    console.error(error);
+    window.alert(sanitizeText(error.message || "Unable to create group.", 180));
+  }
 });
 
 el.newChatForm.addEventListener("submit", (event) => {
@@ -1968,32 +4778,63 @@ el.logoutBtn.addEventListener("click", async () => {
   logout();
 });
 
-el.nicknameBtn.addEventListener("click", () => {
+el.nicknameBtn.addEventListener("click", async () => {
   const thread = getActiveThread();
-  if (!thread) return;
-  const nickname = sanitizeText(window.prompt("Set a nickname for this user", thread.nickname || thread.title), 80);
-  if (!nickname) return;
-  upsertThread({ ...thread, nickname });
-  saveConversationStore();
-  renderAll();
+  if (!thread || thread.kind === "draft_phone") return;
+  const nextValue = window.prompt("Set a nickname for this conversation", thread.nickname || "");
+  if (nextValue === null) return;
+  try {
+    await updateConversationPreferences(thread.id, { nickname: sanitizeText(nextValue, 80) });
+    renderAll();
+  } catch (error) {
+    console.error(error);
+    window.alert(sanitizeText(error.message || "Unable to update nickname.", 160));
+  }
 });
 
-el.blockBtn.addEventListener("click", () => {
+el.blockBtn.addEventListener("click", async () => {
   const thread = getActiveThread();
-  if (!thread) return;
-  upsertThread({ ...thread, blocked: !thread.blocked });
-  saveConversationStore();
-  renderAll();
+  const targetUserId = otherUserIdForThread(thread);
+  if (!thread || !targetUserId) return;
+  try {
+    if (thread.blockedByViewer) {
+      await apiRequest(`/v1/blocks/${encodeURIComponent(targetUserId)}`, { method: "DELETE" });
+      applyConversationStateUpdate({
+        conversation_id: thread.id,
+        blocked: Boolean(thread.blockedByOther),
+        blocked_by_viewer: false,
+        blocked_by_other: Boolean(thread.blockedByOther),
+        updated_at: nowISO(),
+      });
+    } else {
+      await apiRequest(`/v1/blocks/${encodeURIComponent(targetUserId)}`, { method: "POST", body: JSON.stringify({}) });
+      applyConversationStateUpdate({
+        conversation_id: thread.id,
+        blocked: true,
+        blocked_by_viewer: true,
+        blocked_by_other: Boolean(thread.blockedByOther),
+        updated_at: nowISO(),
+      });
+    }
+    renderAll();
+  } catch (error) {
+    console.error(error);
+    window.alert(sanitizeText(error.message || "Unable to update block state.", 160));
+  }
 });
 
-el.closeThreadBtn.addEventListener("click", () => {
+el.closeThreadBtn.addEventListener("click", async () => {
   const thread = getActiveThread();
-  if (!thread) return;
-  upsertThread({ ...thread, closed: true });
-  const remaining = visibleThreads();
-  state.activeThreadId = remaining.length ? remaining[0].id : null;
-  saveConversationStore();
-  renderAll();
+  if (!thread || thread.kind === "draft_phone") return;
+  try {
+    await updateConversationPreferences(thread.id, { closed: true });
+    const remaining = visibleThreads();
+    state.activeThreadId = remaining.length ? remaining[0].id : null;
+    renderAll();
+  } catch (error) {
+    console.error(error);
+    window.alert(sanitizeText(error.message || "Unable to close conversation.", 160));
+  }
 });
 
 el.phoneStartForm.addEventListener("submit", startPhoneAuth);
@@ -2004,6 +4845,13 @@ el.newPhoneInput.addEventListener("input", updateNewPhoneFormat);
 
 window.addEventListener("resize", () => {
   if (!window.matchMedia("(max-width: 880px)").matches) closeMobileThread();
+});
+
+document.addEventListener("click", (event) => {
+  if (!state.openMessageMenu) return;
+  const target = event.target;
+  if (target instanceof Element && target.closest(".message-action-anchor")) return;
+  clearMessageMenu();
 });
 
 window.addEventListener("message", async (event) => {
@@ -2029,7 +4877,32 @@ window.addEventListener("message", async (event) => {
   }
 });
 
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.addEventListener("message", (event) => {
+    if (event.data?.type !== "notification.open") return;
+    const conversationId = sanitizeText(event.data?.conversation_id, 80);
+    if (conversationId) {
+      state.activeThreadId = conversationId;
+      renderAll();
+    }
+    void syncFromCursor();
+  });
+}
+
+document.addEventListener("keydown", async (event) => {
+  if (event.key !== "Escape") return;
+  if (state.miniapp.popupOpen) {
+    await closeMiniappWindow();
+    renderAll();
+    return;
+  }
+  if (!state.miniapp.drawerOpen) return;
+  closeMiniappLauncher();
+  renderMiniappLauncher();
+});
+
 async function init() {
+  syncAuthHint();
   updatePhonePreview();
   const session = authStoreLoad();
   if (session) {

@@ -9,22 +9,11 @@ import (
 	"testing"
 	"time"
 
-	pgxmock "github.com/pashagolub/pgxmock"
+	"github.com/jackc/pgx/v5"
 	"ohmf/services/gateway/internal/middleware"
 )
 
 func TestStreamSupportsWrappedResponseWriter(t *testing.T) {
-	mockPool, err := pgxmock.NewPool()
-	if err != nil {
-		t.Fatalf("failed to create pgx mock: %v", err)
-	}
-	defer mockPool.Close()
-
-	mockPool.ExpectQuery("SELECT").
-		WithArgs("11111111-1111-1111-1111-111111111111").
-		WillReturnRows(pgxmock.NewRows([]string{"conv_max", "msg_max", "total"}).
-			AddRow(time.Unix(1, 0).UTC(), time.Unix(2, 0).UTC(), int64(3)))
-
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	ctx = middleware.WithUserID(ctx, "11111111-1111-1111-1111-111111111111")
@@ -33,7 +22,9 @@ func TestStreamSupportsWrappedResponseWriter(t *testing.T) {
 	rec := httptest.NewRecorder()
 	wrapped := unwrapOnlyWriter{ResponseWriter: rec}
 
-	NewHandler(mockPool).Stream(wrapped, req)
+	NewHandler(fakeDB{
+		row: fakeRow{values: []any{time.Unix(1, 0).UTC(), time.Unix(2, 0).UTC(), time.Unix(3, 0).UTC(), int64(3)}},
+	}, nil, nil).Stream(wrapped, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d body=%q", rec.Code, rec.Body.String())
@@ -41,22 +32,9 @@ func TestStreamSupportsWrappedResponseWriter(t *testing.T) {
 	if body := rec.Body.String(); !strings.Contains(body, "event: sync_required") {
 		t.Fatalf("expected sync_required event, got %q", body)
 	}
-	if err := mockPool.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet expectations: %v", err)
-	}
 }
 
 func TestStreamInitialSnapshotFailureDoesNotReturn500(t *testing.T) {
-	mockPool, err := pgxmock.NewPool()
-	if err != nil {
-		t.Fatalf("failed to create pgx mock: %v", err)
-	}
-	defer mockPool.Close()
-
-	mockPool.ExpectQuery("SELECT").
-		WithArgs("11111111-1111-1111-1111-111111111111").
-		WillReturnError(errors.New("db unavailable"))
-
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	ctx = middleware.WithUserID(ctx, "11111111-1111-1111-1111-111111111111")
@@ -64,16 +42,13 @@ func TestStreamInitialSnapshotFailureDoesNotReturn500(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/v1/events/stream", nil).WithContext(ctx)
 	rec := httptest.NewRecorder()
 
-	NewHandler(mockPool).Stream(rec, req)
+	NewHandler(fakeDB{row: fakeRow{err: errors.New("db unavailable")}}, nil, nil).Stream(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d body=%q", rec.Code, rec.Body.String())
 	}
 	if body := rec.Body.String(); !strings.Contains(body, `event: error`) || !strings.Contains(body, `snapshot_unavailable`) {
 		t.Fatalf("expected snapshot_unavailable event, got %q", body)
-	}
-	if err := mockPool.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet expectations: %v", err)
 	}
 }
 
@@ -83,4 +58,34 @@ type unwrapOnlyWriter struct {
 
 func (w unwrapOnlyWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
+}
+
+type fakeDB struct {
+	row fakeRow
+}
+
+func (f fakeDB) QueryRow(context.Context, string, ...any) pgx.Row {
+	return f.row
+}
+
+type fakeRow struct {
+	values []any
+	err    error
+}
+
+func (r fakeRow) Scan(dest ...any) error {
+	if r.err != nil {
+		return r.err
+	}
+	for i := range dest {
+		switch d := dest[i].(type) {
+		case *time.Time:
+			*d = r.values[i].(time.Time)
+		case *int64:
+			*d = r.values[i].(int64)
+		default:
+			return errors.New("unsupported scan target")
+		}
+	}
+	return nil
 }

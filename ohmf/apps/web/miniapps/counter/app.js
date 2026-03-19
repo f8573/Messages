@@ -1,13 +1,22 @@
 import { createMiniAppClientFromLocation } from "../../miniapp-sdk.js";
 
+const runtimeParams = new URLSearchParams(window.location.search);
+const isPreviewMode = runtimeParams.get("preview") === "1";
+const hasBridgeContext = Boolean(runtimeParams.get("channel") && runtimeParams.get("parent_origin"));
+
 const state = {
   counter: 0,
   launchContext: null,
   recentMessages: [],
   logEntries: [],
+  previewCounter: 3,
 };
 
 const el = {
+  appShell: document.getElementById("app-shell"),
+  previewShell: document.getElementById("preview-shell"),
+  previewCounterValue: document.getElementById("preview-counter-value"),
+  previewCaption: document.getElementById("preview-caption"),
   status: document.getElementById("status-pill"),
   counterValue: document.getElementById("counter-value"),
   noteInput: document.getElementById("note-input"),
@@ -25,7 +34,8 @@ const el = {
   sendSummaryBtn: document.getElementById("send-summary-btn"),
 };
 
-const bridge = createMiniAppClientFromLocation();
+const bridge = hasBridgeContext ? createMiniAppClientFromLocation() : null;
+let previewTicker = 0;
 
 function sanitizeText(value, limit = 240) {
   return String(value || "").replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, limit);
@@ -41,6 +51,11 @@ function randomId(prefix) {
 function setStatus(message, isError = false) {
   el.status.textContent = sanitizeText(message, 180);
   el.status.classList.toggle("error", Boolean(isError));
+}
+
+function requireBridge() {
+  if (bridge) return bridge;
+  throw new Error(isPreviewMode ? "Preview mode does not have host bridge context." : "Missing runtime channel information.");
 }
 
 function addLog(summary, detail) {
@@ -86,6 +101,36 @@ function renderLog() {
 
 function renderCounter() {
   el.counterValue.textContent = String(state.counter);
+  renderPreview();
+}
+
+function renderPreview() {
+  const previewValue = state.launchContext ? state.counter : state.previewCounter;
+  el.previewCounterValue.textContent = String(previewValue);
+
+  const participants = Array.isArray(state.launchContext?.participants) ? state.launchContext.participants : [];
+  if (participants.length) {
+    el.previewCaption.textContent = `${participants.length} participant${participants.length === 1 ? "" : "s"} in the shared session.`;
+    return;
+  }
+
+  el.previewCaption.textContent = "Live square preview for shared app cards.";
+}
+
+function enterPreviewMode() {
+  document.body.classList.add("preview-mode");
+  el.appShell.hidden = true;
+  el.previewShell.hidden = false;
+  renderPreview();
+}
+
+function startPreviewTicker() {
+  window.clearInterval(previewTicker);
+  previewTicker = window.setInterval(() => {
+    if (state.launchContext) return;
+    state.previewCounter = (state.previewCounter + 1) % 10;
+    renderPreview();
+  }, 1600);
 }
 
 function renderContext() {
@@ -127,25 +172,27 @@ function renderRecentMessages() {
   });
 }
 
-bridge.on("session.stateUpdated", (payload) => {
-  addLog("event session.stateUpdated", payload);
-  if (payload?.state_snapshot) {
-    state.counter = Number(payload.state_snapshot.counter) || 0;
-    renderCounter();
-    setStatus(`Shared counter updated to ${state.counter}.`);
-  }
-});
+if (bridge) {
+  bridge.on("session.stateUpdated", (payload) => {
+    addLog("event session.stateUpdated", payload);
+    if (payload?.state_snapshot) {
+      state.counter = Number(payload.state_snapshot.counter) || 0;
+      renderCounter();
+      setStatus(`Shared counter updated to ${state.counter}.`);
+    }
+  });
 
-bridge.on("session.permissionsUpdated", (payload) => {
-  addLog("event session.permissionsUpdated", payload);
-  if (!state.launchContext) state.launchContext = {};
-  state.launchContext.capabilities_granted = Array.isArray(payload?.capabilities_granted) ? payload.capabilities_granted : [];
-  renderContext();
-  setStatus("Host permission grants changed.");
-});
+  bridge.on("session.permissionsUpdated", (payload) => {
+    addLog("event session.permissionsUpdated", payload);
+    if (!state.launchContext) state.launchContext = {};
+    state.launchContext.capabilities_granted = Array.isArray(payload?.capabilities_granted) ? payload.capabilities_granted : [];
+    renderContext();
+    setStatus("Host permission grants changed.");
+  });
+}
 
 async function refreshLaunchContext() {
-  const launchContext = await bridge.getLaunchContext();
+  const launchContext = await requireBridge().getLaunchContext();
   state.launchContext = launchContext;
   state.counter = Number(launchContext?.state_snapshot?.counter) || 0;
   renderCounter();
@@ -154,14 +201,14 @@ async function refreshLaunchContext() {
 }
 
 async function refreshThreadContext() {
-  const context = await bridge.readConversationContext();
+  const context = await requireBridge().readConversationContext();
   state.recentMessages = Array.isArray(context?.recent_messages) ? context.recent_messages : [];
   renderRecentMessages();
   addLog("conversation.readContext", context);
 }
 
 async function loadNote() {
-  const result = await bridge.getSessionStorage("session_note");
+  const result = await requireBridge().getSessionStorage("session_note");
   el.noteInput.value = typeof result?.value === "string" ? result.value : "";
   addLog("storage.session.get", result);
   setStatus("Loaded session note.");
@@ -169,13 +216,13 @@ async function loadNote() {
 
 async function saveNote() {
   const value = sanitizeText(el.noteInput.value, 240);
-  const result = await bridge.setSessionStorage("session_note", value);
+  const result = await requireBridge().setSessionStorage("session_note", value);
   addLog("storage.session.set", result);
   setStatus("Saved session note.");
 }
 
 async function updateCounter(nextValue) {
-  const result = await bridge.updateSessionState({ counter: nextValue });
+  const result = await requireBridge().updateSessionState({ counter: nextValue });
   state.counter = Number(result?.state_snapshot?.counter) || 0;
   renderCounter();
   addLog("session.updateState", result);
@@ -183,7 +230,7 @@ async function updateCounter(nextValue) {
 }
 
 async function sendSummary() {
-  const result = await bridge.sendConversationMessage({
+  const result = await requireBridge().sendConversationMessage({
     content_type: "app_event",
     content: {
       event_name: "COUNTER_SUMMARY",
@@ -196,7 +243,25 @@ async function sendSummary() {
   await refreshThreadContext();
 }
 
+async function bootstrapPreview() {
+  enterPreviewMode();
+  startPreviewTicker();
+  if (!bridge) return;
+
+  try {
+    await refreshLaunchContext();
+    setStatus("Preview bridge ready.");
+  } catch (error) {
+    addLog(`preview bootstrap error ${error.code || "error"}`, { message: error.message, details: error.details });
+  }
+}
+
 async function bootstrap() {
+  if (isPreviewMode) {
+    await bootstrapPreview();
+    return;
+  }
+
   try {
     await refreshLaunchContext();
     await refreshThreadContext();

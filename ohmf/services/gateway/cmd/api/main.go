@@ -22,6 +22,7 @@ import (
 	"ohmf/services/gateway/internal/config"
 	"ohmf/services/gateway/internal/conversations"
 	"ohmf/services/gateway/internal/db"
+	"ohmf/services/gateway/internal/devicekeys"
 	"ohmf/services/gateway/internal/devices"
 	"ohmf/services/gateway/internal/discovery"
 	"ohmf/services/gateway/internal/events"
@@ -33,13 +34,16 @@ import (
 	"ohmf/services/gateway/internal/notification"
 	"ohmf/services/gateway/internal/observability"
 	openapipkg "ohmf/services/gateway/internal/openapi"
+	"ohmf/services/gateway/internal/otp"
 	"ohmf/services/gateway/internal/presence"
 	"ohmf/services/gateway/internal/realtime"
 	"ohmf/services/gateway/internal/relay"
+	"ohmf/services/gateway/internal/replication"
 	"ohmf/services/gateway/internal/serviceregistry"
 	"ohmf/services/gateway/internal/sync"
 	"ohmf/services/gateway/internal/token"
 	"ohmf/services/gateway/internal/users"
+	wk "ohmf/services/gateway/internal/worker"
 )
 
 func main() {
@@ -165,20 +169,26 @@ func main() {
 	}
 
 	rateLimiter := limit.NewTokenBucket(rdb)
+	replicationStore := replication.NewStore(pool, rdb)
 
 	tokens := token.NewService(cfg.JWTSecret)
-	authSvc := auth.NewService(pool, rdb, tokens, cfg.AccessTTL, cfg.RefreshTTL, cfg)
-	usersSvc := users.NewService(pool)
+	otpProvider, err := otp.NewProvider(cfg)
+	if err != nil {
+		logger.Fatal().Err(err).Msg("otp provider init failed")
+	}
+	authSvc := auth.NewService(pool, rdb, tokens, otpProvider, cfg.AccessTTL, cfg.RefreshTTL, cfg)
+	usersSvc := users.NewService(pool, replicationStore)
 	discoverySvc := discovery.NewService(pool, cfg.DiscoveryPepper)
-	convSvc := conversations.NewService(pool)
-	devSvc := devices.NewService(pool)
-	mediaSvc := media.NewService(pool)
+	convSvc := conversations.NewService(pool, replicationStore)
+	devSvc := devices.NewService(pool, cfg)
+	mediaSvc := media.NewService(pool, cfg)
 	carrierSvc := carrier.NewService(&pgxAdapter{p: pool})
 	presenceSvc := presence.NewService(rdb)
-	notificationSvc := notification.NewService(pool)
-	miniappSvc := miniapp.NewService(pool, cfg)
+	notificationSvc := notification.NewService(pool, devSvc, cfg)
 	abuseSvc := abuse.NewService(pool)
-	relaySvc := relay.NewService(pool)
+	relaySvc := relay.NewServiceWithOptions(pool, relay.Options{RequireAttestation: cfg.RequireRelayAttestation})
+	miniappSvc := miniapp.NewService(pool, cfg, rdb, replicationStore)
+	deviceKeysSvc := devicekeys.NewService(pool)
 	msgSvc := messages.NewService(pool, messages.Options{
 		UseKafkaSend:      cfg.UseKafkaSend,
 		UseCassandraReads: cfg.UseCassandraReads,
@@ -187,9 +197,10 @@ func main() {
 		Cassandra:         cassandraStore,
 		RateLimiter:       rateLimiter,
 		Redis:             rdb,
+		Replication:       replicationStore,
 	})
 	eventsHandler := events.NewHandler(pool, rdb, msgSvc)
-	wsHandler := realtime.NewHandler(tokens, msgSvc, rdb, rateLimiter, cfg.EnableWSSend)
+	wsHandler := realtime.NewHandler(tokens, msgSvc, rdb, rateLimiter, cfg.EnableWSSend, replicationStore)
 
 	authHandler := auth.NewHandler(authSvc)
 	usersHandler := users.NewHandler(usersSvc)
@@ -203,9 +214,16 @@ func main() {
 	miniappHandler := miniapp.NewHandler(miniappSvc)
 	abuseHandler := abuse.NewHandler(abuseSvc)
 	relayHandler := relay.NewHandler(relaySvc)
+	deviceKeysHandler := devicekeys.NewHandler(deviceKeysSvc)
 	msgHandler := messages.NewHandler(msgSvc)
-	syncSvc := sync.NewService(pool)
+	syncSvc := sync.NewService(pool, replicationStore)
 	syncHandler := sync.NewHandler(syncSvc)
+	syncFanoutWorker := wk.NewSyncFanoutWorker(replicationStore)
+	go func() {
+		if err := syncFanoutWorker.Start(ctx); err != nil {
+			logger.Error().Err(err).Msg("sync fanout worker stopped")
+		}
+	}()
 
 	// Build a lightweight runtime view of which high-level services are present
 	reg := serviceregistry.New(map[string]bool{
@@ -230,7 +248,7 @@ func main() {
 		timeout := chimiddleware.Timeout(30 * time.Second)
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 			switch req.URL.Path {
-			case "/v1/ws", "/v1/events/stream":
+			case "/v1/ws", "/v1/events/stream", "/v2/ws":
 				next.ServeHTTP(w, req)
 				return
 			}
@@ -253,7 +271,7 @@ func main() {
 			}
 			return strings.HasPrefix(origin, "http://localhost:") || strings.HasPrefix(origin, "http://127.0.0.1:")
 		},
-		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
 		ExposedHeaders:   []string{"Link"},
 		AllowCredentials: true,
@@ -295,22 +313,33 @@ func main() {
 		v1.Post("/auth/phone/verify", authHandler.VerifyPhone)
 		v1.Post("/auth/refresh", authHandler.Refresh)
 		v1.Get("/ws", wsHandler.ServeHTTP)
+		v1.Put("/media/uploads/{token}", mediaHandler.UploadObject)
+		v1.Get("/media/downloads/{token}", mediaHandler.DownloadObject)
 
 		v1.Group(func(protected chi.Router) {
 			protected.Use(appmw.RequireAuth(tokens))
 			protected.Post("/auth/logout", authHandler.Logout)
 			protected.Post("/account/export", usersHandler.ExportAccount)
 			protected.Post("/account/delete", usersHandler.DeleteAccount)
+			protected.Get("/me", usersHandler.GetMe)
+			protected.Patch("/me", usersHandler.UpdateMe)
+			protected.Post("/users/resolve", usersHandler.ResolveProfiles)
 			protected.Post("/discovery", discoveryHandler.Discover)
 			// Alternate path per spec: /contacts/discover
 			protected.Post("/contacts/discover", discoveryHandler.Discover)
 			protected.Post("/conversations", convHandler.Create)
 			protected.Post("/devices", devHandler.Register)
 			protected.Get("/devices", devHandler.List)
+			protected.Patch("/devices/{id}", devHandler.Update)
 			protected.Delete("/devices/{id}", devHandler.Revoke)
+			protected.Put("/device-keys/{deviceID}", deviceKeysHandler.Publish)
+			protected.Post("/device-keys/{deviceID}/prekeys", deviceKeysHandler.AddPrekeys)
+			protected.Get("/device-keys/{userID}", deviceKeysHandler.ListForUser)
+			protected.Post("/device-keys/{userID}/claim", deviceKeysHandler.ClaimForUser)
 			protected.Get("/presence/users/{id}", presenceHandler.GetUser)
 			protected.Get("/presence/conversations/{id}", presenceHandler.GetConversation)
 			protected.Post("/media/attachments", mediaHandler.Register)
+			protected.Get("/media/attachments/{id}/download", mediaHandler.CreateDownload)
 			protected.Delete("/media/attachments/{id}", mediaHandler.Purge)
 			protected.Post("/carrier/messages/import", carrierHandler.Import)
 			protected.Get("/carrier/messages", carrierHandler.List)
@@ -340,6 +369,8 @@ func main() {
 			protected.Get("/apps/{appID}", miniappHandler.GetApp)
 
 			protected.Post("/notifications/send", notificationHandler.Send)
+			protected.Get("/notifications/preferences", notificationHandler.GetPreferences)
+			protected.Put("/notifications/preferences", notificationHandler.UpdatePreferences)
 			protected.Post("/relay/messages", relayHandler.CreateMessage)
 			protected.Get("/relay/jobs/{id}", relayHandler.GetJob)
 			protected.Get("/relay/jobs/available", relayHandler.ListAvailable)
@@ -356,6 +387,10 @@ func main() {
 			protected.Get("/conversations", convHandler.List)
 			protected.Get("/conversations/{id}", convHandler.Get)
 			protected.Patch("/conversations/{id}", convHandler.UpdatePolicy)
+			protected.Patch("/conversations/{id}/metadata", convHandler.UpdateMetadata)
+			protected.Patch("/conversations/{id}/preferences", convHandler.UpdatePreferences)
+			protected.Post("/conversations/{id}/members", convHandler.AddMembers)
+			protected.Delete("/conversations/{id}/members/{userID}", convHandler.RemoveMember)
 			protected.Post("/conversations/{id}/thread_keys", convHandler.SetThreadKeys)
 			protected.With(appmw.ValidateJSONMiddleware("send-message-request")).Post("/messages", msgHandler.Send)
 			protected.With(appmw.ValidateJSONMiddleware("send-phone-message-request")).Post("/messages/phone", msgHandler.SendToPhone)
@@ -364,12 +399,24 @@ func main() {
 			protected.Post("/messages/{id}/deliveries", msgHandler.RecordDelivery)
 			protected.Get("/conversations/{id}/messages", msgHandler.List)
 			protected.Get("/conversations/{id}/timeline", msgHandler.Timeline)
+			protected.Patch("/messages/{id}", msgHandler.Edit)
 			protected.Delete("/messages/{id}", msgHandler.Delete)
 			protected.Get("/messages/{id}/deliveries", msgHandler.ListDeliveries)
 			protected.Post("/conversations/{id}/read", msgHandler.MarkRead)
 			protected.Post("/messages/{id}/redact", msgHandler.Redact)
 			protected.Get("/events/stream", eventsHandler.Stream)
 			protected.Get("/sync", syncHandler.Incremental)
+		})
+	})
+
+	r.Route("/v2", func(v2 chi.Router) {
+		v2.Get("/ws", wsHandler.ServeV2)
+		v2.Group(func(protected chi.Router) {
+			protected.Use(appmw.RequireAuth(tokens))
+			protected.Get("/conversations", convHandler.ListProjected)
+			protected.Get("/sync", syncHandler.IncrementalV2)
+			protected.Post("/conversations/{id}/read", msgHandler.MarkRead)
+			protected.Post("/conversations/{id}/delivered", syncHandler.MarkDeliveredV2)
 		})
 	})
 

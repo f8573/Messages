@@ -71,9 +71,9 @@ func TestCreateListAcceptAndFinishJob(t *testing.T) {
 		t.Fatalf("expected job id")
 	}
 
-	rows := pgxmock.NewRows([]string{"id", "creator_user_id", "destination", "transport_hint", "content", "status", "executing_device_id", "result", "created_at", "updated_at"}).
-		AddRow(jobID, "11111111-1111-1111-1111-111111111111", mustJSON(t, destination), "SMS", mustJSON(t, content), "queued", "", []byte(nil), nil, nil)
-	mock.ExpectQuery(`SELECT id::text, creator_user_id::text, destination, transport_hint, content, status, executing_device_id::text, result, created_at, updated_at FROM relay_jobs WHERE status = 'queued'`).
+	rows := pgxmock.NewRows([]string{"id", "creator_user_id", "destination", "transport_hint", "content", "status", "executing_device_id", "consent_state", "required_capability", "expires_at", "accepted_at", "attested_at", "result", "created_at", "updated_at"}).
+		AddRow(jobID, "11111111-1111-1111-1111-111111111111", mustJSON(t, destination), "SMS", mustJSON(t, content), "queued", "", "PENDING_DEVICE", "RELAY_EXECUTOR", nil, nil, nil, []byte(nil), nil, nil)
+	mock.ExpectQuery(`SELECT id::text, creator_user_id::text, destination, transport_hint, content, status, executing_device_id::text, consent_state, required_capability, expires_at, accepted_at, attested_at, result, created_at, updated_at FROM relay_jobs WHERE status = 'queued'`).
 		WithArgs(10).
 		WillReturnRows(rows)
 

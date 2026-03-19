@@ -19,7 +19,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 	"ohmf/services/gateway/internal/config"
+	"ohmf/services/gateway/internal/replication"
 )
 
 var (
@@ -36,8 +38,10 @@ var (
 var semverPattern = regexp.MustCompile(`^\d+\.\d+\.\d+(-[A-Za-z0-9.-]+)?$`)
 
 type Service struct {
-	db        *pgxpool.Pool
-	publicKey any
+	db          *pgxpool.Pool
+	publicKey   any
+	redis       *redis.Client
+	replication *replication.Store
 }
 
 type SessionParticipant struct {
@@ -87,8 +91,8 @@ type manifestSignature struct {
 	Sig string
 }
 
-func NewService(db *pgxpool.Pool, cfg config.Config) *Service {
-	s := &Service{db: db}
+func NewService(db *pgxpool.Pool, cfg config.Config, redisClient *redis.Client, store *replication.Store) *Service {
+	s := &Service{db: db, redis: redisClient, replication: store}
 	if cfg.MiniappPublicKeyPEM != "" {
 		block, _ := pem.Decode([]byte(cfg.MiniappPublicKeyPEM))
 		if block != nil {
@@ -163,6 +167,20 @@ func validateManifest(mmap map[string]any) error {
 	}
 	if !nonEmptyStringField(entrypoint, "url") {
 		return fmt.Errorf("%w: entrypoint.url required", ErrManifestInvalid)
+	}
+	messagePreview, ok := mmap["message_preview"].(map[string]any)
+	if !ok {
+		return fmt.Errorf("%w: message_preview object required", ErrManifestInvalid)
+	}
+	previewType := stringField(messagePreview, "type")
+	if previewType != "static_image" && previewType != "live" {
+		return fmt.Errorf("%w: message_preview.type invalid", ErrManifestInvalid)
+	}
+	if !nonEmptyStringField(messagePreview, "url") {
+		return fmt.Errorf("%w: message_preview.url required", ErrManifestInvalid)
+	}
+	if fitMode := stringField(messagePreview, "fit_mode"); fitMode != "" && fitMode != "scale" && fitMode != "crop" {
+		return fmt.Errorf("%w: message_preview.fit_mode invalid", ErrManifestInvalid)
 	}
 	if !stringSliceFieldPresent(mmap, "permissions") {
 		return fmt.Errorf("%w: permissions array required", ErrManifestInvalid)
@@ -684,19 +702,19 @@ func (s *Service) loadSessionRecord(ctx context.Context, sessionID string) (sess
 func (s *Service) sessionRecordToMap(record sessionRecord) map[string]any {
 	viewer := pickViewer(record.Participants, record.CreatedBy)
 	return map[string]any{
-		"app_session_id":       record.ID,
-		"manifest_id":          record.ManifestID,
-		"app_id":               record.AppID,
-		"conversation_id":      record.ConversationID,
-		"participants":         record.Participants,
-		"capabilities_granted": record.viewerGrantedPermissions(viewer.UserID),
+		"app_session_id":          record.ID,
+		"manifest_id":             record.ManifestID,
+		"app_id":                  record.AppID,
+		"conversation_id":         record.ConversationID,
+		"participants":            record.Participants,
+		"capabilities_granted":    record.viewerGrantedPermissions(viewer.UserID),
 		"participant_permissions": record.ParticipantPermissions,
-		"state":                record.State,
-		"state_version":        record.StateVersion,
-		"expires_at":           record.ExpiresAt,
-		"created_at":           record.CreatedAt,
-		"launch_context":       buildLaunchContext(record),
-		"ended_at":             record.EndedAt,
+		"state":                   record.State,
+		"state_version":           record.StateVersion,
+		"expires_at":              record.ExpiresAt,
+		"created_at":              record.CreatedAt,
+		"launch_context":          buildLaunchContext(record),
+		"ended_at":                record.EndedAt,
 	}
 }
 

@@ -1,0 +1,25 @@
+ALTER TABLE devices
+  ADD COLUMN IF NOT EXISTS push_provider TEXT,
+  ADD COLUMN IF NOT EXISTS push_subscription TEXT,
+  ADD COLUMN IF NOT EXISTS push_subscription_updated_at TIMESTAMPTZ;
+
+ALTER TABLE attachments
+  ADD COLUMN IF NOT EXISTS file_name TEXT,
+  ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'PENDING_UPLOAD',
+  ADD COLUMN IF NOT EXISTS checksum_sha256 TEXT,
+  ADD COLUMN IF NOT EXISTS upload_completed_at TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS available_at TIMESTAMPTZ;
+
+ALTER TABLE upload_tokens
+  ADD COLUMN IF NOT EXISTS object_key TEXT,
+  ADD COLUMN IF NOT EXISTS upload_method TEXT NOT NULL DEFAULT 'PUT',
+  ADD COLUMN IF NOT EXISTS expected_checksum_sha256 TEXT,
+  ADD COLUMN IF NOT EXISTS completed_object_size BIGINT;
+
+ALTER TABLE notifications
+  ADD COLUMN IF NOT EXISTS delivered BOOLEAN NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS last_error TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_attachments_status ON attachments(status);
+CREATE INDEX IF NOT EXISTS idx_notifications_status ON notifications(status);

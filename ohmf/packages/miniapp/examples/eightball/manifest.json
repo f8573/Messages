@@ -10,6 +10,12 @@
   "icons": [
     { "src": "https://example.com/miniapps/eightball/icon-128.png", "sizes": "128x128", "type": "image/png" }
   ],
+  "message_preview": {
+    "type": "static_image",
+    "url": "https://example.com/miniapps/eightball/preview-square.png",
+    "alt_text": "EightBall conversation preview",
+    "fit_mode": "scale"
+  },
   "permissions": ["network","vibrate"],
   "capabilities": {
     "ui": { "dialogs": true },

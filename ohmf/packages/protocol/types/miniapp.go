@@ -16,6 +16,14 @@ type MiniAppIcon struct {
 	Size  int    `json:"size,omitempty"`
 }
 
+// MiniAppMessagePreview defines the preview shown when a mini-app is shared into a conversation.
+type MiniAppMessagePreview struct {
+	Type    string `json:"type"` // "static_image" or "live"
+	URL     string `json:"url"`  // Preview asset or live preview URL
+	AltText string `json:"alt_text,omitempty"`
+	FitMode string `json:"fit_mode,omitempty"` // "scale" or "crop"; defaults to "scale"
+}
+
 // MiniAppSignature holds an integrity signature for the manifest.
 type MiniAppSignature struct {
 	Alg string `json:"alg"`
@@ -31,6 +39,7 @@ type MiniAppManifest struct {
 	Version         string                 `json:"version"`
 	Entrypoint      MiniAppEntrypoint      `json:"entrypoint"`
 	Icons           []MiniAppIcon          `json:"icons,omitempty"`
+	MessagePreview  MiniAppMessagePreview  `json:"message_preview"`
 	Permissions     []string               `json:"permissions"`
 	Capabilities    map[string]interface{} `json:"capabilities"`
 	Metadata        map[string]interface{} `json:"metadata,omitempty"`
