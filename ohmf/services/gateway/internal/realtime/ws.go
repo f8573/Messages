@@ -65,7 +65,16 @@ type presenceSubscribePayload struct {
 	ConversationIDs []string `json:"conversation_ids"`
 }
 
-func NewHandler(tokens *token.Service, messageService *messages.Service, redisClient *redis.Client, limiter *limit.TokenBucket, enableSend bool, store *replication.Store) *Handler {
+// removed: enableSend boolean parameter - replaced with named constructors
+func NewHandlerWithSend(tokens *token.Service, messageService *messages.Service, redisClient *redis.Client, limiter *limit.TokenBucket, store *replication.Store) *Handler {
+	return newHandlerInternal(tokens, messageService, redisClient, limiter, true, store)
+}
+
+func NewHandlerReadOnly(tokens *token.Service, messageService *messages.Service, redisClient *redis.Client, limiter *limit.TokenBucket, store *replication.Store) *Handler {
+	return newHandlerInternal(tokens, messageService, redisClient, limiter, false, store)
+}
+
+func newHandlerInternal(tokens *token.Service, messageService *messages.Service, redisClient *redis.Client, limiter *limit.TokenBucket, enableSend bool, store *replication.Store) *Handler {
 	return &Handler{
 		tokens:      tokens,
 		messages:    messageService,
