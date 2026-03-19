@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"net/http"
 	"net/http/httputil"
@@ -179,7 +180,9 @@ func main() {
 	usersSvc := users.NewService(pool, replicationStore)
 	discoverySvc := discovery.NewService(pool, cfg.DiscoveryPepper)
 	convSvc := conversations.NewService(pool, replicationStore)
-	devSvc := devices.NewService(pool, cfg)
+	// removed: derive subscription key from config for AES-GCM encryption
+	subscriptionKeyBytes := sha256.Sum256([]byte(cfg.PushSubscriptionKey))[:]
+	devSvc := devices.NewService(pool, subscriptionKeyBytes)
 	mediaSvc := media.NewService(pool, cfg)
 	carrierSvc := carrier.NewService(&pgxAdapter{p: pool})
 	// removed: presence service - unused routes
