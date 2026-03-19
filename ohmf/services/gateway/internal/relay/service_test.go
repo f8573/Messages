@@ -54,7 +54,7 @@ func TestCreateListAcceptAndFinishJob(t *testing.T) {
 	}
 	defer mock.Close()
 
-	svc := NewServiceWithDB(&mockAdapter{p: mock})
+	svc := NewHandlerWithDB(&mockAdapter{p: mock})
 	ctx := context.Background()
 	destination := map[string]any{"phone_e164": "+15551234567"}
 	content := map[string]any{"text": "hello"}
@@ -124,7 +124,7 @@ func TestVerifyDeviceSignature(t *testing.T) {
 		WithArgs("33333333-3333-3333-3333-333333333333").
 		WillReturnRows(rows)
 
-	svc := NewServiceWithDB(&mockAdapter{p: mock})
+	svc := NewHandlerWithDB(&mockAdapter{p: mock})
 	if err := svc.verifyDeviceSignature(context.Background(), "33333333-3333-3333-3333-333333333333", payload, base64.StdEncoding.EncodeToString(signature)); err != nil {
 		t.Fatalf("verifyDeviceSignature failed: %v", err)
 	}

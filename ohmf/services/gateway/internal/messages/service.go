@@ -86,10 +86,6 @@ type DeliveryRecord struct {
 	FailureCode       string `json:"failure_code,omitempty"`
 }
 
-// Redact removes personal content from a message while preserving identifiers
-// required for timeline integrity. Only the original sender may redact their
-// own message. Redaction replaces the message content with an empty JSON
-// object, sets `redacted_at` and `visibility_state` = 'REDACTED'.
 func (s *Service) Redact(ctx context.Context, actorUserID, messageID string) error {
 	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -107,11 +103,9 @@ func (s *Service) Redact(ctx context.Context, actorUserID, messageID string) err
 		return err
 	}
 	if senderID != actorUserID {
-		// Only sender may redact (policy). Future: allow admins or owners.
 		return fmt.Errorf("forbidden")
 	}
 
-	// Perform redaction: empty content, set redacted_at and visibility state.
 	_, err = tx.Exec(ctx, `
 		UPDATE messages
 		SET content = '{}'::jsonb,
@@ -134,8 +128,8 @@ func (s *Service) Redact(ctx context.Context, actorUserID, messageID string) err
 	return nil
 }
 
-// DeleteMessage performs a privacy-aware deletion flow for a message.
-// Only the original sender may delete their message.
+// removed: redaction comments duplicated the implementation
+
 func (s *Service) DeleteMessage(ctx context.Context, actorUserID, messageID string) error {
 	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -166,7 +160,6 @@ func (s *Service) DeleteMessage(ctx context.Context, actorUserID, messageID stri
 		return fmt.Errorf("forbidden")
 	}
 
-	// mark deleted_at and redact content fields and set visibility to SOFT_DELETED
 	var deletedAt time.Time
 	err = tx.QueryRow(ctx, `
 		UPDATE messages
@@ -181,7 +174,6 @@ func (s *Service) DeleteMessage(ctx context.Context, actorUserID, messageID stri
 		return err
 	}
 
-	// collect attachments to instruct media service to delete
 	rows, err := tx.Query(ctx, `SELECT attachment_id::text FROM attachments WHERE message_id = $1`, messageID)
 	if err != nil {
 		return err
@@ -198,13 +190,11 @@ func (s *Service) DeleteMessage(ctx context.Context, actorUserID, messageID stri
 	rows.Close()
 
 	if len(attachments) > 0 {
-		// delete attachment rows (actual object deletion handled by media service)
 		if _, err := tx.Exec(ctx, `DELETE FROM attachments WHERE message_id = $1`, messageID); err != nil {
 			return err
 		}
 	}
 
-	// update conversation updated_at
 	if _, err := tx.Exec(ctx, `UPDATE conversations SET updated_at = now() WHERE id = $1::uuid`, convID); err != nil {
 		return err
 	}
@@ -237,7 +227,6 @@ func (s *Service) DeleteMessage(ctx context.Context, actorUserID, messageID stri
 		return err
 	}
 
-	// emit a deletion envelope for downstream processors (media purge, index invalidation)
 	if s.async != nil {
 		env := Envelope{
 			SpecVersion:    "2026-03-01",
@@ -256,7 +245,8 @@ func (s *Service) DeleteMessage(ctx context.Context, actorUserID, messageID stri
 	return nil
 }
 
-// EditMessage updates the content of a sender-authored text message.
+// removed: deletion flow comments repeated the control flow and SQL
+
 func (s *Service) EditMessage(ctx context.Context, actorUserID, messageID, text string) error {
 	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -347,7 +337,6 @@ func (s *Service) EditMessage(ctx context.Context, actorUserID, messageID, text 
 	return tx.Commit(ctx)
 }
 
-// RecordDelivery inserts or updates a delivery record for a message.
 func (s *Service) RecordDelivery(ctx context.Context, messageID string, dr DeliveryRecord) error {
 	_, err := s.db.Exec(ctx, `
 		INSERT INTO message_deliveries (id, message_id, recipient_user_id, recipient_device_id, recipient_phone_e164, transport, state, provider, submitted_at, updated_at, failure_code)
@@ -356,8 +345,6 @@ func (s *Service) RecordDelivery(ctx context.Context, messageID string, dr Deliv
 	return err
 }
 
-// AddReaction adds a reaction emoji by a user to a message. Reactions are
-// separate records and do not mutate the original message content.
 func (s *Service) AddReaction(ctx context.Context, actorUserID, messageID, emoji string) error {
 	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -405,7 +392,6 @@ func (s *Service) AddReaction(ctx context.Context, actorUserID, messageID, emoji
 	return tx.Commit(ctx)
 }
 
-// RemoveReaction deletes a reaction record.
 func (s *Service) RemoveReaction(ctx context.Context, actorUserID, messageID, emoji string) error {
 	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -451,7 +437,6 @@ func (s *Service) RemoveReaction(ctx context.Context, actorUserID, messageID, em
 	return tx.Commit(ctx)
 }
 
-// ListReactions returns aggregated reaction counts for a message.
 func (s *Service) ListReactions(ctx context.Context, messageID string) (map[string]int64, error) {
 	return s.listReactionsWithQuery(ctx, s.db, messageID)
 }
@@ -509,7 +494,6 @@ func nullableTimestamp(v string) any {
 	return v
 }
 
-// ListDeliveries returns delivery records for a message.
 func (s *Service) ListDeliveries(ctx context.Context, messageID string) ([]DeliveryRecord, error) {
 	rows, err := s.db.Query(ctx, `
 		SELECT id::text, message_id::text, recipient_user_id::text, recipient_device_id::text, recipient_phone_e164, transport, state, provider, submitted_at, updated_at, failure_code
@@ -672,7 +656,6 @@ func (s *Service) sendAsync(ctx context.Context, userID, conversationID, idemKey
 		return SendResult{}, ErrConversationAccess
 	}
 
-	// Enforce block rules for async path as well
 	if blocked, _, err := s.checkBlockedRecipients(ctx, s.db, userID, conversationID); err != nil {
 		return SendResult{}, err
 	} else if blocked {
@@ -868,9 +851,6 @@ func (s *Service) List(ctx context.Context, actor, conversationID string) ([]Mes
 	return items, rows.Err()
 }
 
-// ListUnified returns a merged timeline combining canonical server messages and
-// optional mirrored carrier messages for a conversation. Items are ordered by
-// created_at ascending to preserve display chronology.
 func (s *Service) ListUnified(ctx context.Context, actor, conversationID string, limit int) ([]Message, error) {
 	if ok, err := s.hasMembership(ctx, s.db, actor, conversationID); err != nil {
 		return nil, err
@@ -882,7 +862,6 @@ func (s *Service) ListUnified(ctx context.Context, actor, conversationID string,
 		limit = 100
 	}
 
-	// load canonical messages (up to limit)
 	rows, err := s.db.Query(ctx, `
 		SELECT
 			m.id::text,
@@ -944,7 +923,6 @@ func (s *Service) ListUnified(ctx context.Context, actor, conversationID string,
 		messageIDs = append(messageIDs, m.MessageID)
 	}
 
-	// fetch thread keys for this conversation
 	tkRows, err := s.db.Query(ctx, `SELECT value FROM conversation_thread_keys WHERE conversation_id = $1::uuid`, conversationID)
 	if err == nil {
 		defer tkRows.Close()
@@ -955,9 +933,7 @@ func (s *Service) ListUnified(ctx context.Context, actor, conversationID string,
 				keys = append(keys, v)
 			}
 		}
-		// query carrier messages matching thread keys or linked to server messages
 		if len(keys) > 0 || len(messageIDs) > 0 {
-			// build query dynamically
 			query := `SELECT id::text, device_id::text, thread_key, carrier_message_id, direction, transport, text, media_json, created_at, device_authoritative, server_message_id::text, raw_payload FROM carrier_messages WHERE `
 			args := []any{}
 			clauses := []string{}
@@ -992,7 +968,6 @@ func (s *Service) ListUnified(ctx context.Context, actor, conversationID string,
 					if err := crows.Scan(&id, &deviceID, &threadKey, &carrierMessageID, &direction, &transport, &text, &mediaJSON, &created, &deviceAuth, &serverMsgID, &rawPayload); err != nil {
 						return nil, err
 					}
-					// build content map
 					content := make(map[string]any)
 					if text != "" {
 						content["text"] = text
@@ -1005,7 +980,7 @@ func (s *Service) ListUnified(ctx context.Context, actor, conversationID string,
 					m := Message{
 						MessageID:      id,
 						ConversationID: conversationID,
-						SenderUserID:   "", // carrier origin does not map to server user
+						SenderUserID:   "",
 						ContentType:    "media",
 						Content:        content,
 						Transport:      transport,
@@ -1019,7 +994,6 @@ func (s *Service) ListUnified(ctx context.Context, actor, conversationID string,
 		}
 	}
 
-	// sort by created_at ascending
 	sort.SliceStable(items, func(i, j int) bool {
 		ti, _ := time.Parse(time.RFC3339, items[i].CreatedAt)
 		tj, _ := time.Parse(time.RFC3339, items[j].CreatedAt)
@@ -1031,6 +1005,8 @@ func (s *Service) ListUnified(ctx context.Context, actor, conversationID string,
 	}
 	return items, nil
 }
+
+// removed: unified timeline comments repeated the query flow
 
 func (s *Service) MarkRead(ctx context.Context, actor, conversationID string, through int64) error {
 	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
@@ -1221,9 +1197,6 @@ func (s *Service) ensurePhoneConversation(ctx context.Context, userID, phoneE164
 	return conversationID, nil
 }
 
-// decideTransport selects the transport for a send operation based on the
-// conversation's transport_policy, the presence of other OHMF identities,
-// and client profiles present in the request context.
 func (s *Service) decideTransport(ctx context.Context, tx pgx.Tx, conversationID, senderUserID string) (string, error) {
 	var policy string
 	if err := tx.QueryRow(ctx, `SELECT transport_policy FROM conversations WHERE id = $1::uuid`, conversationID).Scan(&policy); err != nil {
@@ -1237,11 +1210,8 @@ func (s *Service) decideTransport(ctx context.Context, tx pgx.Tx, conversationID
 	case "FORCE_MMS":
 		return "MMS", nil
 	case "BLOCK_CARRIER_RELAY":
-		// treat as AUTO but disallow RELAY transports (we don't select RELAY here)
 	}
 
-	// AUTO-like decision: if there are other member users in the conversation,
-	// prefer OTT unless policy forces SMS.
 	var otherCount int
 	if err := tx.QueryRow(ctx, `SELECT COUNT(1) FROM conversation_members WHERE conversation_id = $1::uuid AND user_id <> $2::uuid`, conversationID, senderUserID).Scan(&otherCount); err != nil {
 		return "", err
@@ -1250,13 +1220,11 @@ func (s *Service) decideTransport(ctx context.Context, tx pgx.Tx, conversationID
 		return "OTT", nil
 	}
 
-	// If no other member users, check for external phone membership (PHONE_DM)
 	var hasExternal int
 	if err := tx.QueryRow(ctx, `SELECT COUNT(1) FROM conversation_external_members WHERE conversation_id = $1::uuid`, conversationID).Scan(&hasExternal); err == nil && hasExternal > 0 {
 		return "SMS", nil
 	}
 
-	// Inspect client profiles from context (e.g., DEFAULT_SMS_HANDLER)
 	if profiles, ok := middleware.ProfilesFromContext(ctx); ok {
 		for _, p := range profiles {
 			if p == "DEFAULT_SMS_HANDLER" {
@@ -1265,9 +1233,10 @@ func (s *Service) decideTransport(ctx context.Context, tx pgx.Tx, conversationID
 		}
 	}
 
-	// Fallback to OTT
 	return "OTT", nil
 }
+
+// removed: transport-selection comments restated the switch and fallback order
 
 func (s *Service) sendSync(ctx context.Context, userID, senderDeviceID, conversationID, idemKey, contentType string, content map[string]any, clientGeneratedID string) (Message, error) {
 	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
@@ -1282,7 +1251,6 @@ func (s *Service) sendSync(ctx context.Context, userID, senderDeviceID, conversa
 		return Message{}, ErrConversationAccess
 	}
 
-	// Enforce block rules: if any other member has blocked the sender, forbid sending.
 	if blocked, _, err := s.checkBlockedRecipients(ctx, tx, userID, conversationID); err != nil {
 		return Message{}, err
 	} else if blocked {
@@ -1343,7 +1311,6 @@ func (s *Service) sendSync(ctx context.Context, userID, senderDeviceID, conversa
 		return Message{}, err
 	}
 
-	// decide transport according to conversation policy and client profiles
 	chosenTransport, err := s.decideTransport(ctx, tx, conversationID, userID)
 	if err != nil {
 		return Message{}, err
@@ -1454,7 +1421,6 @@ func (s *Service) sendToPhoneSync(ctx context.Context, userID, senderDeviceID, p
 		return Message{}, err
 	}
 
-	// Enforce block rules: if the (user) target has blocked sender, forbid send
 	if blocked, _, err := s.checkBlockedRecipients(ctx, tx, userID, conversationID); err != nil {
 		return Message{}, err
 	} else if blocked {
@@ -1675,8 +1641,6 @@ func (s *Service) hasMembership(ctx context.Context, q querier, userID, conversa
 	return true, nil
 }
 
-// checkBlockedRecipients returns true and the other participant id if sending is
-// blocked because either side has blocked the other.
 func (s *Service) checkBlockedRecipients(ctx context.Context, q querier, senderUserID, conversationID string) (bool, string, error) {
 	rows2, err := q.Query(ctx, `SELECT user_id::text FROM conversation_members WHERE conversation_id = $1::uuid AND user_id <> $2::uuid`, conversationID, senderUserID)
 	if err != nil {
@@ -1707,11 +1671,11 @@ func (s *Service) checkBlockedRecipients(ctx context.Context, q querier, senderU
 	return false, "", nil
 }
 
-// IsMember checks whether a user is a member of a conversation using the
-// service's configured DB pool.
 func (s *Service) IsMember(ctx context.Context, userID, conversationID string) (bool, error) {
 	return s.hasMembership(ctx, s.db, userID, conversationID)
 }
+
+// removed: membership and block-check comments restated the helper names
 
 func loadRecipients(ctx context.Context, q querier, conversationID, senderID string) ([]string, error) {
 	rows, err := q.Query(ctx, `

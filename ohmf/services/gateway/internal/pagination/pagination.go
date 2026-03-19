@@ -6,13 +6,11 @@ import (
 	"fmt"
 )
 
-// EncodeCursor encodes a map into a base64 JSON cursor.
 func EncodeCursor(data map[string]any) string {
 	b, _ := json.Marshal(data)
 	return base64.RawURLEncoding.EncodeToString(b)
 }
 
-// DecodeCursor decodes a base64 JSON cursor into a map.
 func DecodeCursor(s string) (map[string]any, error) {
 	if s == "" {
 		return nil, nil
@@ -27,3 +25,5 @@ func DecodeCursor(s string) (map[string]any, error) {
 	}
 	return out, nil
 }
+
+// removed: redundant doc comments stripped where function names are explicit

@@ -169,10 +169,15 @@ function loadRuntimeAuth() {
   }
 }
 
-function setStatus(message, isError = false) {
+function setStatus(message) {
   el.status.textContent = sanitizeText(message, 280) || "Ready.";
-  el.status.classList.toggle("error", Boolean(isError));
+  el.status.classList.remove("error");
 }
+
+function setErrorStatus(message) {
+  el.status.textContent = sanitizeText(message, 280) || "Ready.";
+  el.status.classList.add("error");
+} // removed: boolean status flag split into named helpers
 
 function addLog(kind, summary, detail) {
   state.logEntries.unshift({
@@ -832,14 +837,14 @@ el.manifestForm.addEventListener("submit", async (event) => {
   try {
     await loadAndLaunch(el.manifestUrl.value);
   } catch (error) {
-    setStatus(error.message || "Failed to load manifest.", true);
+    setErrorStatus(error.message || "Failed to load manifest.");
     addLog("error", "runtime.load_failed", { message: error.message || String(error) });
   }
 });
 
 el.relaunchBtn.addEventListener("click", () => {
   if (!state.manifest) {
-    setStatus("Load a manifest before relaunching.", true);
+    setErrorStatus("Load a manifest before relaunching.");
     return;
   }
   renderContext();
@@ -849,7 +854,7 @@ el.relaunchBtn.addEventListener("click", () => {
 
 el.clearSessionBtn.addEventListener("click", async () => {
   if (!state.manifest) {
-    setStatus("Load a manifest before clearing session state.", true);
+    setErrorStatus("Load a manifest before clearing session state.");
     return;
   }
   try {
@@ -870,6 +875,6 @@ el.clearSessionBtn.addEventListener("click", async () => {
 
 renderLog();
 loadAndLaunch(DEFAULT_MANIFEST_URL).catch((error) => {
-  setStatus(error.message || "Failed to start runtime.", true);
+  setErrorStatus(error.message || "Failed to start runtime.");
   addLog("error", "runtime.bootstrap_failed", { message: error.message || String(error) });
 });
