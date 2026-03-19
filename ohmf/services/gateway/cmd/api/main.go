@@ -199,7 +199,13 @@ func main() {
 		Replication:       replicationStore,
 	})
 	eventsHandler := events.NewHandler(pool, rdb, msgSvc)
-	wsHandler := realtime.NewHandler(tokens, msgSvc, rdb, rateLimiter, cfg.EnableWSSend, replicationStore)
+	// removed: enableSend boolean parameter - using named constructors for clarity
+	var wsHandler *realtime.Handler
+	if cfg.EnableWSSend {
+		wsHandler = realtime.NewHandlerWithSend(tokens, msgSvc, rdb, rateLimiter, replicationStore)
+	} else {
+		wsHandler = realtime.NewHandlerReadOnly(tokens, msgSvc, rdb, rateLimiter, replicationStore)
+	}
 
 	authHandler := auth.NewHandler(authSvc)
 	usersHandler := users.NewHandler(usersSvc)
