@@ -6,8 +6,10 @@
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self' http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:*; object-src 'none'; base-uri 'none'; form-action 'self'" />
     <meta name="referrer" content="no-referrer" />
     <meta http-equiv="Permissions-Policy" content="camera=(), microphone=(), geolocation=()" />
+    <meta name="theme-color" content="#111111" />
     <title>OHMF Messages</title>
     <link rel="icon" href="data:," />
+    <link rel="manifest" href="./manifest.webmanifest" />
     <script src="./runtime-config.js"></script>
     <script src="./asset-loader.js" data-css="./styles.css" data-js="./frontend-config.js"></script>
   </head>
@@ -16,7 +18,7 @@
     <section class="auth-shell" id="auth-shell">
       <div class="auth-card">
         <h1>Sign in to OHMF</h1>
-        <p class="auth-muted">Choose your country code and enter your number. In local dev, OTP is <code>123456</code>.</p>
+        <p class="auth-muted" id="auth-hint">Choose your country code and enter your number.</p>
         <p class="status-msg" id="auth-status" role="status" aria-live="polite"></p>
 
         <form id="phone-start-form">
@@ -49,6 +51,7 @@
           <h1>Messages</h1>
           <div class="header-actions">
             <button class="icon-btn" id="new-chat-btn" aria-label="New conversation">+</button>
+            <button class="icon-btn" id="new-group-btn" aria-label="New group">Group</button>
             <button class="icon-btn" id="logout-btn" aria-label="Logout">x</button>
           </div>
         </header>
@@ -93,62 +96,96 @@
           </div>
         </section>
 
-        <form class="composer" id="composer">
-          <section class="miniapp-launcher hidden" id="miniapp-launcher">
+        <section class="miniapp-launcher hidden" id="miniapp-launcher" aria-label="Mini-app controls">
+          <div class="miniapp-launcher-head">
+            <div>
+              <p class="miniapp-kicker">Embedded Apps</p>
+              <h2 class="miniapp-title">Choose an app for this thread</h2>
+            </div>
+            <div class="miniapp-head-actions">
+              <details class="miniapp-settings">
+                <summary class="secondary-btn compact">Settings</summary>
+                <div class="miniapp-settings-menu">
+                  <div class="miniapp-config-block">
+                    <p class="miniapp-config-label">Permissions</p>
+                    <div class="miniapp-permissions" id="miniapp-permissions"></div>
+                  </div>
+                  <button type="button" class="secondary-btn compact" id="miniapp-reset-btn">Reset Session</button>
+                </div>
+              </details>
+              <button type="button" class="icon-btn miniapp-close-btn" id="miniapp-close-btn" aria-label="Close app controls">x</button>
+            </div>
+          </div>
+
+          <div class="miniapp-picker" id="miniapp-picker">
+            <button type="button" class="miniapp-card" id="miniapp-upload-card">
+              <span class="miniapp-card-icon">+</span>
+              <span class="miniapp-card-copy">
+                <strong>Send File</strong>
+                <span>Upload a file and send it as an attachment.</span>
+              </span>
+            </button>
+            <button type="button" class="miniapp-card" id="miniapp-counter-card">
+              <span class="miniapp-card-icon">#</span>
+              <span class="miniapp-card-copy">
+                <strong>Counter Lab</strong>
+                <span>Shared state demo with projected messages.</span>
+              </span>
+            </button>
+          </div>
+
+          <div class="miniapp-stage hidden" id="miniapp-stage">
+            <div class="miniapp-preview">
+              <div class="miniapp-preview-head">
+                <p class="miniapp-preview-title" id="miniapp-preview-title">Counter Lab</p>
+                <p class="miniapp-preview-subtitle" id="miniapp-preview-subtitle">Choose launch settings, then open the app.</p>
+              </div>
+            </div>
+
+            <aside class="miniapp-config">
+              <div class="miniapp-config-block">
+                <p class="miniapp-config-label">Launch mode</p>
+                <p class="miniapp-config-value" id="miniapp-launch-mode">Ready</p>
+              </div>
+
+              <div class="miniapp-config-block">
+                <p class="miniapp-config-label">Context</p>
+                <p class="miniapp-config-copy" id="miniapp-context-copy">Pick a conversation to prepare the app.</p>
+              </div>
+
+              <div class="miniapp-config-actions">
+                <button type="button" class="send-btn compact" id="miniapp-share-btn">Send App</button>
+                <button type="button" class="send-btn compact" id="miniapp-open-btn">Open App</button>
+              </div>
+            </aside>
+          </div>
+        </section>
+
+        <section class="miniapp-window hidden" id="miniapp-window" aria-label="Mini-app popup" aria-modal="true" role="dialog">
+          <button type="button" class="miniapp-backdrop" id="miniapp-backdrop" aria-label="Close app popup"></button>
+          <div class="miniapp-modal">
             <div class="miniapp-launcher-head">
               <div>
                 <p class="miniapp-kicker">Embedded Apps</p>
-                <h2 class="miniapp-title">Launch an app in this thread</h2>
+                <h2 class="miniapp-title" id="miniapp-window-title">Counter Lab</h2>
+                <p class="miniapp-preview-subtitle" id="miniapp-window-subtitle">Running in this conversation.</p>
               </div>
-              <button type="button" class="icon-btn miniapp-close-btn" id="miniapp-close-btn" aria-label="Close app launcher">x</button>
+              <button type="button" class="icon-btn miniapp-close-btn" id="miniapp-window-close-btn" aria-label="Close app window">x</button>
             </div>
-
-            <div class="miniapp-picker" id="miniapp-picker">
-              <button type="button" class="miniapp-card" id="miniapp-counter-card">
-                <span class="miniapp-card-icon">#</span>
-                <span class="miniapp-card-copy">
-                  <strong>Counter Lab</strong>
-                  <span>Shared state demo with projected messages.</span>
-                </span>
-              </button>
+            <div class="miniapp-frame-wrap miniapp-window-frame-wrap">
+              <iframe id="miniapp-frame" title="Embedded mini-app"></iframe>
             </div>
+          </div>
+        </section>
 
-            <div class="miniapp-stage hidden" id="miniapp-stage">
-              <div class="miniapp-preview">
-                <div class="miniapp-preview-head">
-                  <p class="miniapp-preview-title" id="miniapp-preview-title">App Preview</p>
-                  <p class="miniapp-preview-subtitle" id="miniapp-preview-subtitle">Choose launch settings, then open the app.</p>
-                </div>
-                <div class="miniapp-frame-wrap">
-                  <iframe id="miniapp-frame" title="Embedded mini-app"></iframe>
-                </div>
-              </div>
-
-              <aside class="miniapp-config">
-                <div class="miniapp-config-block">
-                  <p class="miniapp-config-label">Launch mode</p>
-                  <p class="miniapp-config-value" id="miniapp-launch-mode">Ready</p>
-                </div>
-
-                <div class="miniapp-config-block">
-                  <p class="miniapp-config-label">Permissions</p>
-                  <div class="miniapp-permissions" id="miniapp-permissions"></div>
-                </div>
-
-                <div class="miniapp-config-block">
-                  <p class="miniapp-config-label">Context</p>
-                  <p class="miniapp-config-copy" id="miniapp-context-copy">Pick a conversation to prepare the app.</p>
-                </div>
-
-                <div class="miniapp-config-actions">
-                  <button type="button" class="send-btn compact" id="miniapp-share-btn">Send App</button>
-                  <button type="button" class="send-btn compact" id="miniapp-open-btn">Open App</button>
-                  <button type="button" class="secondary-btn compact" id="miniapp-reset-btn">Reset Session</button>
-                </div>
-              </aside>
+        <form class="composer" id="composer">
+          <div class="composer-reply hidden" id="composer-reply">
+            <div class="composer-reply-copy">
+              <p class="composer-reply-label" id="composer-reply-label">Replying</p>
+              <p class="composer-reply-text" id="composer-reply-text"></p>
             </div>
-          </section>
-
+            <button type="button" class="icon-btn composer-reply-cancel" id="composer-reply-cancel" aria-label="Cancel reply">x</button>
+          </div>
           <div class="composer-main">
             <button type="button" class="icon-btn attach-btn" id="attach-btn" aria-label="Attachment and apps">+</button>
             <input
@@ -163,6 +200,8 @@
         </form>
       </main>
     </div>
+
+    <input id="attachment-input" type="file" class="hidden" />
 
     <script src="./asset-loader.js" data-js="./app.js"></script>
   </body>

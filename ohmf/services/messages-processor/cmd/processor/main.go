@@ -72,6 +72,27 @@ type ackPayload struct {
 	ClientGeneratedID string `json:"client_generated_id,omitempty"`
 }
 
+type conversationMeta struct {
+	Type           string
+	Participants   []string
+	ExternalPhones []string
+}
+
+type messageCreatedDomainEventPayload struct {
+	MessageID         string         `json:"message_id"`
+	ConversationID    string         `json:"conversation_id"`
+	ConversationType  string         `json:"conversation_type"`
+	SenderUserID      string         `json:"sender_user_id"`
+	ContentType       string         `json:"content_type"`
+	Content           map[string]any `json:"content"`
+	ClientGeneratedID string         `json:"client_generated_id,omitempty"`
+	Transport         string         `json:"transport"`
+	ServerOrder       int64          `json:"server_order"`
+	CreatedAt         string         `json:"created_at"`
+	Participants      []string       `json:"participants"`
+	ExternalPhones    []string       `json:"external_phones,omitempty"`
+}
+
 type processor struct {
 	cfg           config
 	pg            *pgxpool.Pool
@@ -83,6 +104,8 @@ type processor struct {
 	smsW          *kafka.Writer
 	dlqW          *kafka.Writer
 }
+
+const domainEventMessageCreated = "message_created"
 
 func main() {
 	ctx := context.Background()
@@ -193,6 +216,7 @@ func (p *processor) processMessage(ctx context.Context, msg kafka.Message) error
 		serverOrder int64
 		messageID   string
 		persistedAt = time.Now().UTC()
+		newMessage  bool
 	)
 	if err == nil && existingStatus == 201 {
 		var existing struct {
@@ -206,6 +230,7 @@ func (p *processor) processMessage(ctx context.Context, msg kafka.Message) error
 	}
 
 	if messageID == "" {
+		newMessage = true
 		messageID = evt.MessageID
 		err = tx.QueryRow(ctx, `
 			UPDATE conversation_counters
@@ -263,6 +288,28 @@ func (p *processor) processMessage(ctx context.Context, msg kafka.Message) error
 	recipients, err := loadRecipients(ctx, tx, evt.ConversationID, evt.SenderUserID)
 	if err != nil {
 		return err
+	}
+	if newMessage {
+		meta, err := loadConversationMeta(ctx, tx, evt.ConversationID)
+		if err != nil {
+			return err
+		}
+		if err := appendDomainEvent(ctx, tx, evt.ConversationID, evt.SenderUserID, domainEventMessageCreated, messageCreatedDomainEventPayload{
+			MessageID:         messageID,
+			ConversationID:    evt.ConversationID,
+			ConversationType:  meta.Type,
+			SenderUserID:      evt.SenderUserID,
+			ContentType:       evt.ContentType,
+			Content:           evt.Content,
+			ClientGeneratedID: evt.ClientGeneratedID,
+			Transport:         mapTransport(evt.TransportIntent),
+			ServerOrder:       serverOrder,
+			CreatedAt:         persistedAt.Format(time.RFC3339),
+			Participants:      meta.Participants,
+			ExternalPhones:    meta.ExternalPhones,
+		}); err != nil {
+			return err
+		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -390,6 +437,74 @@ func loadRecipients(ctx context.Context, tx pgx.Tx, conversationID, senderID str
 		out = append(out, id)
 	}
 	return out, rows.Err()
+}
+
+func loadConversationMeta(ctx context.Context, tx pgx.Tx, conversationID string) (conversationMeta, error) {
+	var meta conversationMeta
+	if err := tx.QueryRow(ctx, `SELECT type FROM conversations WHERE id = $1::uuid`, conversationID).Scan(&meta.Type); err != nil {
+		return conversationMeta{}, err
+	}
+
+	memberRows, err := tx.Query(ctx, `
+		SELECT user_id::text
+		FROM conversation_members
+		WHERE conversation_id = $1::uuid
+		ORDER BY joined_at
+	`, conversationID)
+	if err != nil {
+		return conversationMeta{}, err
+	}
+	for memberRows.Next() {
+		var userID string
+		if err := memberRows.Scan(&userID); err != nil {
+			memberRows.Close()
+			return conversationMeta{}, err
+		}
+		meta.Participants = append(meta.Participants, userID)
+	}
+	if err := memberRows.Err(); err != nil {
+		memberRows.Close()
+		return conversationMeta{}, err
+	}
+	memberRows.Close()
+
+	phoneRows, err := tx.Query(ctx, `
+		SELECT ec.phone_e164
+		FROM conversation_external_members cem
+		JOIN external_contacts ec ON ec.id = cem.external_contact_id
+		WHERE cem.conversation_id = $1::uuid
+		ORDER BY ec.phone_e164
+	`, conversationID)
+	if err != nil {
+		return conversationMeta{}, err
+	}
+	for phoneRows.Next() {
+		var phone string
+		if err := phoneRows.Scan(&phone); err != nil {
+			phoneRows.Close()
+			return conversationMeta{}, err
+		}
+		meta.ExternalPhones = append(meta.ExternalPhones, phone)
+	}
+	if err := phoneRows.Err(); err != nil {
+		phoneRows.Close()
+		return conversationMeta{}, err
+	}
+	phoneRows.Close()
+
+	return meta, nil
+}
+
+func appendDomainEvent(ctx context.Context, tx pgx.Tx, conversationID, actorUserID, eventType string, payload any) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO domain_events (conversation_id, actor_user_id, event_type, payload)
+		VALUES ($1::uuid, NULLIF($2, '')::uuid, $3, $4::jsonb)
+	`, conversationID, actorUserID, eventType, string(body))
+	return err
 }
 
 func loadConfig() config {

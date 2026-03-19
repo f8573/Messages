@@ -40,7 +40,7 @@ func TestVerifyManifestSignatureRS256(t *testing.T) {
 		"sig": base64.StdEncoding.EncodeToString(sig),
 	}
 
-	svc := NewService(nil, config.Config{MiniappPublicKeyPEM: string(pubPEM)})
+	svc := NewService(nil, config.Config{MiniappPublicKeyPEM: string(pubPEM)}, nil, nil)
 	if err := svc.verifyManifestSignature(manifest); err != nil {
 		t.Fatalf("signature verification failed: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestVerifyManifestSignatureEd25519(t *testing.T) {
 		"sig": base64.StdEncoding.EncodeToString(sig),
 	}
 
-	svc := NewService(nil, config.Config{MiniappPublicKeyPEM: string(pubPEM)})
+	svc := NewService(nil, config.Config{MiniappPublicKeyPEM: string(pubPEM)}, nil, nil)
 	if err := svc.verifyManifestSignature(manifest); err != nil {
 		t.Fatalf("signature verification failed: %v", err)
 	}
@@ -98,6 +98,16 @@ func TestValidateManifestAllowsUnsignedWebBundle(t *testing.T) {
 	}
 	if err := validateManifest(manifest); err != nil {
 		t.Fatalf("expected manifest to validate, got %v", err)
+	}
+}
+
+func TestValidateManifestRequiresMessagePreview(t *testing.T) {
+	manifest := validManifest()
+	delete(manifest, "message_preview")
+	if err := validateManifest(manifest); err == nil {
+		t.Fatal("expected validation error for missing message_preview")
+	} else if !errors.Is(err, ErrManifestInvalid) {
+		t.Fatalf("expected ErrManifestInvalid, got %v", err)
 	}
 }
 
@@ -136,6 +146,12 @@ func validManifest() map[string]any {
 		"entrypoint": map[string]any{
 			"type": "url",
 			"url":  "https://example.com/app",
+		},
+		"message_preview": map[string]any{
+			"type":     "static_image",
+			"url":      "https://example.com/app/preview.png",
+			"alt_text": "test app preview",
+			"fit_mode": "scale",
 		},
 		"permissions": []string{
 			"conversation.read_context",

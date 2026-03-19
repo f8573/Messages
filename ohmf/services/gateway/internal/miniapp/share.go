@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"ohmf/services/gateway/internal/replication"
 )
 
 const (
@@ -224,16 +225,16 @@ func (s *Service) ShareSession(ctx context.Context, userID string, input ShareIn
 			return nil, err
 		}
 		record = sessionRecord{
-			ID:                   id,
-			ManifestID:           manifestID,
-			AppID:                appID,
-			ConversationID:       input.ConversationID,
-			Participants:         normalizeParticipants(participants, SessionParticipant{}),
-			GlobalPermissions:    granted,
+			ID:                     id,
+			ManifestID:             manifestID,
+			AppID:                  appID,
+			ConversationID:         input.ConversationID,
+			Participants:           normalizeParticipants(participants, SessionParticipant{}),
+			GlobalPermissions:      granted,
 			ParticipantPermissions: map[string][]string{userID: granted},
-			State:                defaultSessionState(input.StateSnapshot),
-			StateVersion:         1,
-			CreatedBy:            userID,
+			State:                  defaultSessionState(input.StateSnapshot),
+			StateVersion:           1,
+			CreatedBy:              userID,
 		}
 		partsB, _ := json.Marshal(record.Participants)
 		permsB, _ := json.Marshal(record.GlobalPermissions)
@@ -266,19 +267,55 @@ func (s *Service) ShareSession(ctx context.Context, userID string, input ShareIn
 	if err != nil {
 		return nil, err
 	}
+	recipients := conversationRecipients(participants, userID)
+	if s.replication != nil {
+		conversationMeta, err := s.replication.LoadConversationMeta(ctx, tx, input.ConversationID)
+		if err != nil {
+			return nil, err
+		}
+		if err := s.replication.AppendDomainEvent(ctx, tx, input.ConversationID, userID, replication.DomainEventMessageCreated, replication.MessageCreatedPayload{
+			MessageID:         stringField(message, "message_id"),
+			ConversationID:    input.ConversationID,
+			ConversationType:  conversationMeta.Type,
+			SenderUserID:      userID,
+			ContentType:       contentTypeAppCard,
+			Content:           cardContent,
+			ClientGeneratedID: "",
+			Transport:         "OTT",
+			ServerOrder:       int64Field(message, "server_order"),
+			CreatedAt:         stringField(message, "created_at"),
+			Participants:      conversationMeta.Participants,
+			ExternalPhones:    conversationMeta.ExternalPhones,
+		}); err != nil {
+			return nil, err
+		}
+	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
+	s.publishMessageCreated(ctx, recipients, map[string]any{
+		"message_id":        stringField(message, "message_id"),
+		"conversation_id":   input.ConversationID,
+		"sender_user_id":    userID,
+		"content_type":      contentTypeAppCard,
+		"content":           cardContent,
+		"transport":         "OTT",
+		"server_order":      int64Field(message, "server_order"),
+		"created_at":        stringField(message, "created_at"),
+		"status":            "SENT",
+		"sent_at":           stringField(message, "created_at"),
+		"status_updated_at": stringField(message, "created_at"),
+	})
 	return map[string]any{
-		"message":             message,
-		"app_session_id":      record.ID,
-		"manifest_id":         record.ManifestID,
-		"app_id":              record.AppID,
+		"message":              message,
+		"app_session_id":       record.ID,
+		"manifest_id":          record.ManifestID,
+		"app_id":               record.AppID,
 		"capabilities_granted": granted,
-		"launch_context":      buildLaunchContextForUser(record, userID, permitted),
-		"state":               record.State,
-		"state_version":       record.StateVersion,
+		"launch_context":       buildLaunchContextForUser(record, userID, permitted),
+		"state":                record.State,
+		"state_version":        record.StateVersion,
 	}, nil
 }
 
@@ -440,16 +477,18 @@ func buildAppCardContent(manifestRow map[string]any, record sessionRecord) map[s
 		title = record.AppID
 	}
 	return map[string]any{
-		"card_version":   1,
-		"share_mode":     "shared_session",
-		"app_id":         record.AppID,
-		"manifest_id":    record.ManifestID,
-		"app_session_id": record.ID,
-		"title":          title,
-		"summary":        buildAppCardSummary(manifest, title),
-		"icon_url":       iconURLFromManifest(manifest),
-		"cta_label":      "Open",
-		"joinable":       true,
+		"card_version":    1,
+		"share_mode":      "shared_session",
+		"app_id":          record.AppID,
+		"manifest_id":     record.ManifestID,
+		"app_session_id":  record.ID,
+		"title":           title,
+		"summary":         buildAppCardSummary(manifest, title),
+		"icon_url":        iconURLFromManifest(manifest),
+		"message_preview": buildAppCardPreview(manifest),
+		"preview_state":   cloneMap(record.State.Snapshot),
+		"cta_label":       "Open",
+		"joinable":        true,
 	}
 }
 
@@ -483,6 +522,33 @@ func iconURLFromManifest(manifest map[string]any) string {
 	return ""
 }
 
+func buildAppCardPreview(manifest map[string]any) map[string]any {
+	rawPreview, _ := manifest["message_preview"].(map[string]any)
+	if rawPreview == nil {
+		return nil
+	}
+
+	previewType := stringField(rawPreview, "type")
+	previewURL := stringField(rawPreview, "url")
+	if previewType == "" || previewURL == "" {
+		return nil
+	}
+
+	preview := map[string]any{
+		"type": previewType,
+		"url":  previewURL,
+	}
+	if altText := stringField(rawPreview, "alt_text"); altText != "" {
+		preview["alt_text"] = altText
+	}
+	fitMode := stringField(rawPreview, "fit_mode")
+	if fitMode == "" {
+		fitMode = "scale"
+	}
+	preview["fit_mode"] = fitMode
+	return preview
+}
+
 func buildLaunchContextForUser(record sessionRecord, userID string, permitted []string) map[string]any {
 	return map[string]any{
 		"app_id":               record.AppID,
@@ -498,24 +564,77 @@ func buildLaunchContextForUser(record sessionRecord, userID string, permitted []
 	}
 }
 
+func cloneMap(input map[string]any) map[string]any {
+	if len(input) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(input))
+	for key, value := range input {
+		out[key] = value
+	}
+	return out
+}
+
+func conversationRecipients(participants []SessionParticipant, senderUserID string) []string {
+	recipients := make([]string, 0, len(participants))
+	for _, participant := range participants {
+		if participant.UserID == "" || participant.UserID == senderUserID {
+			continue
+		}
+		recipients = append(recipients, participant.UserID)
+	}
+	return recipients
+}
+
+func (s *Service) publishMessageCreated(ctx context.Context, recipients []string, payload map[string]any) {
+	if s.redis == nil || len(recipients) == 0 {
+		return
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	for _, recipientID := range recipients {
+		if recipientID == "" {
+			continue
+		}
+		_ = s.redis.Publish(ctx, "message:user:"+recipientID, body).Err()
+	}
+}
+
+func int64Field(payload map[string]any, key string) int64 {
+	switch value := payload[key].(type) {
+	case int64:
+		return value
+	case int32:
+		return int64(value)
+	case int:
+		return int64(value)
+	case float64:
+		return int64(value)
+	default:
+		return 0
+	}
+}
+
 func (s *Service) sessionRecordToMapForUser(record sessionRecord, userID string, permitted []string) map[string]any {
 	return map[string]any{
-		"app_session_id":       record.ID,
-		"manifest_id":          record.ManifestID,
-		"app_id":               record.AppID,
-		"conversation_id":      record.ConversationID,
-		"viewer":               viewerForUser(record.Participants, userID),
-		"participants":         record.Participants,
-		"capabilities_granted": record.viewerGrantedPermissions(userID),
+		"app_session_id":          record.ID,
+		"manifest_id":             record.ManifestID,
+		"app_id":                  record.AppID,
+		"conversation_id":         record.ConversationID,
+		"viewer":                  viewerForUser(record.Participants, userID),
+		"participants":            record.Participants,
+		"capabilities_granted":    record.viewerGrantedPermissions(userID),
 		"participant_permissions": record.ParticipantPermissions,
-		"state":                record.State,
-		"state_version":        record.StateVersion,
-		"expires_at":           record.ExpiresAt,
-		"created_at":           record.CreatedAt,
-		"launch_context":       buildLaunchContextForUser(record, userID, permitted),
-		"consent_required":     len(permitted) > 0 && !record.hasJoined(userID),
-		"joinable":             record.EndedAt == nil,
-		"ended_at":             record.EndedAt,
+		"state":                   record.State,
+		"state_version":           record.StateVersion,
+		"expires_at":              record.ExpiresAt,
+		"created_at":              record.CreatedAt,
+		"launch_context":          buildLaunchContextForUser(record, userID, permitted),
+		"consent_required":        len(permitted) > 0 && !record.hasJoined(userID),
+		"joinable":                record.EndedAt == nil,
+		"ended_at":                record.EndedAt,
 	}
 }
 

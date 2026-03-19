@@ -13,7 +13,7 @@
     <script src="../../asset-loader.js" data-css="./styles.css"></script>
   </head>
   <body>
-    <main class="app-shell">
+    <main id="app-shell" class="app-shell">
       <header class="app-header">
         <div>
           <p class="eyebrow">Sandboxed Mini-App</p>
@@ -68,6 +68,18 @@
         </article>
       </section>
     </main>
+
+    <section id="preview-shell" class="preview-shell" hidden>
+      <div class="preview-stage">
+        <p class="preview-kicker">Counter Lab Live Preview</p>
+        <div class="preview-halo" aria-hidden="true"></div>
+        <div class="preview-panel">
+          <p class="preview-label">Shared counter</p>
+          <p id="preview-counter-value" class="preview-counter-value">0</p>
+          <p id="preview-caption" class="preview-caption">Live square preview for shared app cards.</p>
+        </div>
+      </div>
+    </section>
 
     <script type="module" src="./boot.js"></script>
   </body>

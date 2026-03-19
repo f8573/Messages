@@ -8,7 +8,9 @@ Runtime model
 
 Manifest format (high level)
 - The mini-app manifest describes identification, runtime entrypoint, UI metadata, requested permissions, declared capabilities, and an optional cryptographic signature used to validate authenticity.
-- Core fields: `app_id`, `name`, `version`, `entrypoint`, `icons`, `permissions`, `capabilities`, `signature`.
+- Core fields: `app_id`, `name`, `version`, `entrypoint`, `icons`, `message_preview`, `permissions`, `capabilities`, `signature`.
+- Shared mini-apps must provide a `message_preview` object. The host renders this preview in a fixed `1:1` square viewport for message previews. Developers can choose `fit_mode` `scale` or `crop`; the default is `scale`.
+- `message_preview.type` supports `static_image` and `live`. Live previews must remain sandboxed and use the host-provided square viewport.
 
 Capabilities model
 - Capabilities are the declarative contract between host and mini-app. The manifest declares capabilities the app can consume (e.g., `storage`, `ui.dialogs`, `network`, `contacts`, `crypto`).

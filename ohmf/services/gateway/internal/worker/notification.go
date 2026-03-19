@@ -4,16 +4,16 @@ import (
 	"context"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"ohmf/services/gateway/internal/notification"
 )
 
 type NotificationWorker struct {
-	pool *pgxpool.Pool
+	svc  *notification.Service
 	stop chan struct{}
 }
 
-func NewNotificationWorker(pool *pgxpool.Pool) *NotificationWorker {
-	return &NotificationWorker{pool: pool, stop: make(chan struct{})}
+func NewNotificationWorker(svc *notification.Service) *NotificationWorker {
+	return &NotificationWorker{svc: svc, stop: make(chan struct{})}
 }
 
 func (n *NotificationWorker) Name() string { return "notification" }
@@ -27,15 +27,8 @@ func (n *NotificationWorker) Start(ctx context.Context) error {
 			return nil
 		default:
 		}
-		var exists bool
-		if err := n.pool.QueryRow(ctx, `SELECT to_regclass('public.notifications') IS NOT NULL`).Scan(&exists); err == nil && exists {
-			_, _ = n.pool.Exec(ctx, `
-                UPDATE notifications
-                SET delivered = true, delivered_at = now()
-                WHERE id IN (
-                    SELECT id FROM notifications WHERE COALESCE(delivered,false)=false LIMIT 100
-                )
-            `)
+		if n.svc != nil && n.svc.HasUsableWebPush() {
+			_ = n.svc.DispatchPending(ctx, 25)
 		}
 		time.Sleep(1 * time.Second)
 	}
