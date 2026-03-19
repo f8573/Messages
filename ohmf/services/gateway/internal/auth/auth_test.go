@@ -134,3 +134,4 @@ func TestRefreshRotatesToken(t *testing.T) {
 		t.Fatalf("expected 0 active tokens after logout; got %d", cnt)
 	}
 }
+

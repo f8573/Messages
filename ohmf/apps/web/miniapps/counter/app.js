@@ -48,10 +48,15 @@ function randomId(prefix) {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
-function setStatus(message, isError = false) {
+function setStatus(message) {
   el.status.textContent = sanitizeText(message, 180);
-  el.status.classList.toggle("error", Boolean(isError));
+  el.status.classList.remove("error");
 }
+
+function setErrorStatus(message) {
+  el.status.textContent = sanitizeText(message, 180);
+  el.status.classList.add("error");
+} // removed: boolean status flag split into named helpers
 
 function requireBridge() {
   if (bridge) return bridge;
@@ -115,22 +120,6 @@ function renderPreview() {
   }
 
   el.previewCaption.textContent = "Live square preview for shared app cards.";
-}
-
-function enterPreviewMode() {
-  document.body.classList.add("preview-mode");
-  el.appShell.hidden = true;
-  el.previewShell.hidden = false;
-  renderPreview();
-}
-
-function startPreviewTicker() {
-  window.clearInterval(previewTicker);
-  previewTicker = window.setInterval(() => {
-    if (state.launchContext) return;
-    state.previewCounter = (state.previewCounter + 1) % 10;
-    renderPreview();
-  }, 1600);
 }
 
 function renderContext() {
@@ -244,8 +233,16 @@ async function sendSummary() {
 }
 
 async function bootstrapPreview() {
-  enterPreviewMode();
-  startPreviewTicker();
+  document.body.classList.add("preview-mode");
+  el.appShell.hidden = true;
+  el.previewShell.hidden = false;
+  renderPreview();
+  window.clearInterval(previewTicker);
+  previewTicker = window.setInterval(() => {
+    if (state.launchContext) return;
+    state.previewCounter = (state.previewCounter + 1) % 10;
+    renderPreview();
+  }, 1600);
   if (!bridge) return;
 
   try {
@@ -254,7 +251,7 @@ async function bootstrapPreview() {
   } catch (error) {
     addLog(`preview bootstrap error ${error.code || "error"}`, { message: error.message, details: error.details });
   }
-}
+} // removed: single-use preview helpers inlined into bootstrap
 
 async function bootstrap() {
   if (isPreviewMode) {
@@ -269,7 +266,7 @@ async function bootstrap() {
     setStatus("Bridge ready.");
   } catch (error) {
     addLog(`bootstrap error ${error.code || "error"}`, { message: error.message, details: error.details });
-    setStatus(error.message || "Failed to initialize app.", true);
+    setErrorStatus(error.message || "Failed to initialize app.");
   }
 }
 
@@ -277,7 +274,7 @@ el.decrementBtn.addEventListener("click", async () => {
   try {
     await updateCounter(state.counter - 1);
   } catch (error) {
-    setStatus(error.message || "Unable to decrement counter.", true);
+    setErrorStatus(error.message || "Unable to decrement counter.");
   }
 });
 
@@ -285,7 +282,7 @@ el.incrementBtn.addEventListener("click", async () => {
   try {
     await updateCounter(state.counter + 1);
   } catch (error) {
-    setStatus(error.message || "Unable to increment counter.", true);
+    setErrorStatus(error.message || "Unable to increment counter.");
   }
 });
 
@@ -293,7 +290,7 @@ el.resetBtn.addEventListener("click", async () => {
   try {
     await updateCounter(0);
   } catch (error) {
-    setStatus(error.message || "Unable to reset counter.", true);
+    setErrorStatus(error.message || "Unable to reset counter.");
   }
 });
 
@@ -301,7 +298,7 @@ el.loadNoteBtn.addEventListener("click", async () => {
   try {
     await loadNote();
   } catch (error) {
-    setStatus(error.message || "Unable to load note.", true);
+    setErrorStatus(error.message || "Unable to load note.");
   }
 });
 
@@ -309,7 +306,7 @@ el.saveNoteBtn.addEventListener("click", async () => {
   try {
     await saveNote();
   } catch (error) {
-    setStatus(error.message || "Unable to save note.", true);
+    setErrorStatus(error.message || "Unable to save note.");
   }
 });
 
@@ -319,7 +316,7 @@ el.refreshContextBtn.addEventListener("click", async () => {
     await refreshThreadContext();
     setStatus("Context refreshed.");
   } catch (error) {
-    setStatus(error.message || "Unable to refresh context.", true);
+    setErrorStatus(error.message || "Unable to refresh context.");
   }
 });
 
@@ -327,7 +324,7 @@ el.sendSummaryBtn.addEventListener("click", async () => {
   try {
     await sendSummary();
   } catch (error) {
-    setStatus(error.message || "Unable to send summary.", true);
+    setErrorStatus(error.message || "Unable to send summary.");
   }
 });
 

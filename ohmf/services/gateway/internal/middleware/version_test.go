@@ -53,7 +53,6 @@ func TestAPIVersionMiddleware_AcceptVersion_Negotiation(t *testing.T) {
 	}))
 
 	req := httptest.NewRequest("GET", "/", nil)
-	// request a semver range that excludes server major
 	req.Header.Set("Accept-Version", ">=2.0.0 <3.0.0")
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -74,7 +73,6 @@ func TestAPIVersionMiddleware_AcceptVersion_SemverAccepts(t *testing.T) {
 	}))
 
 	req := httptest.NewRequest("GET", "/", nil)
-	// accept any 1.x series
 	req.Header.Set("Accept-Version", ">=1.0.0 <2.0.0")
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -83,6 +81,8 @@ func TestAPIVersionMiddleware_AcceptVersion_SemverAccepts(t *testing.T) {
 		t.Fatalf("expected 200 OK, got %d", rr.Code)
 	}
 }
+
+// removed: test input comments repeated the header values
 
 func TestAPIVersionMiddleware_DeprecationAndSunset(t *testing.T) {
 	cfg := config.Config{APIDeprecation: "Tue, 01 Jul 2025 00:00:00 GMT", APISunset: "2026-01-01"}
