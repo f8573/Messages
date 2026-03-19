@@ -223,7 +223,24 @@ func (h *Handler) ResolveProfiles(ctx context.Context, userIDs []string) ([]Prof
 		SELECT id::text, COALESCE(display_name, ''), COALESCE(avatar_url, ''), COALESCE(primary_phone_e164, '')
 		FROM users
 		WHERE id = ANY($1::uuid[])
-	`, dedupeUUIDs(userIDs))
+	`, func(items []string) []string {
+		seen := map[string]struct{}{}
+		out := make([]string, 0, len(items))
+		for _, item := range items {
+			if item == "" {
+				continue
+			}
+			if _, err := uuid.Parse(item); err != nil {
+				continue
+			}
+			if _, ok := seen[item]; ok {
+				continue
+			}
+			seen[item] = struct{}{}
+			out = append(out, item)
+		}
+		return out
+	}(userIDs))
 	if err != nil {
 		return nil, err
 	}
@@ -421,21 +438,4 @@ func (h *Handler) emitBlockStateUpdates(ctx context.Context, actorID, targetID s
 	return rows.Err()
 }
 
-func dedupeUUIDs(items []string) []string {
-	seen := map[string]struct{}{}
-	out := make([]string, 0, len(items))
-	for _, item := range items {
-		if item == "" {
-			continue
-		}
-		if _, err := uuid.Parse(item); err != nil {
-			continue
-		}
-		if _, ok := seen[item]; ok {
-			continue
-		}
-		seen[item] = struct{}{}
-		out = append(out, item)
-	}
-	return out
-}
+// removed: dedupeUUIDs() inlined at call site (single-use function)
