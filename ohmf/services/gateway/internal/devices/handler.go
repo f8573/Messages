@@ -19,6 +19,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"ohmf/services/gateway/internal/httpx"
 	"ohmf/services/gateway/internal/middleware"
+	"ohmf/services/gateway/internal/sqlutil"
 )
 
 type Handler struct {
@@ -152,7 +153,7 @@ func (h *Handler) RegisterDevice(ctx context.Context, userID string, d Device) (
 		)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,CASE WHEN NULLIF($9, '') IS NULL THEN NULL ELSE now() END,$10,now())
 		RETURNING id::text
-	`, userID, d.Platform, d.DeviceName, d.ClientVersion, d.Capabilities, d.SMSRoleState, nullable(d.PushToken), nullable(d.PushProvider), nullable(encryptedSubscription), nullable(d.PublicKey)).Scan(&id)
+	`, userID, d.Platform, d.DeviceName, d.ClientVersion, d.Capabilities, d.SMSRoleState, sqlutil.Nullable(d.PushToken), sqlutil.Nullable(d.PushProvider), sqlutil.Nullable(encryptedSubscription), sqlutil.Nullable(d.PublicKey)).Scan(&id)
 	if err != nil {
 		return "", err
 	}
@@ -296,11 +297,7 @@ func (h *Handler) ListWebPushSubscriptions(ctx context.Context, userID string) (
 	return out, rows.Err()
 }
 
-func nullable(v string) any {
-	if v == "" {
-		return nil
-	}
-	return v
+// removed: duplicate nullable() helper - moved to sqlutil package
 }
 
 func normalizeCapabilities(platform string, requested []string) []string {
@@ -328,16 +325,7 @@ func normalizeCapabilities(platform string, requested []string) []string {
 	return out
 }
 
-func deriveSubscriptionKey(cfg config.Config) []byte {
-	seed := cfg.PushSubscriptionKey
-	if strings.TrimSpace(seed) == "" {
-		seed = cfg.JWTSecret
-	}
-	sum := sha256.Sum256([]byte(seed))
-	return sum[:]
-}
-
-func (h *Handler) encryptSubscription(raw string) (string, error) {
+// removed: deriveSubscriptionKey() - never called, dead code
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return "", nil
