@@ -86,6 +86,8 @@ func handleError(w http.ResponseWriter, r *http.Request, err error) {
 		httpx.WriteError(w, r, http.StatusUnauthorized, "invalid_refresh", err.Error(), nil)
 	case errors.Is(err, ErrRateLimited):
 		httpx.WriteError(w, r, http.StatusTooManyRequests, "rate_limited", err.Error(), nil)
+	case errors.Is(err, ErrOTPDeliveryFailed):
+		httpx.WriteError(w, r, http.StatusBadGateway, "otp_delivery_failed", err.Error(), nil)
 	default:
 		httpx.WriteError(w, r, http.StatusInternalServerError, "internal_error", err.Error(), nil)
 	}

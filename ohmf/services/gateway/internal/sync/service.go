@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"ohmf/services/gateway/internal/replication"
 )
 
 type Rows interface {
@@ -63,10 +64,13 @@ func parseCursor(cursor string) time.Time {
 }
 
 type Service struct {
-	db DB
+	db          DB
+	replication *replication.Store
 }
 
-func NewService(db *pgxpool.Pool) *Service { return &Service{db: &pgxPoolAdapter{db: db}} }
+func NewService(db *pgxpool.Pool, store *replication.Store) *Service {
+	return &Service{db: &pgxPoolAdapter{db: db}, replication: store}
+}
 
 func NewServiceWithDB(db DB) *Service { return &Service{db: db} }
 
@@ -137,4 +141,29 @@ func (s *Service) IncrementalSync(ctx context.Context, cursor string, limit int)
 		}
 	}
 	return SyncResponse{Events: events, NextCursor: nextCursor}, nil
+}
+
+func (s *Service) IncrementalSyncV2(ctx context.Context, userID, cursor string, limit int) (replication.SyncResponse, error) {
+	if s.replication == nil {
+		return replication.SyncResponse{}, nil
+	}
+	parsed, err := replication.ParseCursor(cursor)
+	if err != nil {
+		return replication.SyncResponse{}, err
+	}
+	return s.replication.ListEvents(ctx, userID, parsed, limit)
+}
+
+func (s *Service) AcknowledgeCursor(ctx context.Context, userID, deviceID string, throughUserEventID int64) error {
+	if s.replication == nil {
+		return nil
+	}
+	return s.replication.AcknowledgeCursor(ctx, userID, deviceID, throughUserEventID)
+}
+
+func (s *Service) MarkDelivered(ctx context.Context, userID, deviceID, conversationID string, throughServerOrder int64) error {
+	if s.replication == nil {
+		return nil
+	}
+	return s.replication.AdvanceDeliveredCheckpoint(ctx, userID, deviceID, conversationID, throughServerOrder)
 }

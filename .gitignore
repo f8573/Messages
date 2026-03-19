@@ -1,0 +1,8 @@
+ohmf/.tools/
+postgres-data/
+ohmf/services/gateway/bin/
+ohmf/services/gateway/.env
+ohmf/services/gateway/coverage.out
+ohmf/services/messages-processor/*.exe
+ohmf/services/delivery-processor/*.exe
+ohmf/services/sms-processor/*.exe

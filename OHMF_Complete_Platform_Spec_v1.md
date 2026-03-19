@@ -1692,6 +1692,12 @@ Mini-apps SHOULD ship with a signed manifest and static assets or an entry URL.
   "version": "2.1.0",
   "entrypoint": {"type": "web_bundle", "url": "https://apps.example/eightball/index.html"},
   "icons": [{"size": 64, "url": "https://apps.example/eightball/icon-64.png"}],
+  "message_preview": {
+    "type": "static_image",
+    "url": "https://apps.example/eightball/preview.png",
+    "alt_text": "The current 8-Ball board state",
+    "fit_mode": "scale"
+  },
   "permissions": [
     "conversation.send_message",
     "conversation.read_context",
@@ -1706,6 +1712,24 @@ Mini-apps SHOULD ship with a signed manifest and static assets or an entry URL.
   "signature": {"alg": "Ed25519", "kid": "appkey_01", "sig": "base64..."}
 }
 ```
+
+## 30.4 Message preview requirements
+
+Mini-apps that can be shared into a conversation MUST declare a `message_preview` definition in their manifest.
+
+The host framework MUST render the preview inside a fixed square `1:1` viewport when the app is represented in a message preview or app card. Hosts MUST NOT expose an override for this aspect ratio.
+
+Supported preview modes:
+
+- `static_image` for a non-interactive image preview
+- `live` for a sandboxed live preview surface provided by the SDK/runtime
+
+The SDK/runtime MUST allow developers to choose a preview `fit_mode` of:
+
+- `scale`, which preserves the full preview within the square viewport
+- `crop`, which fills the square viewport and allows clipping
+
+If no `fit_mode` is declared, the host MUST treat it as `scale`.
 
 ---
 
@@ -1818,6 +1842,12 @@ Event pushed to app:
 4. runtime is launched with launch context
 5. app emits events through bridge
 6. host persists session deltas and may project summary messages into thread
+
+## 31.6 SDK preview registration
+
+SDKs that support shared mini-apps MUST expose a developer-facing way to define the manifest `message_preview` contract for message previews.
+
+For `live` previews, the SDK/runtime MUST provide the preview surface in a sandboxed square viewport and MUST preserve the framework-defined `1:1` aspect ratio. The developer MAY choose `scale` or `crop`, but MUST NOT change the aspect ratio itself.
 
 ---
 

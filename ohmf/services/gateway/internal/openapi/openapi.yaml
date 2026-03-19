@@ -37,6 +37,7 @@ components:
         expires_in_sec: { type: integer }
         retry_after_sec: { type: integer }
         otp_strategy: { type: string }
+        provider: { type: string }
     PhoneVerifyRequest:
       type: object
       required: [challenge_id, otp_code, device]
@@ -60,13 +61,231 @@ components:
         refresh_token: { type: string }
     CreateConversationRequest:
       type: object
-      required: [type, participants]
+      required: [type]
       properties:
-        type: { type: string, enum: [DM] }
+        type: { type: string, enum: [DM, GROUP] }
         participants:
           type: array
           items: { type: string }
+        participant_phones:
+          type: array
+          items: { type: string }
+        title: { type: string }
+        avatar_url: { type: string }
+        encryption_state: { type: string, enum: [PLAINTEXT, PENDING_E2EE, ENCRYPTED] }
         transport_policy: { type: string, default: AUTO }
+    Conversation:
+      type: object
+      properties:
+        conversation_id: { type: string }
+        type: { type: string }
+        title: { type: string }
+        avatar_url: { type: string }
+        creator_user_id: { type: string }
+        encryption_state: { type: string }
+        encryption_epoch: { type: integer }
+        participants:
+          type: array
+          items: { type: string }
+        external_phones:
+          type: array
+          items: { type: string }
+        updated_at:
+          type: string
+          format: date-time
+        last_message_preview: { type: string }
+        unread_count: { type: integer }
+        nickname: { type: string }
+        closed: { type: boolean }
+        archived: { type: boolean }
+        pinned: { type: boolean }
+        muted_until:
+          type: string
+          format: date-time
+        blocked: { type: boolean }
+        blocked_by_viewer: { type: boolean }
+        blocked_by_other: { type: boolean }
+        thread_keys:
+          type: array
+          items:
+            type: object
+            additionalProperties:
+              type: string
+    ConversationListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Conversation' }
+        next_cursor: { type: string }
+    UpdateConversationPreferencesRequest:
+      type: object
+      properties:
+        nickname: { type: string, nullable: true }
+        closed: { type: boolean }
+        archived: { type: boolean }
+        pinned: { type: boolean }
+        muted_until:
+          type: string
+          format: date-time
+          nullable: true
+    UpdateConversationMetadataRequest:
+      type: object
+      properties:
+        title: { type: string, nullable: true }
+        avatar_url: { type: string, nullable: true }
+        encryption_state: { type: string, enum: [PLAINTEXT, PENDING_E2EE, ENCRYPTED, CARRIER_PLAINTEXT] }
+    UpdateConversationMembersRequest:
+      type: object
+      required: [user_ids]
+      properties:
+        user_ids:
+          type: array
+          items: { type: string }
+    Profile:
+      type: object
+      properties:
+        user_id: { type: string }
+        display_name: { type: string }
+        avatar_url: { type: string }
+        primary_phone_e164: { type: string }
+    ResolveProfilesRequest:
+      type: object
+      required: [user_ids]
+      properties:
+        user_ids:
+          type: array
+          items: { type: string }
+    ResolveProfilesResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Profile' }
+    DeviceKeyOneTimePrekey:
+      type: object
+      properties:
+        prekey_id: { type: integer }
+        public_key: { type: string }
+    DeviceKeyBundle:
+      type: object
+      properties:
+        device_id: { type: string }
+        user_id: { type: string }
+        identity_key_alg: { type: string }
+        identity_public_key: { type: string }
+        agreement_identity_public_key: { type: string }
+        signing_key_alg: { type: string }
+        signing_public_key: { type: string }
+        signed_prekey_id: { type: integer }
+        signed_prekey_public_key: { type: string }
+        signed_prekey_signature: { type: string }
+        key_version: { type: integer }
+        trust_level: { type: string }
+        published_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        available_one_time_prekeys: { type: integer }
+        claimed_one_time_prekey: { $ref: '#/components/schemas/DeviceKeyOneTimePrekey' }
+    PublishDeviceKeyBundleRequest:
+      type: object
+      required: [agreement_identity_public_key, signing_public_key, signed_prekey_id, signed_prekey_public_key, signed_prekey_signature]
+      properties:
+        identity_key_alg: { type: string }
+        identity_public_key: { type: string }
+        agreement_identity_public_key: { type: string }
+        signing_key_alg: { type: string }
+        signing_public_key: { type: string }
+        signed_prekey_id: { type: integer }
+        signed_prekey_public_key: { type: string }
+        signed_prekey_signature: { type: string }
+        key_version: { type: integer }
+        trust_level: { type: string }
+        one_time_prekeys:
+          type: array
+          items: { $ref: '#/components/schemas/DeviceKeyOneTimePrekey' }
+    NotificationPreferences:
+      type: object
+      properties:
+        user_id: { type: string }
+        device_id: { type: string }
+        push_enabled: { type: boolean }
+        mute_unknown_senders: { type: boolean }
+        show_previews: { type: boolean }
+        muted_conversation_notifications: { type: boolean }
+    Device:
+      type: object
+      properties:
+        device_id: { type: string }
+        user_id: { type: string }
+        platform: { type: string }
+        device_name: { type: string }
+        client_version: { type: string }
+        capabilities:
+          type: array
+          items: { type: string }
+        push_provider: { type: string }
+        has_push_subscription: { type: boolean }
+        public_key: { type: string }
+    DeviceUpdateRequest:
+      type: object
+      properties:
+        platform: { type: string }
+        device_name: { type: string }
+        client_version: { type: string }
+        capabilities:
+          type: array
+          items: { type: string }
+        push_provider: { type: string }
+        push_subscription: { type: string }
+        push_token: { type: string }
+        public_key: { type: string }
+    MediaUploadInitRequest:
+      type: object
+      required: [mime_type]
+      properties:
+        attachment_id: { type: string }
+        mime_type: { type: string }
+        file_name: { type: string }
+        size_bytes: { type: integer }
+        checksum_sha256: { type: string }
+        ttl_seconds: { type: integer }
+    MediaUploadInitResponse:
+      type: object
+      properties:
+        upload_id: { type: string }
+        attachment_id: { type: string }
+        token: { type: string }
+        upload_url: { type: string }
+        method: { type: string }
+        object_key: { type: string }
+        expires_at:
+          type: string
+          format: date-time
+        headers:
+          type: object
+          additionalProperties: { type: string }
+    MediaAttachmentBindRequest:
+      type: object
+      required: [attachment_id, message_id]
+      properties:
+        attachment_id: { type: string }
+        message_id: { type: string }
+        file_name: { type: string }
+    MediaDownloadResponse:
+      type: object
+      properties:
+        attachment_id: { type: string }
+        download_url: { type: string }
+        expires_at:
+          type: string
+          format: date-time
+        file_name: { type: string }
+        mime_type: { type: string }
+        size_bytes: { type: integer }
     SendMessageRequest:
       type: object
       required: [conversation_id, idempotency_key, content_type, content]
@@ -181,6 +400,16 @@ components:
         title: { type: string }
         summary: { type: string }
         icon_url: { type: string }
+        message_preview:
+          type: object
+          properties:
+            type: { type: string, enum: [static_image, live] }
+            url: { type: string }
+            alt_text: { type: string }
+            fit_mode: { type: string, enum: [scale, crop] }
+        preview_state:
+          type: object
+          additionalProperties: true
         cta_label: { type: string }
         joinable: { type: boolean }
     MiniAppSession:
@@ -336,6 +565,39 @@ paths:
       responses:
         '204':
           description: No Content
+  /v1/me:
+    get:
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Profile' }
+    patch:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Profile' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Profile' }
+  /v1/users/resolve:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ResolveProfilesRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ResolveProfilesResponse' }
   /v1/conversations:
     post:
       requestBody:
@@ -346,15 +608,277 @@ paths:
       responses:
         '201':
           description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Conversation' }
     get:
       responses:
         '200':
           description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationListResponse' }
   /v1/conversations/{id}:
     get:
       parameters:
         - in: path
           name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Conversation' }
+  /v1/conversations/{id}/preferences:
+    patch:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateConversationPreferencesRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Conversation' }
+  /v1/conversations/{id}/metadata:
+    patch:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateConversationMetadataRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Conversation' }
+  /v1/conversations/{id}/members:
+    post:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateConversationMembersRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Conversation' }
+  /v1/conversations/{id}/members/{userID}:
+    delete:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+        - in: path
+          name: userID
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Conversation' }
+  /v1/device-keys/{deviceID}:
+    put:
+      parameters:
+        - in: path
+          name: deviceID
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PublishDeviceKeyBundleRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeviceKeyBundle' }
+  /v1/device-keys/{deviceID}/prekeys:
+    post:
+      parameters:
+        - in: path
+          name: deviceID
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                one_time_prekeys:
+                  type: array
+                  items: { $ref: '#/components/schemas/DeviceKeyOneTimePrekey' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeviceKeyBundle' }
+  /v1/device-keys/{userID}:
+    get:
+      parameters:
+        - in: path
+          name: userID
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+  /v1/device-keys/{userID}/claim:
+    post:
+      parameters:
+        - in: path
+          name: userID
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+  /v1/notifications/preferences:
+    get:
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationPreferences' }
+    put:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NotificationPreferences' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationPreferences' }
+  /v1/devices:
+    get:
+      responses:
+        '200':
+          description: OK
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeviceUpdateRequest' }
+      responses:
+        '200':
+          description: OK
+  /v1/devices/{id}:
+    patch:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeviceUpdateRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Device' }
+  /v1/media/uploads:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MediaUploadInitRequest' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MediaUploadInitResponse' }
+  /v1/media/uploads/{token}:
+    put:
+      parameters:
+        - in: path
+          name: token
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MediaUploadInitResponse' }
+  /v1/media/uploads/{token}/complete:
+    post:
+      parameters:
+        - in: path
+          name: token
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+  /v1/media/attachments:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MediaAttachmentBindRequest' }
+      responses:
+        '201':
+          description: Created
+  /v1/media/attachments/{id}/download:
+    get:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MediaDownloadResponse' }
+  /v1/media/downloads/{token}:
+    get:
+      parameters:
+        - in: path
+          name: token
           required: true
           schema: { type: string }
       responses:

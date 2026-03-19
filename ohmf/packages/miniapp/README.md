@@ -7,6 +7,7 @@ Purpose
 
 Expected behavior
 - Miniapps are signed JSON manifests with declared capabilities and scopes.
+- Shareable miniapps must include a `message_preview` definition for the host message preview surface.
 - Install flow includes validation of manifest against JSON Schema and verification of signature.
 
 Miniapp manifest JSON Schema (Draft 2020-12)
@@ -21,6 +22,15 @@ Miniapp manifest JSON Schema (Draft 2020-12)
 		"version":{"type":"string"},
 		"name":{"type":"string"},
 		"entrypoint":{"type":"string","format":"uri"},
+		"message_preview":{
+			"type":"object",
+			"required":["type","url"],
+			"properties":{
+				"type":{"type":"string","enum":["static_image","live"]},
+				"url":{"type":"string","format":"uri"},
+				"fit_mode":{"type":"string","enum":["scale","crop"]}
+			}
+		},
 		"capabilities":{"type":"array","items":{"type":"string"}},
 		"scopes":{"type":"array","items":{"type":"string"}},
 		"signature":{"type":"string"}

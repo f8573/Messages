@@ -9,8 +9,13 @@ import (
 
 	"ohmf/services/gateway/internal/config"
 	"ohmf/services/gateway/internal/db"
+	"ohmf/services/gateway/internal/devices"
+	"ohmf/services/gateway/internal/notification"
 	"ohmf/services/gateway/internal/observability"
+	"ohmf/services/gateway/internal/replication"
 	wk "ohmf/services/gateway/internal/worker"
+
+	"github.com/redis/go-redis/v9"
 )
 
 func main() {
@@ -24,12 +29,26 @@ func main() {
 	}
 	defer pool.Close()
 
+	rdb := redis.NewClient(&redis.Options{
+		Addr: cfg.RedisAddr,
+		DB:   cfg.RedisDB,
+	})
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		logger.Fatal().Err(err).Msg("redis connection failed")
+	}
+	defer rdb.Close()
+
+	replicationStore := replication.NewStore(pool, rdb)
+	deviceSvc := devices.NewService(pool, cfg)
+	notificationSvc := notification.NewService(pool, deviceSvc, cfg)
+
 	// create runner and workers
 	runner := wk.NewRunner()
 	runner.Add(wk.NewMediaWorker(pool))
-	runner.Add(wk.NewNotificationWorker(pool))
+	runner.Add(wk.NewNotificationWorker(notificationSvc))
 	runner.Add(wk.NewAbuseAggregatorWorker(pool))
 	runner.Add(wk.NewRelayRetryWorker(pool))
+	runner.Add(wk.NewSyncFanoutWorker(replicationStore))
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()

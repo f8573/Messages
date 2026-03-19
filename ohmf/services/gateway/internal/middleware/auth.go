@@ -12,6 +12,7 @@ type ctxKey string
 
 const (
 	userIDKey       ctxKey = "user_id"
+	deviceIDKey     ctxKey = "device_id"
 	userProfilesKey ctxKey = "user_profiles"
 )
 
@@ -24,6 +25,15 @@ func UserIDFromContext(ctx context.Context) (string, bool) {
 // convenient for tests to simulate an authenticated request.
 func WithUserID(ctx context.Context, userID string) context.Context {
 	return context.WithValue(ctx, userIDKey, userID)
+}
+
+func DeviceIDFromContext(ctx context.Context) (string, bool) {
+	v, ok := ctx.Value(deviceIDKey).(string)
+	return v, ok
+}
+
+func WithDeviceID(ctx context.Context, deviceID string) context.Context {
+	return context.WithValue(ctx, deviceIDKey, deviceID)
 }
 
 // WithProfiles returns a new context with the provided user profiles set.
@@ -64,6 +74,9 @@ func RequireAuth(tokens *token.Service) func(http.Handler) http.Handler {
 			}
 			// attach user id and claimed profiles into the request context
 			ctx := context.WithValue(r.Context(), userIDKey, claims.UserID)
+			if claims.DeviceID != "" {
+				ctx = context.WithValue(ctx, deviceIDKey, claims.DeviceID)
+			}
 			if len(claims.Profiles) > 0 {
 				ctx = context.WithValue(ctx, userProfilesKey, claims.Profiles)
 			}

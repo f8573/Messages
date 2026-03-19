@@ -29,6 +29,47 @@ func isReservedContentType(contentType string) bool {
 	}
 }
 
+func validateSendContent(contentType string, content map[string]any) error {
+	switch contentType {
+	case "encrypted":
+		if _, ok := content["ciphertext"].(string); !ok {
+			return errors.New("encrypted messages require ciphertext")
+		}
+		if _, ok := content["nonce"].(string); !ok {
+			return errors.New("encrypted messages require nonce")
+		}
+		encryption, ok := content["encryption"].(map[string]any)
+		if !ok {
+			return errors.New("encrypted messages require encryption metadata")
+		}
+		if scheme, _ := encryption["scheme"].(string); scheme != "OHMF_SIGNAL_V1" {
+			return errors.New("encrypted messages require scheme OHMF_SIGNAL_V1")
+		}
+		if _, ok := encryption["sender_user_id"].(string); !ok {
+			return errors.New("encrypted messages require sender_user_id")
+		}
+		if _, ok := encryption["sender_device_id"].(string); !ok {
+			return errors.New("encrypted messages require sender_device_id")
+		}
+		if _, ok := encryption["sender_signature"].(string); !ok {
+			return errors.New("encrypted messages require sender_signature")
+		}
+		recipients, ok := encryption["recipients"].([]any)
+		if !ok || len(recipients) == 0 {
+			return errors.New("encrypted messages require recipients")
+		}
+	case "attachment":
+		if _, ok := content["attachment_id"].(string); !ok {
+			return errors.New("attachment messages require attachment_id")
+		}
+	case "link_preview":
+		if _, ok := content["url"].(string); !ok {
+			return errors.New("link previews require url")
+		}
+	}
+	return nil
+}
+
 func NewHandler(svc *Service) *Handler {
 	return &Handler{svc: svc}
 }
@@ -72,11 +113,24 @@ func (h *Handler) Send(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "content required", nil)
 		return
 	}
+	if err := validateSendContent(req.ContentType, req.Content); err != nil {
+		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", err.Error(), nil)
+		return
+	}
+	deviceID, _ := middleware.DeviceIDFromContext(r.Context())
 	traceID := buildTraceID(chimiddleware.GetReqID(r.Context()))
-	result, err := h.svc.Send(r.Context(), userID, req.ConversationID, req.IdempotencyKey, req.ContentType, req.Content, req.ClientGeneratedID, traceID, ipOnly(r.RemoteAddr))
+	result, err := h.svc.Send(r.Context(), userID, deviceID, req.ConversationID, req.IdempotencyKey, req.ContentType, req.Content, req.ClientGeneratedID, traceID, ipOnly(r.RemoteAddr))
 	if err != nil {
 		if errors.Is(err, ErrConversationAccess) {
 			httpx.WriteError(w, r, http.StatusForbidden, "forbidden", err.Error(), nil)
+			return
+		}
+		if errors.Is(err, ErrConversationBlocked) {
+			httpx.WriteError(w, r, http.StatusForbidden, "blocked", "conversation is blocked", nil)
+			return
+		}
+		if errors.Is(err, ErrEncryptedMessageRequired) || errors.Is(err, ErrEncryptedMessageInvalid) || errors.Is(err, ErrSenderDeviceRequired) || errors.Is(err, ErrSenderDeviceInvalid) {
+			httpx.WriteError(w, r, http.StatusConflict, "invalid_encrypted_message", err.Error(), nil)
 			return
 		}
 		var rlErr RateLimitError
@@ -166,9 +220,22 @@ func (h *Handler) SendToPhone(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "content required", nil)
 		return
 	}
+	if err := validateSendContent(req.ContentType, req.Content); err != nil {
+		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", err.Error(), nil)
+		return
+	}
+	deviceID, _ := middleware.DeviceIDFromContext(r.Context())
 	traceID := buildTraceID(chimiddleware.GetReqID(r.Context()))
-	result, err := h.svc.SendToPhone(r.Context(), userID, req.PhoneE164, req.IdempotencyKey, req.ContentType, req.Content, req.ClientGeneratedID, traceID, ipOnly(r.RemoteAddr))
+	result, err := h.svc.SendToPhone(r.Context(), userID, deviceID, req.PhoneE164, req.IdempotencyKey, req.ContentType, req.Content, req.ClientGeneratedID, traceID, ipOnly(r.RemoteAddr))
 	if err != nil {
+		if errors.Is(err, ErrConversationBlocked) {
+			httpx.WriteError(w, r, http.StatusForbidden, "blocked", "conversation is blocked", nil)
+			return
+		}
+		if errors.Is(err, ErrEncryptedMessageInvalid) || errors.Is(err, ErrSenderDeviceRequired) || errors.Is(err, ErrSenderDeviceInvalid) {
+			httpx.WriteError(w, r, http.StatusConflict, "invalid_encrypted_message", err.Error(), nil)
+			return
+		}
 		var rlErr RateLimitError
 		if errors.As(err, &rlErr) {
 			decision := limit.Decision{Allowed: false, RetryAfter: time.Duration(retryAfterOrDefault(rlErr.RetryAfter)) * time.Millisecond}
@@ -389,6 +456,51 @@ func (h *Handler) Redact(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (h *Handler) Edit(w http.ResponseWriter, r *http.Request) {
+	userID, ok := middleware.UserIDFromContext(r.Context())
+	if !ok {
+		httpx.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing auth", nil)
+		return
+	}
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "message id required", nil)
+		return
+	}
+	var req struct {
+		Content map[string]any `json:"content"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "invalid body", nil)
+		return
+	}
+	text, _ := req.Content["text"].(string)
+	if text == "" {
+		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "content.text required", nil)
+		return
+	}
+	if err := h.svc.EditMessage(r.Context(), userID, id, text); err != nil {
+		switch err.Error() {
+		case "forbidden":
+			httpx.WriteError(w, r, http.StatusForbidden, "forbidden", "not allowed to edit", nil)
+			return
+		case "message_not_found":
+			httpx.WriteError(w, r, http.StatusNotFound, "not_found", "message not found", nil)
+			return
+		case "message_not_editable":
+			httpx.WriteError(w, r, http.StatusConflict, "message_not_editable", "message cannot be edited", nil)
+			return
+		}
+		if errors.Is(err, ErrEncryptedMessageEdit) {
+			httpx.WriteError(w, r, http.StatusConflict, "e2ee_edit_not_supported", "encrypted messages cannot be edited in this rollout", nil)
+			return
+		}
+		httpx.WriteError(w, r, http.StatusInternalServerError, "edit_failed", err.Error(), nil)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 	userID, ok := middleware.UserIDFromContext(r.Context())
 	if !ok {
@@ -442,10 +554,22 @@ func (h *Handler) AddReaction(w http.ResponseWriter, r *http.Request) {
 			httpx.WriteError(w, r, http.StatusForbidden, "forbidden", "not a member", nil)
 			return
 		}
+		if errors.Is(err, ErrEncryptedReactionBlocked) {
+			httpx.WriteError(w, r, http.StatusConflict, "e2ee_reactions_not_supported", "encrypted DM reactions are disabled in this rollout", nil)
+			return
+		}
 		httpx.WriteError(w, r, http.StatusInternalServerError, "add_reaction_failed", err.Error(), nil)
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	reactions, err := h.svc.ListReactions(r.Context(), id)
+	if err != nil {
+		httpx.WriteError(w, r, http.StatusInternalServerError, "list_reactions_failed", err.Error(), nil)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{
+		"message_id": id,
+		"reactions":  reactions,
+	})
 }
 
 func (h *Handler) RemoveReaction(w http.ResponseWriter, r *http.Request) {
@@ -475,10 +599,22 @@ func (h *Handler) RemoveReaction(w http.ResponseWriter, r *http.Request) {
 			httpx.WriteError(w, r, http.StatusForbidden, "forbidden", "not a member", nil)
 			return
 		}
+		if errors.Is(err, ErrEncryptedReactionBlocked) {
+			httpx.WriteError(w, r, http.StatusConflict, "e2ee_reactions_not_supported", "encrypted DM reactions are disabled in this rollout", nil)
+			return
+		}
 		httpx.WriteError(w, r, http.StatusInternalServerError, "remove_reaction_failed", err.Error(), nil)
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	reactions, err := h.svc.ListReactions(r.Context(), id)
+	if err != nil {
+		httpx.WriteError(w, r, http.StatusInternalServerError, "list_reactions_failed", err.Error(), nil)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{
+		"message_id": id,
+		"reactions":  reactions,
+	})
 }
 
 func retryAfterOrDefault(v time.Duration) int64 {
