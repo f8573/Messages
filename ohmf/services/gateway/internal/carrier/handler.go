@@ -334,14 +334,10 @@ func (h *Handler) ListLinks(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 	var out []CarrierMessageLinkAudit
 	for rows.Next() {
-		var a CarrierMessageLinkAudit
-		var serverID *string
-		if err := rows.Scan(&a.ID, &a.CarrierMessageID, &serverID, &a.SetAt, &a.Actor); err != nil {
+		a, err := h.scanCarrierMessageLinkAudit(rows)
+		if err != nil {
 			httpx.WriteError(w, r, http.StatusInternalServerError, "list_failed", err.Error(), nil)
 			return
-		}
-		if serverID != nil && *serverID != "" {
-			a.ServerMessageID = serverID
 		}
 		out = append(out, a)
 	}
@@ -383,14 +379,10 @@ func (h *Handler) AdminListLinks(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 	var out []CarrierMessageLinkAudit
 	for rows.Next() {
-		var a CarrierMessageLinkAudit
-		var serverID *string
-		if err := rows.Scan(&a.ID, &a.CarrierMessageID, &serverID, &a.SetAt, &a.Actor); err != nil {
+		a, err := h.scanCarrierMessageLinkAudit(rows)
+		if err != nil {
 			httpx.WriteError(w, r, http.StatusInternalServerError, "list_failed", err.Error(), nil)
 			return
-		}
-		if serverID != nil && *serverID != "" {
-			a.ServerMessageID = serverID
 		}
 		out = append(out, a)
 	}
@@ -399,6 +391,18 @@ func (h *Handler) AdminListLinks(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"links": out})
 }
 
+// removed: extracted scanCarrierMessageLinkAudit() helper to eliminate duplicate row-scanning code
+func (h *Handler) scanCarrierMessageLinkAudit(rows interface{ Scan(...any) error }) (CarrierMessageLinkAudit, error) {
+	var a CarrierMessageLinkAudit
+	var serverID *string
+	if err := rows.Scan(&a.ID, &a.CarrierMessageID, &serverID, &a.SetAt, &a.Actor); err != nil {
+		return a, err
+	}
+	if serverID != nil && *serverID != "" {
+		a.ServerMessageID = serverID
+	}
+	return a, nil
+}
 
 type CarrierMessage struct {
 	ID                  string          `json:"id"`
