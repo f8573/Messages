@@ -1583,24 +1583,27 @@ func nullUUIDArg(value string) any {
 	return value
 }
 
-// auditLogCapabilityCheck logs a capability enforcement decision (allowed or denied).
+// auditLogCapabilityAllowed logs successful capability enforcement.
 // This is used for compliance, debugging, and forensic analysis.
-func (s *Service) auditLogCapabilityCheck(ctx context.Context, userID, sessionID, bridgeMethod string, allowed bool, denyReason string) error {
-	eventType := "bridge_method_allowed"
-	if !allowed {
-		eventType = "bridge_method_denied"
-	}
-
+func (s *Service) auditLogCapabilityAllowed(ctx context.Context, userID, sessionID, bridgeMethod string) error {
 	payload := map[string]any{
 		"session_id":    sessionID,
 		"bridge_method": bridgeMethod,
-		"allowed":       allowed,
+		"allowed":       true,
 	}
-	if denyReason != "" {
-		payload["deny_reason"] = denyReason
-	}
+	return securityaudit.Append(ctx, s.db, userID, userID, "bridge_method_allowed", payload)
+}
 
-	return securityaudit.Append(ctx, s.db, userID, userID, eventType, payload)
+// auditLogCapabilityDenied logs denied capability enforcement with reason.
+// This is used for compliance, debugging, and forensic analysis.
+func (s *Service) auditLogCapabilityDenied(ctx context.Context, userID, sessionID, bridgeMethod, reason string) error {
+	payload := map[string]any{
+		"session_id":    sessionID,
+		"bridge_method": bridgeMethod,
+		"allowed":       false,
+		"deny_reason":   reason,
+	}
+	return securityaudit.Append(ctx, s.db, userID, userID, "bridge_method_denied", payload)
 }
 
 // ReleaseStatus represents the suspension/revocation status of a release
