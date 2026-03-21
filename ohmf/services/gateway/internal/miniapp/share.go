@@ -145,7 +145,7 @@ func (s *Service) AppendEventForUser(ctx context.Context, userID, sessionID, eve
 	grantedCapabilities := record.viewerGrantedPermissions(userID)
 	if err := validateBridgeMethodWithRateLimit(sessionID, grantedCapabilities, eventName); err != nil {
 		// Log denied capability call for security audit
-		_ = s.auditLogCapabilityCheck(ctx, userID, sessionID, eventName, false, err.Error())
+		_ = s.auditLogCapabilityDenied(ctx, userID, sessionID, eventName, err.Error())
 
 		// Return generic error to prevent fingerprinting
 		if errors.Is(err, ErrBridgeMethodRateLimited) {
@@ -155,7 +155,7 @@ func (s *Service) AppendEventForUser(ctx context.Context, userID, sessionID, eve
 	}
 
 	// Log allowed capability call for audit trail
-	_ = s.auditLogCapabilityCheck(ctx, userID, sessionID, eventName, true, "")
+	_ = s.auditLogCapabilityAllowed(ctx, userID, sessionID, eventName)
 
 	return s.AppendEvent(ctx, sessionID, userID, eventName, body)
 }
