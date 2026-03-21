@@ -1,6 +1,7 @@
 {
   "app_id": "app.ohmf.counter-lab",
   "name": "Counter Lab",
+  "manifest_version": "1.0",
   "version": "1.0.0",
   "entrypoint": {
     "type": "url",
@@ -17,6 +18,11 @@
     "turn_based": true,
     "offline_resume": true,
     "host_message_projection": true
+  },
+  "message_preview": {
+    "type": "static_image",
+    "url": "http://localhost:5174/miniapps/counter/preview.svg",
+    "fit_mode": "scale"
   },
   "metadata": {
     "category": "test",

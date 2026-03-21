@@ -40,6 +40,38 @@ message ReadReceipt {
   string conversation_id = 1;
   string user_id = 2;
   int64 through_server_order = 3;
+  int64 read_at_ms = 4;
+}
+
+// Typing indicator
+message TypingIndicator {
+  string conversation_id = 1;
+  string user_id = 2;
+  string device_id = 3;
+  int64 started_at_ms = 4;
+  string state = 5;  // "typing_started" or "typing_stopped"
+}
+
+// Message effect types
+enum MessageEffectType {
+  EFFECT_UNSPECIFIED = 0;
+  EFFECT_NONE = 1;
+  BUBBLE_CONFETTI = 2;
+  BUBBLE_ECHO = 3;
+  BUBBLE_SPOTLIGHT = 4;
+  BUBBLE_BALLOONS = 5;
+  BUBBLE_LOVE = 6;
+  BUBBLE_LASERS = 7;
+  SCREEN_FIREWORKS = 8;
+  SCREEN_ECHO = 9;
+  SCREEN_SPOTLIGHT = 10;
+}
+
+// Message effect
+message MessageEffect {
+  MessageEffectType effect_type = 1;
+  int64 triggered_at_ms = 2;
+  string triggered_by_user_id = 3;
 }
 
 // Relay job

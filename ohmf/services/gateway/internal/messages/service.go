@@ -12,7 +12,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"ohmf/services/gateway/internal/limit"
 	"ohmf/services/gateway/internal/middleware"
@@ -24,6 +23,8 @@ type Message struct {
 	ConversationID    string           `json:"conversation_id"`
 	SenderUserID      string           `json:"sender_user_id"`
 	SenderDeviceID    string           `json:"sender_device_id,omitempty"`
+	ReplyToMessageID  string           `json:"reply_to_message_id,omitempty"`
+	ReplyCount        int64            `json:"reply_count,omitempty"`
 	ContentType       string           `json:"content_type"`
 	Content           map[string]any   `json:"content"`
 	Reactions         map[string]int64 `json:"reactions,omitempty"`
@@ -37,10 +38,13 @@ type Message struct {
 	ReadAt            string           `json:"read_at,omitempty"`
 	StatusUpdatedAt   string           `json:"status_updated_at,omitempty"`
 	EditedAt          string           `json:"edited_at,omitempty"`
+	ExpiresAt         string           `json:"expires_at,omitempty"`
 	Deleted           bool             `json:"deleted,omitempty"`
 	DeletedAt         string           `json:"deleted_at,omitempty"`
 	VisibilityState   string           `json:"visibility_state,omitempty"`
 	Source            string           `json:"source,omitempty"`
+	PinnedAt          string           `json:"pinned_at,omitempty"`
+	PinnedByUserID    string           `json:"pinned_by_user_id,omitempty"`
 }
 
 type SendResult struct {
@@ -60,8 +64,15 @@ type Options struct {
 	Replication       *replication.Store
 }
 
+type DB interface {
+	BeginTx(ctx context.Context, txOptions pgx.TxOptions) (pgx.Tx, error)
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
 type Service struct {
-	db                *pgxpool.Pool
+	db                DB
 	useKafkaSend      bool
 	useCassandraReads bool
 	ackTimeout        time.Duration
@@ -85,6 +96,19 @@ type DeliveryRecord struct {
 	UpdatedAt         string `json:"updated_at"`
 	FailureCode       string `json:"failure_code,omitempty"`
 }
+
+type SearchOptions struct {
+	SenderUserID string
+	ContentType  string
+	After        *time.Time
+	Before       *time.Time
+}
+
+const (
+	messagePinEffectPinned   = "PINNED"
+	messagePinEffectUnpinned = "UNPINNED"
+	messageForwardSource     = "FORWARDED"
+)
 
 func (s *Service) Redact(ctx context.Context, actorUserID, messageID string) error {
 	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
@@ -247,7 +271,7 @@ func (s *Service) DeleteMessage(ctx context.Context, actorUserID, messageID stri
 
 // removed: deletion flow comments repeated the control flow and SQL
 
-func (s *Service) EditMessage(ctx context.Context, actorUserID, messageID, text string) error {
+func (s *Service) EditMessage(ctx context.Context, actorUserID, messageID string, content map[string]any) error {
 	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return err
@@ -263,11 +287,13 @@ func (s *Service) EditMessage(ctx context.Context, actorUserID, messageID, text 
 	var serverOrder int64
 	var createdAt time.Time
 	var deletedAt sql.NullTime
+	var expiresAt sql.NullTime
+	var previousContent string
 	err = tx.QueryRow(ctx, `
-		SELECT sender_user_id::text, COALESCE(sender_device_id::text, ''), conversation_id::text, content_type, client_generated_id, transport, server_order, created_at, deleted_at
+		SELECT sender_user_id::text, COALESCE(sender_device_id::text, ''), conversation_id::text, content_type, client_generated_id, transport, server_order, created_at, deleted_at, expires_at, content::text
 		FROM messages
 		WHERE id = $1
-	`, messageID).Scan(&senderID, &senderDeviceID, &convID, &contentType, &clientGeneratedID, &transport, &serverOrder, &createdAt, &deletedAt)
+	`, messageID).Scan(&senderID, &senderDeviceID, &convID, &contentType, &clientGeneratedID, &transport, &serverOrder, &createdAt, &deletedAt, &expiresAt, &previousContent)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("message_not_found")
@@ -280,6 +306,9 @@ func (s *Service) EditMessage(ctx context.Context, actorUserID, messageID, text 
 	if deletedAt.Valid {
 		return fmt.Errorf("message_not_editable")
 	}
+	if expiresAt.Valid && !expiresAt.Time.After(time.Now().UTC()) {
+		return fmt.Errorf("message_not_editable")
+	}
 	if contentType == "encrypted" {
 		return ErrEncryptedMessageEdit
 	}
@@ -287,7 +316,10 @@ func (s *Service) EditMessage(ctx context.Context, actorUserID, messageID, text 
 		return fmt.Errorf("message_not_editable")
 	}
 
-	content := map[string]any{"text": text}
+	if _, err := messageLifecycleHintsFromContent(content); err != nil {
+		return err
+	}
+
 	contentJSON, err := json.Marshal(content)
 	if err != nil {
 		return err
@@ -306,6 +338,13 @@ func (s *Service) EditMessage(ctx context.Context, actorUserID, messageID, text 
 	}
 
 	if _, err := tx.Exec(ctx, `UPDATE conversations SET updated_at = now() WHERE id = $1::uuid`, convID); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO message_edits (message_id, conversation_id, edited_by, previous_content, new_content, edited_at)
+		VALUES ($1::uuid, $2::uuid, $3::uuid, $4::jsonb, $5::jsonb, $6)
+	`, messageID, convID, actorUserID, previousContent, string(contentJSON), editedAt); err != nil {
 		return err
 	}
 
@@ -337,12 +376,250 @@ func (s *Service) EditMessage(ctx context.Context, actorUserID, messageID, text 
 	return tx.Commit(ctx)
 }
 
+type EditRecord struct {
+	EditedAt        string         `json:"edited_at"`
+	PreviousContent map[string]any `json:"previous_content"`
+	NewContent      map[string]any `json:"new_content"`
+	EditedBy        string         `json:"edited_by"`
+}
+
+func (s *Service) GetMessageEditHistory(ctx context.Context, actorUserID, messageID string) ([]EditRecord, error) {
+	var conversationID string
+	err := s.db.QueryRow(ctx, `SELECT conversation_id::text FROM messages WHERE id = $1::uuid`, messageID).Scan(&conversationID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("message_not_found")
+		}
+		return nil, err
+	}
+
+	ok, err := s.hasMembership(ctx, s.db, actorUserID, conversationID)
+	if err != nil || !ok {
+		return nil, ErrConversationAccess
+	}
+
+	rows, err := s.db.Query(ctx, `
+		SELECT edited_at, previous_content, new_content, COALESCE(edited_by::text, '') AS edited_by
+		FROM message_edits
+		WHERE message_id = $1::uuid
+		ORDER BY edited_at DESC
+	`, messageID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var edits []EditRecord
+	for rows.Next() {
+		var edit EditRecord
+		var prevContentStr, newContentStr string
+		if err := rows.Scan(&edit.EditedAt, &prevContentStr, &newContentStr, &edit.EditedBy); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(prevContentStr), &edit.PreviousContent); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(newContentStr), &edit.NewContent); err != nil {
+			return nil, err
+		}
+		edits = append(edits, edit)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return edits, nil
+}
+
 func (s *Service) RecordDelivery(ctx context.Context, messageID string, dr DeliveryRecord) error {
 	_, err := s.db.Exec(ctx, `
 		INSERT INTO message_deliveries (id, message_id, recipient_user_id, recipient_device_id, recipient_phone_e164, transport, state, provider, submitted_at, updated_at, failure_code)
 		VALUES (gen_random_uuid(), $1, NULLIF($2, '')::uuid, NULLIF($3, '')::uuid, NULLIF($4, ''), $5, $6, NULLIF($7, ''), NULLIF($8, '')::timestamptz, now(), NULLIF($9, ''))
 	`, messageID, dr.RecipientUserID, dr.RecipientDeviceID, dr.RecipientPhone, dr.Transport, dr.State, dr.Provider, nullableTimestamp(dr.SubmittedAt), dr.FailureCode)
 	return err
+}
+
+func (s *Service) SetMessagePinned(ctx context.Context, actorUserID, messageID string, pinned bool) error {
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var convID string
+	var deletedAt sql.NullTime
+	var visibilityState sql.NullString
+	var expiresAt sql.NullTime
+	if err := tx.QueryRow(ctx, `
+		SELECT conversation_id::text, deleted_at, visibility_state, expires_at
+		FROM messages
+		WHERE id = $1::uuid
+	`, messageID).Scan(&convID, &deletedAt, &visibilityState, &expiresAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("message_not_found")
+		}
+		return err
+	}
+	if deletedAt.Valid || strings.EqualFold(visibilityState.String, "SOFT_DELETED") || strings.EqualFold(visibilityState.String, "REDACTED") || (expiresAt.Valid && !expiresAt.Time.After(time.Now().UTC())) {
+		return fmt.Errorf("message_not_pinnable")
+	}
+
+	if ok, err := s.hasMembership(ctx, tx, actorUserID, convID); err != nil {
+		return err
+	} else if !ok {
+		return ErrConversationAccess
+	}
+
+	state, err := s.latestPinState(ctx, tx, messageID, convID)
+	if err != nil {
+		return err
+	}
+	if pinned && state == messagePinEffectPinned {
+		return tx.Commit(ctx)
+	}
+	if !pinned && state != messagePinEffectPinned {
+		return tx.Commit(ctx)
+	}
+
+	effectType := messagePinEffectPinned
+	if !pinned {
+		effectType = messagePinEffectUnpinned
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO message_effects(message_id, conversation_id, triggered_by_user_id, effect_type)
+		VALUES($1::uuid, $2::uuid, $3::uuid, $4)
+	`, messageID, convID, actorUserID, effectType); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(ctx, `UPDATE conversations SET updated_at = now() WHERE id = $1::uuid`, convID); err != nil {
+		return err
+	}
+
+	if s.replication != nil {
+		if err := s.replication.AppendMessageEffectEvent(ctx, tx, convID, actorUserID, messageID, effectType, time.Now().UTC()); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit(ctx)
+}
+
+func (s *Service) ListPinnedMessages(ctx context.Context, actorUserID, conversationID string) ([]Message, error) {
+	if ok, err := s.hasMembership(ctx, s.db, actorUserID, conversationID); err != nil {
+		return nil, err
+	} else if !ok {
+		return nil, ErrConversationAccess
+	}
+
+	rows, err := s.db.Query(ctx, `
+		SELECT DISTINCT ON (message_id)
+			message_id::text,
+			triggered_by_user_id::text,
+			triggered_at,
+			effect_type
+		FROM message_effects
+		WHERE conversation_id = $1::uuid
+		  AND effect_type IN ($2, $3)
+		ORDER BY message_id, triggered_at DESC, id DESC
+	`, conversationID, messagePinEffectPinned, messagePinEffectUnpinned)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	type pinState struct {
+		messageID string
+		pinnedBy  string
+		pinnedAt  time.Time
+	}
+
+	pins := make([]pinState, 0, 16)
+	for rows.Next() {
+		var state pinState
+		var effectType string
+		if err := rows.Scan(&state.messageID, &state.pinnedBy, &state.pinnedAt, &effectType); err != nil {
+			return nil, err
+		}
+		if effectType != messagePinEffectPinned {
+			continue
+		}
+		pins = append(pins, state)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	items := make([]Message, 0, len(pins))
+	for _, pin := range pins {
+		msg, err := s.loadMessageViewByID(ctx, actorUserID, pin.messageID)
+		if err != nil {
+			if errors.Is(err, ErrConversationAccess) {
+				continue
+			}
+			if err.Error() == "message_not_found" {
+				continue
+			}
+			return nil, err
+		}
+		if msg.Deleted || strings.EqualFold(msg.VisibilityState, "EXPIRED") {
+			continue
+		}
+		msg.PinnedAt = pin.pinnedAt.UTC().Format(time.RFC3339Nano)
+		msg.PinnedByUserID = pin.pinnedBy
+		items = append(items, msg)
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		ti, _ := time.Parse(time.RFC3339Nano, items[i].PinnedAt)
+		tj, _ := time.Parse(time.RFC3339Nano, items[j].PinnedAt)
+		if ti.Equal(tj) {
+			return items[i].ServerOrder < items[j].ServerOrder
+		}
+		return ti.After(tj)
+	})
+	return items, nil
+}
+
+func (s *Service) ForwardMessage(ctx context.Context, actorUserID, senderDeviceID, sourceMessageID, targetConversationID, idemKey, clientGeneratedID, ip string) (SendResult, error) {
+	var sourceConversationID string
+	var sourceMessage Message
+	var err error
+	if sourceMessage, err = s.loadMessageViewByID(ctx, actorUserID, sourceMessageID); err != nil {
+		return SendResult{}, err
+	}
+	sourceConversationID = sourceMessage.ConversationID
+	if sourceConversationID == "" {
+		return SendResult{}, fmt.Errorf("message_not_found")
+	}
+	if sourceMessage.Deleted || strings.EqualFold(sourceMessage.VisibilityState, "SOFT_DELETED") || strings.EqualFold(sourceMessage.VisibilityState, "REDACTED") {
+		return SendResult{}, fmt.Errorf("message_not_forwardable")
+	}
+
+	if err := s.enforceSendRate(ctx, actorUserID, targetConversationID, ip); err != nil {
+		return SendResult{}, err
+	}
+
+	forwardedContent := cloneMessageContent(sourceMessage.Content)
+	if forwardedContent == nil {
+		forwardedContent = map[string]any{}
+	}
+	delete(forwardedContent, "reply_to_message_id")
+	forwardedContent["forwarded_from"] = map[string]any{
+		"message_id":       sourceMessage.MessageID,
+		"conversation_id":  sourceConversationID,
+		"sender_user_id":   sourceMessage.SenderUserID,
+		"content_type":     sourceMessage.ContentType,
+		"server_order":     sourceMessage.ServerOrder,
+		"created_at":       sourceMessage.CreatedAt,
+		"visibility_state": sourceMessage.VisibilityState,
+		"client_generated": sourceMessage.ClientGeneratedID,
+	}
+
+	msg, err := s.sendSyncWithEndpoint(ctx, actorUserID, senderDeviceID, targetConversationID, idemKey, sourceMessage.ContentType, forwardedContent, clientGeneratedID, "/v1/messages/forward", messageForwardSource)
+	if err != nil {
+		return SendResult{}, err
+	}
+	return SendResult{Message: msg}, nil
 }
 
 func (s *Service) AddReaction(ctx context.Context, actorUserID, messageID, emoji string) error {
@@ -441,6 +718,207 @@ func (s *Service) ListReactions(ctx context.Context, messageID string) (map[stri
 	return s.listReactionsWithQuery(ctx, s.db, messageID)
 }
 
+func (s *Service) latestPinState(ctx context.Context, q querier, messageID, conversationID string) (string, error) {
+	var state string
+	err := q.QueryRow(ctx, `
+		SELECT effect_type
+		FROM message_effects
+		WHERE message_id = $1::uuid
+		  AND conversation_id = $2::uuid
+		  AND effect_type IN ($3, $4)
+		ORDER BY triggered_at DESC, id DESC
+		LIMIT 1
+	`, messageID, conversationID, messagePinEffectPinned, messagePinEffectUnpinned).Scan(&state)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", nil
+		}
+		return "", err
+	}
+	return state, nil
+}
+
+func (s *Service) loadMessageViewByID(ctx context.Context, actorUserID, messageID string) (Message, error) {
+	var conversationID string
+	if err := s.db.QueryRow(ctx, `SELECT conversation_id::text FROM messages WHERE id = $1::uuid`, messageID).Scan(&conversationID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Message{}, fmt.Errorf("message_not_found")
+		}
+		return Message{}, err
+	}
+
+	if ok, err := s.hasMembership(ctx, s.db, actorUserID, conversationID); err != nil {
+		return Message{}, err
+	} else if !ok {
+		return Message{}, ErrConversationAccess
+	}
+
+	row := s.db.QueryRow(ctx, `
+		SELECT
+			m.id::text,
+			m.conversation_id::text,
+			m.sender_user_id::text,
+			COALESCE(m.sender_device_id::text, ''),
+			COALESCE(m.reply_to_message_id::text, ''),
+			m.content_type,
+			CASE
+				WHEN m.deleted_at IS NOT NULL
+				  OR m.visibility_state IN ('SOFT_DELETED', 'REDACTED')
+				  OR (m.expires_at IS NOT NULL AND m.expires_at <= now()) THEN '{}'::jsonb
+				ELSE COALESCE(m.content, '{}'::jsonb)
+			END AS content,
+			m.client_generated_id,
+			m.transport,
+			m.server_order,
+			CASE
+				WHEN m.sender_user_id = $1::uuid AND m.transport IN ('OTT', 'OHMF') AND read_meta.read_at IS NOT NULL THEN 'READ'
+				WHEN m.sender_user_id = $1::uuid AND m.transport IN ('OTT', 'OHMF') AND delivered_meta.delivered_at IS NOT NULL THEN 'DELIVERED'
+				WHEN m.sender_user_id = $1::uuid THEN 'SENT'
+				ELSE ''
+			END AS delivery_status,
+			m.created_at,
+			delivered_meta.delivered_at,
+			read_meta.read_at,
+			m.edited_at,
+			m.deleted_at,
+			m.expires_at,
+			CASE
+				WHEN m.deleted_at IS NOT NULL THEN m.visibility_state
+				WHEN m.expires_at IS NOT NULL AND m.expires_at <= now() THEN 'EXPIRED'
+				ELSE m.visibility_state
+			END AS visibility_state,
+			COALESCE(reply_meta.reply_count, 0) AS reply_count,
+			COALESCE(reaction_meta.reactions, '{}'::jsonb) AS reactions
+		FROM messages m
+		LEFT JOIN LATERAL (
+			SELECT MAX(de.created_at) AS delivered_at
+			FROM domain_events de
+			WHERE de.conversation_id = m.conversation_id
+			  AND de.event_type = 'delivery_checkpoint_advanced'
+			  AND COALESCE((de.payload->>'through_server_order')::bigint, 0) >= m.server_order
+			  AND COALESCE(de.payload->>'user_id', '') <> $1::text
+		) delivered_meta ON TRUE
+		LEFT JOIN LATERAL (
+			SELECT MAX(other.last_read_at) AS read_at
+			FROM conversation_members other
+			WHERE other.conversation_id = m.conversation_id
+			  AND other.user_id <> $1::uuid
+			  AND other.last_read_server_order >= m.server_order
+			  AND other.last_read_at IS NOT NULL
+		) read_meta ON TRUE
+		LEFT JOIN LATERAL (
+			SELECT COUNT(*)::bigint AS reply_count
+			FROM messages child
+			WHERE child.reply_to_message_id = m.id
+			  AND child.deleted_at IS NULL
+			  AND (child.expires_at IS NULL OR child.expires_at > now())
+			  AND COALESCE(child.visibility_state, '') NOT IN ('SOFT_DELETED', 'REDACTED', 'EXPIRED')
+		) reply_meta ON TRUE
+		LEFT JOIN LATERAL (
+			SELECT jsonb_object_agg(emoji, cnt) AS reactions
+			FROM (
+				SELECT emoji, count(*)::bigint AS cnt
+				FROM message_reactions
+				WHERE message_id = m.id
+				GROUP BY emoji
+			) grouped
+		) reaction_meta ON TRUE
+		WHERE m.id = $2::uuid
+	`, actorUserID, messageID)
+
+	var m Message
+	var contentRaw []byte
+	var clientGenID sql.NullString
+	var status string
+	var created time.Time
+	var deliveredAt sql.NullTime
+	var readAt sql.NullTime
+	var editedAt sql.NullTime
+	var deletedAt sql.NullTime
+	var expiresAt sql.NullTime
+	var reactionsRaw []byte
+	if err := row.Scan(&m.MessageID, &m.ConversationID, &m.SenderUserID, &m.SenderDeviceID, &m.ReplyToMessageID, &m.ContentType, &contentRaw, &clientGenID, &m.Transport, &m.ServerOrder, &status, &created, &deliveredAt, &readAt, &editedAt, &deletedAt, &expiresAt, &m.VisibilityState, &m.ReplyCount, &reactionsRaw); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Message{}, fmt.Errorf("message_not_found")
+		}
+		return Message{}, err
+	}
+	_ = json.Unmarshal(contentRaw, &m.Content)
+	_ = json.Unmarshal(reactionsRaw, &m.Reactions)
+	if clientGenID.Valid {
+		m.ClientGeneratedID = clientGenID.String
+	}
+	if status != "" {
+		m.Status = status
+	}
+	m.CreatedAt = created.UTC().Format(time.RFC3339)
+	m.SentAt = m.CreatedAt
+	if deliveredAt.Valid {
+		m.DeliveredAt = deliveredAt.Time.UTC().Format(time.RFC3339)
+	}
+	if readAt.Valid {
+		m.ReadAt = readAt.Time.UTC().Format(time.RFC3339)
+	}
+	if editedAt.Valid {
+		m.EditedAt = editedAt.Time.UTC().Format(time.RFC3339)
+	}
+	applyMessageLifecycle(&m, deletedAt, expiresAt)
+	switch m.Status {
+	case "READ":
+		m.StatusUpdatedAt = m.ReadAt
+	case "DELIVERED":
+		m.StatusUpdatedAt = m.DeliveredAt
+	case "SENT":
+		m.StatusUpdatedAt = m.SentAt
+	}
+	return m, nil
+}
+
+func cloneMessageContent(content map[string]any) map[string]any {
+	if content == nil {
+		return nil
+	}
+	body, err := json.Marshal(content)
+	if err != nil {
+		return nil
+	}
+	var out map[string]any
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil
+	}
+	return out
+}
+
+func resolveReplyTarget(ctx context.Context, tx pgx.Tx, conversationID string, content map[string]any) (string, error) {
+	if content == nil {
+		return "", nil
+	}
+	replyToRaw, _ := content["reply_to_message_id"].(string)
+	replyToMessageID := strings.TrimSpace(replyToRaw)
+	delete(content, "reply_to_message_id")
+	if replyToMessageID == "" {
+		return "", nil
+	}
+	var exists bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1
+			FROM messages
+			WHERE id = $1::uuid
+			  AND conversation_id = $2::uuid
+			  AND deleted_at IS NULL
+			  AND (expires_at IS NULL OR expires_at > now())
+			  AND COALESCE(visibility_state, '') NOT IN ('SOFT_DELETED', 'REDACTED', 'EXPIRED')
+		)
+	`, replyToMessageID, conversationID).Scan(&exists); err != nil {
+		return "", err
+	}
+	if !exists {
+		return "", fmt.Errorf("reply_target_not_found")
+	}
+	return replyToMessageID, nil
+}
+
 func (s *Service) appendReactionDomainEventTx(ctx context.Context, tx pgx.Tx, actorUserID, messageID, conversationID string, serverOrder int64) error {
 	if s.replication == nil {
 		return nil
@@ -494,6 +972,75 @@ func nullableTimestamp(v string) any {
 	return v
 }
 
+func resolveMessageExpiration(ctx context.Context, q interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}, conversationID, contentType string, content map[string]any) (sql.NullTime, error) {
+	if !strings.EqualFold(contentType, "text") {
+		return sql.NullTime{}, nil
+	}
+	hints, err := messageLifecycleHintsFromContent(content)
+	if err != nil {
+		return sql.NullTime{}, err
+	}
+
+	var retentionSeconds sql.NullInt64
+	var conversationExpiresAt sql.NullTime
+	if err := q.QueryRow(ctx, `
+		SELECT COALESCE(retention_seconds, 0), expires_at
+		FROM conversations
+		WHERE id = $1::uuid
+	`, conversationID).Scan(&retentionSeconds, &conversationExpiresAt); err != nil {
+		return sql.NullTime{}, err
+	}
+
+	now := time.Now().UTC()
+	candidates := make([]time.Time, 0, 3)
+	if hints.ExpiresAt != nil {
+		candidates = append(candidates, hints.ExpiresAt.UTC())
+	}
+	if retentionSeconds.Valid && retentionSeconds.Int64 > 0 {
+		candidates = append(candidates, now.Add(time.Duration(retentionSeconds.Int64)*time.Second))
+	}
+	if conversationExpiresAt.Valid {
+		candidates = append(candidates, conversationExpiresAt.Time.UTC())
+	}
+
+	if len(candidates) == 0 {
+		return sql.NullTime{}, nil
+	}
+
+	expiry := candidates[0]
+	for _, candidate := range candidates[1:] {
+		if candidate.Before(expiry) {
+			expiry = candidate
+		}
+	}
+	return sql.NullTime{Time: expiry, Valid: true}, nil
+}
+
+func applyMessageLifecycle(m *Message, deletedAt sql.NullTime, expiresAt sql.NullTime) {
+	if expiresAt.Valid {
+		m.ExpiresAt = expiresAt.Time.UTC().Format(time.RFC3339Nano)
+	}
+	if deletedAt.Valid {
+		m.Deleted = true
+		m.DeletedAt = deletedAt.Time.UTC().Format(time.RFC3339Nano)
+		m.Content = map[string]any{}
+		return
+	}
+	if expiresAt.Valid && !expiresAt.Time.After(time.Now().UTC()) {
+		m.Deleted = true
+		m.DeletedAt = expiresAt.Time.UTC().Format(time.RFC3339Nano)
+		m.VisibilityState = "EXPIRED"
+		m.Content = map[string]any{}
+		return
+	}
+	if m.VisibilityState == "SOFT_DELETED" || m.VisibilityState == "REDACTED" {
+		m.Deleted = true
+		m.Content = map[string]any{}
+	}
+}
+
 func (s *Service) ListDeliveries(ctx context.Context, messageID string) ([]DeliveryRecord, error) {
 	rows, err := s.db.Query(ctx, `
 		SELECT id::text, message_id::text, recipient_user_id::text, recipient_device_id::text, recipient_phone_e164, transport, state, provider, submitted_at, updated_at, failure_code
@@ -531,6 +1078,7 @@ var (
 	ErrConversationAccess       = errors.New("conversation_access_denied")
 	ErrConversationBlocked      = errors.New("conversation_blocked")
 	ErrRateLimited              = errors.New("rate_limited")
+	ErrInvalidMessageEffectType = errors.New("invalid_message_effect_type")
 	ErrEncryptedMessageRequired = errors.New("encrypted_message_required")
 	ErrEncryptedMessageInvalid  = errors.New("encrypted_message_invalid")
 	ErrEncryptedMessageEdit     = errors.New("e2ee_edit_not_supported")
@@ -548,7 +1096,24 @@ func (e RateLimitError) Error() string {
 	return "rate_limited"
 }
 
-func NewService(db *pgxpool.Pool, opts Options) *Service {
+func isSupportedMessageEffectType(effectType string) bool {
+	switch strings.ToLower(strings.TrimSpace(effectType)) {
+	case "bubble_confetti",
+		"bubble_echo",
+		"bubble_spotlight",
+		"bubble_balloons",
+		"bubble_love",
+		"bubble_lasers",
+		"screen_fireworks",
+		"screen_echo",
+		"screen_spotlight":
+		return true
+	default:
+		return false
+	}
+}
+
+func NewService(db DB, opts Options) *Service {
 	ackTimeout := opts.AckTimeout
 	if ackTimeout <= 0 {
 		ackTimeout = 2 * time.Second
@@ -618,6 +1183,11 @@ type receiptEvent struct {
 }
 
 func (s *Service) Send(ctx context.Context, userID, senderDeviceID, conversationID, idemKey, contentType string, content map[string]any, clientGeneratedID string, traceID string, ip string) (SendResult, error) {
+	if strings.EqualFold(contentType, "text") {
+		if _, err := messageLifecycleHintsFromContent(content); err != nil {
+			return SendResult{}, err
+		}
+	}
 	if err := s.enforceSendRate(ctx, userID, conversationID, ip); err != nil {
 		return SendResult{}, err
 	}
@@ -632,6 +1202,11 @@ func (s *Service) Send(ctx context.Context, userID, senderDeviceID, conversation
 }
 
 func (s *Service) SendToPhone(ctx context.Context, userID, senderDeviceID, phoneE164, idemKey, contentType string, content map[string]any, clientGeneratedID string, traceID string, ip string) (SendResult, error) {
+	if strings.EqualFold(contentType, "text") {
+		if _, err := messageLifecycleHintsFromContent(content); err != nil {
+			return SendResult{}, err
+		}
+	}
 	conversationID, err := s.ensurePhoneConversation(ctx, userID, phoneE164)
 	if err != nil {
 		return SendResult{}, err
@@ -740,9 +1315,12 @@ func (s *Service) List(ctx context.Context, actor, conversationID string) ([]Mes
 			m.conversation_id::text,
 			m.sender_user_id::text,
 			COALESCE(m.sender_device_id::text, ''),
+			COALESCE(m.reply_to_message_id::text, ''),
 			m.content_type,
 			CASE
-				WHEN m.deleted_at IS NOT NULL OR m.visibility_state = 'SOFT_DELETED' THEN '{}'::jsonb
+				WHEN m.deleted_at IS NOT NULL
+				  OR m.visibility_state IN ('SOFT_DELETED', 'REDACTED')
+				  OR (m.expires_at IS NOT NULL AND m.expires_at <= now()) THEN '{}'::jsonb
 				ELSE COALESCE(m.content, '{}'::jsonb)
 			END AS content,
 			m.client_generated_id,
@@ -759,7 +1337,13 @@ func (s *Service) List(ctx context.Context, actor, conversationID string) ([]Mes
 			read_meta.read_at,
 			m.edited_at,
 			m.deleted_at,
-			m.visibility_state,
+			m.expires_at,
+			CASE
+				WHEN m.deleted_at IS NOT NULL THEN m.visibility_state
+				WHEN m.expires_at IS NOT NULL AND m.expires_at <= now() THEN 'EXPIRED'
+				ELSE m.visibility_state
+			END AS visibility_state,
+			COALESCE(reply_meta.reply_count, 0) AS reply_count,
 			COALESCE(reaction_meta.reactions, '{}'::jsonb) AS reactions
 		FROM messages m
 		LEFT JOIN LATERAL (
@@ -778,6 +1362,14 @@ func (s *Service) List(ctx context.Context, actor, conversationID string) ([]Mes
 			  AND other.last_read_server_order >= m.server_order
 			  AND other.last_read_at IS NOT NULL
 		) read_meta ON TRUE
+		LEFT JOIN LATERAL (
+			SELECT COUNT(*)::bigint AS reply_count
+			FROM messages child
+			WHERE child.reply_to_message_id = m.id
+			  AND child.deleted_at IS NULL
+			  AND (child.expires_at IS NULL OR child.expires_at > now())
+			  AND COALESCE(child.visibility_state, '') NOT IN ('SOFT_DELETED', 'REDACTED', 'EXPIRED')
+		) reply_meta ON TRUE
 		LEFT JOIN LATERAL (
 			SELECT jsonb_object_agg(emoji, cnt) AS reactions
 			FROM (
@@ -806,8 +1398,9 @@ func (s *Service) List(ctx context.Context, actor, conversationID string) ([]Mes
 		var readAt sql.NullTime
 		var editedAt sql.NullTime
 		var deletedAt sql.NullTime
+		var expiresAt sql.NullTime
 		var reactionsRaw []byte
-		if err := rows.Scan(&m.MessageID, &m.ConversationID, &m.SenderUserID, &m.SenderDeviceID, &m.ContentType, &contentRaw, &clientGenID, &m.Transport, &m.ServerOrder, &status, &created, &deliveredAt, &readAt, &editedAt, &deletedAt, &m.VisibilityState, &reactionsRaw); err != nil {
+		if err := rows.Scan(&m.MessageID, &m.ConversationID, &m.SenderUserID, &m.SenderDeviceID, &m.ReplyToMessageID, &m.ContentType, &contentRaw, &clientGenID, &m.Transport, &m.ServerOrder, &status, &created, &deliveredAt, &readAt, &editedAt, &deletedAt, &expiresAt, &m.VisibilityState, &m.ReplyCount, &reactionsRaw); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal(contentRaw, &m.Content)
@@ -829,15 +1422,7 @@ func (s *Service) List(ctx context.Context, actor, conversationID string) ([]Mes
 		if editedAt.Valid {
 			m.EditedAt = editedAt.Time.UTC().Format(time.RFC3339)
 		}
-		if deletedAt.Valid {
-			m.Deleted = true
-			m.DeletedAt = deletedAt.Time.UTC().Format(time.RFC3339Nano)
-			m.Content = map[string]any{}
-		}
-		if m.VisibilityState == "SOFT_DELETED" {
-			m.Deleted = true
-			m.Content = map[string]any{}
-		}
+		applyMessageLifecycle(&m, deletedAt, expiresAt)
 		switch m.Status {
 		case "READ":
 			m.StatusUpdatedAt = m.ReadAt
@@ -868,9 +1453,12 @@ func (s *Service) ListUnified(ctx context.Context, actor, conversationID string,
 			m.conversation_id::text,
 			m.sender_user_id::text,
 			COALESCE(m.sender_device_id::text, ''),
+			COALESCE(m.reply_to_message_id::text, ''),
 			m.content_type,
 			CASE
-				WHEN m.deleted_at IS NOT NULL OR m.visibility_state = 'SOFT_DELETED' THEN '{}'::jsonb
+				WHEN m.deleted_at IS NOT NULL
+				  OR m.visibility_state IN ('SOFT_DELETED', 'REDACTED')
+				  OR (m.expires_at IS NOT NULL AND m.expires_at <= now()) THEN '{}'::jsonb
 				ELSE COALESCE(m.content, '{}'::jsonb)
 			END AS content,
 			m.client_generated_id,
@@ -879,8 +1467,18 @@ func (s *Service) ListUnified(ctx context.Context, actor, conversationID string,
 			m.created_at,
 			m.edited_at,
 			m.deleted_at,
-			m.visibility_state
+			m.expires_at,
+			m.visibility_state,
+			COALESCE(reply_meta.reply_count, 0) AS reply_count
 		FROM messages m
+		LEFT JOIN LATERAL (
+			SELECT COUNT(*)::bigint AS reply_count
+			FROM messages child
+			WHERE child.reply_to_message_id = m.id
+			  AND child.deleted_at IS NULL
+			  AND (child.expires_at IS NULL OR child.expires_at > now())
+			  AND COALESCE(child.visibility_state, '') NOT IN ('SOFT_DELETED', 'REDACTED', 'EXPIRED')
+		) reply_meta ON TRUE
 		WHERE m.conversation_id = $1::uuid
 		ORDER BY server_order ASC
 		LIMIT $2
@@ -898,7 +1496,8 @@ func (s *Service) ListUnified(ctx context.Context, actor, conversationID string,
 		var created time.Time
 		var editedAt sql.NullTime
 		var deletedAt sql.NullTime
-		if err := rows.Scan(&m.MessageID, &m.ConversationID, &m.SenderUserID, &m.SenderDeviceID, &m.ContentType, &contentRaw, &clientGenID, &m.Transport, &m.ServerOrder, &created, &editedAt, &deletedAt, &m.VisibilityState); err != nil {
+		var expiresAt sql.NullTime
+		if err := rows.Scan(&m.MessageID, &m.ConversationID, &m.SenderUserID, &m.SenderDeviceID, &m.ReplyToMessageID, &m.ContentType, &contentRaw, &clientGenID, &m.Transport, &m.ServerOrder, &created, &editedAt, &deletedAt, &expiresAt, &m.VisibilityState, &m.ReplyCount); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal(contentRaw, &m.Content)
@@ -909,15 +1508,7 @@ func (s *Service) ListUnified(ctx context.Context, actor, conversationID string,
 		if editedAt.Valid {
 			m.EditedAt = editedAt.Time.UTC().Format(time.RFC3339)
 		}
-		if deletedAt.Valid {
-			m.Deleted = true
-			m.DeletedAt = deletedAt.Time.UTC().Format(time.RFC3339Nano)
-			m.Content = map[string]any{}
-		}
-		if m.VisibilityState == "SOFT_DELETED" {
-			m.Deleted = true
-			m.Content = map[string]any{}
-		}
+		applyMessageLifecycle(&m, deletedAt, expiresAt)
 		m.Source = "SERVER"
 		items = append(items, m)
 		messageIDs = append(messageIDs, m.MessageID)
@@ -1006,19 +1597,289 @@ func (s *Service) ListUnified(ctx context.Context, actor, conversationID string,
 	return items, nil
 }
 
-// removed: unified timeline comments repeated the query flow
+// SearchMessages searches for messages in a conversation by text content
+func (s *Service) SearchMessages(ctx context.Context, userID, conversationID, query string, limit int, opts SearchOptions) ([]Message, error) {
+	if query == "" {
+		return []Message{}, nil
+	}
+	if len(query) < 2 {
+		return nil, errors.New("query too short")
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
 
-func (s *Service) MarkRead(ctx context.Context, actor, conversationID string, through int64) error {
+	if err := s.enforceSearchRate(ctx, userID, conversationID); err != nil {
+		return nil, err
+	}
+
+	if ok, err := s.hasMembership(ctx, s.db, userID, conversationID); err != nil {
+		return nil, err
+	} else if !ok {
+		return nil, ErrConversationAccess
+	}
+
+	args := []any{conversationID, query}
+	filters := []string{
+		`m.conversation_id = $1::uuid`,
+		`m.deleted_at IS NULL`,
+		`(m.expires_at IS NULL OR m.expires_at > now())`,
+		`m.visibility_state != 'SOFT_DELETED'`,
+		`(
+			m.search_vector @@ websearch_to_tsquery('simple', $2)
+			OR m.content->>'text' ILIKE '%' || $2 || '%'
+			OR m.content->>'attachment_id' ILIKE '%' || $2 || '%'
+		)`,
+	}
+	if trimmed := strings.TrimSpace(opts.SenderUserID); trimmed != "" {
+		args = append(args, trimmed)
+		filters = append(filters, fmt.Sprintf("m.sender_user_id = $%d::uuid", len(args)))
+	}
+	if trimmed := strings.TrimSpace(opts.ContentType); trimmed != "" {
+		args = append(args, trimmed)
+		filters = append(filters, fmt.Sprintf("m.content_type = $%d", len(args)))
+	}
+	if opts.After != nil {
+		args = append(args, opts.After.UTC())
+		filters = append(filters, fmt.Sprintf("m.created_at >= $%d", len(args)))
+	}
+	if opts.Before != nil {
+		args = append(args, opts.Before.UTC())
+		filters = append(filters, fmt.Sprintf("m.created_at <= $%d", len(args)))
+	}
+	args = append(args, limit)
+
+	querySQL := fmt.Sprintf(`
+		SELECT
+			m.id::text,
+			m.conversation_id::text,
+			m.sender_user_id::text,
+			COALESCE(m.sender_device_id::text, ''),
+			COALESCE(m.reply_to_message_id::text, ''),
+			m.content_type,
+			CASE
+				WHEN m.deleted_at IS NOT NULL
+				  OR m.visibility_state IN ('SOFT_DELETED', 'REDACTED')
+				  OR (m.expires_at IS NOT NULL AND m.expires_at <= now()) THEN '{}'::jsonb
+				ELSE COALESCE(m.content, '{}'::jsonb)
+			END AS content,
+			m.client_generated_id,
+			m.transport,
+			m.server_order,
+			m.created_at,
+			m.edited_at,
+			m.deleted_at,
+			m.expires_at,
+			m.visibility_state,
+			COALESCE(reply_meta.reply_count, 0) AS reply_count
+		FROM messages m
+		LEFT JOIN LATERAL (
+			SELECT COUNT(*)::bigint AS reply_count
+			FROM messages child
+			WHERE child.reply_to_message_id = m.id
+			  AND child.deleted_at IS NULL
+			  AND (child.expires_at IS NULL OR child.expires_at > now())
+			  AND COALESCE(child.visibility_state, '') NOT IN ('SOFT_DELETED', 'REDACTED', 'EXPIRED')
+		) reply_meta ON TRUE
+		WHERE %s
+		ORDER BY
+			ts_rank_cd(m.search_vector, websearch_to_tsquery('simple', $2)) DESC,
+			CASE
+				WHEN lower(COALESCE(m.content->>'text', '')) = lower($2) THEN 3
+				WHEN lower(COALESCE(m.content->>'text', '')) LIKE lower($2) || '%%' THEN 2
+				WHEN COALESCE(m.content->>'text', '') ILIKE '%%' || $2 || '%%' THEN 1
+				ELSE 0
+			END DESC,
+			m.server_order DESC
+		LIMIT $%d
+	`, strings.Join(filters, "\n		  AND "), len(args))
+
+	rows, err := s.db.Query(ctx, querySQL, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := make([]Message, 0, limit)
+	for rows.Next() {
+		var m Message
+		var contentRaw []byte
+		var clientGenID sql.NullString
+		var created time.Time
+		var editedAt sql.NullTime
+		var deletedAt sql.NullTime
+		var expiresAt sql.NullTime
+		if err := rows.Scan(&m.MessageID, &m.ConversationID, &m.SenderUserID, &m.SenderDeviceID, &m.ReplyToMessageID, &m.ContentType, &contentRaw, &clientGenID, &m.Transport, &m.ServerOrder, &created, &editedAt, &deletedAt, &expiresAt, &m.VisibilityState, &m.ReplyCount); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal(contentRaw, &m.Content)
+		if clientGenID.Valid {
+			m.ClientGeneratedID = clientGenID.String
+		}
+		m.CreatedAt = created.UTC().Format(time.RFC3339)
+		if editedAt.Valid {
+			m.EditedAt = editedAt.Time.UTC().Format(time.RFC3339)
+		}
+		applyMessageLifecycle(&m, deletedAt, expiresAt)
+		m.Source = "SERVER"
+		items = append(items, m)
+	}
+	return items, rows.Err()
+}
+
+func (s *Service) ListReplies(ctx context.Context, actorUserID, messageID string) ([]Message, error) {
+	parent, err := s.loadMessageViewByID(ctx, actorUserID, messageID)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.db.Query(ctx, `
+		SELECT
+			m.id::text,
+			m.conversation_id::text,
+			m.sender_user_id::text,
+			COALESCE(m.sender_device_id::text, ''),
+			COALESCE(m.reply_to_message_id::text, ''),
+			m.content_type,
+			CASE
+				WHEN m.deleted_at IS NOT NULL
+				  OR m.visibility_state IN ('SOFT_DELETED', 'REDACTED')
+				  OR (m.expires_at IS NOT NULL AND m.expires_at <= now()) THEN '{}'::jsonb
+				ELSE COALESCE(m.content, '{}'::jsonb)
+			END AS content,
+			m.client_generated_id,
+			m.transport,
+			m.server_order,
+			m.created_at,
+			m.edited_at,
+			m.deleted_at,
+			m.expires_at,
+			CASE
+				WHEN m.deleted_at IS NOT NULL THEN m.visibility_state
+				WHEN m.expires_at IS NOT NULL AND m.expires_at <= now() THEN 'EXPIRED'
+				ELSE m.visibility_state
+			END AS visibility_state,
+			COALESCE(reply_meta.reply_count, 0) AS reply_count
+		FROM messages m
+		LEFT JOIN LATERAL (
+			SELECT COUNT(*)::bigint AS reply_count
+			FROM messages child
+			WHERE child.reply_to_message_id = m.id
+			  AND child.deleted_at IS NULL
+			  AND (child.expires_at IS NULL OR child.expires_at > now())
+			  AND COALESCE(child.visibility_state, '') NOT IN ('SOFT_DELETED', 'REDACTED', 'EXPIRED')
+		) reply_meta ON TRUE
+		WHERE m.reply_to_message_id = $1::uuid
+		  AND m.conversation_id = $2::uuid
+		ORDER BY m.server_order ASC
+	`, messageID, parent.ConversationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := make([]Message, 0, 8)
+	for rows.Next() {
+		var m Message
+		var contentRaw []byte
+		var clientGenID sql.NullString
+		var created time.Time
+		var editedAt sql.NullTime
+		var deletedAt sql.NullTime
+		var expiresAt sql.NullTime
+		if err := rows.Scan(&m.MessageID, &m.ConversationID, &m.SenderUserID, &m.SenderDeviceID, &m.ReplyToMessageID, &m.ContentType, &contentRaw, &clientGenID, &m.Transport, &m.ServerOrder, &created, &editedAt, &deletedAt, &expiresAt, &m.VisibilityState, &m.ReplyCount); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal(contentRaw, &m.Content)
+		if clientGenID.Valid {
+			m.ClientGeneratedID = clientGenID.String
+		}
+		m.CreatedAt = created.UTC().Format(time.RFC3339)
+		if editedAt.Valid {
+			m.EditedAt = editedAt.Time.UTC().Format(time.RFC3339)
+		}
+		applyMessageLifecycle(&m, deletedAt, expiresAt)
+		items = append(items, m)
+	}
+	return items, rows.Err()
+}
+
+// TriggerEffect records a message effect (confetti, balloons, etc.) and broadcasts to conversation
+func (s *Service) TriggerEffect(ctx context.Context, actorUserID, messageID, effectType string) error {
+	if !isSupportedMessageEffectType(effectType) {
+		return ErrInvalidMessageEffectType
+	}
+
 	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
 
+	var convID string
+	if err := tx.QueryRow(ctx, `
+		SELECT conversation_id::text
+		FROM messages
+		WHERE id = $1::uuid
+	`, messageID).Scan(&convID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("message_not_found")
+		}
+		return err
+	}
+
+	if ok, err := s.hasMembership(ctx, tx, actorUserID, convID); err != nil {
+		return err
+	} else if !ok {
+		return ErrConversationAccess
+	}
+
+	var allowEffects bool
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE(allow_message_effects, TRUE)
+		FROM conversations
+		WHERE id = $1::uuid
+	`, convID).Scan(&allowEffects); err != nil {
+		return err
+	}
+	if !allowEffects {
+		return fmt.Errorf("effects_disabled")
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO message_effects(message_id, conversation_id, triggered_by_user_id, effect_type)
+		VALUES($1::uuid, $2::uuid, $3::uuid, $4)
+	`, messageID, convID, actorUserID, effectType); err != nil {
+		return err
+	}
+
+	if s.replication != nil {
+		if err := s.replication.AppendMessageEffectEvent(ctx, tx, convID, actorUserID, messageID, effectType, time.Now().UTC()); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit(ctx)
+}
+
+// removed: unified timeline comments repeated the query flow
+
+func (s *Service) MarkRead(ctx context.Context, actor, conversationID string, through int64) error {
+	if through <= 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	now := time.Now().UTC()
+	nowStr := now.Format(time.RFC3339Nano)
+
 	res, err := tx.Exec(ctx, `
 		UPDATE conversation_members
 		SET last_read_server_order = GREATEST(last_read_server_order, $3),
-		    last_read_at = CASE WHEN $3 > last_read_server_order THEN now() ELSE last_read_at END
+		    last_read_at = CASE WHEN $3 > last_read_server_order THEN now() ELSE last_read_at END,
+		    read_at = now()
 		WHERE conversation_id = $1::uuid AND user_id = $2::uuid
 	`, conversationID, actor, through)
 	if err != nil {
@@ -1027,23 +1888,110 @@ func (s *Service) MarkRead(ctx context.Context, actor, conversationID string, th
 	if res.RowsAffected() == 0 {
 		return ErrConversationAccess
 	}
-	_, _ = tx.Exec(ctx, `
+
+	// Insert per-message read receipts for newly read messages
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO message_read_receipts(message_id, reader_user_id, read_at)
+		SELECT m.id, $1::uuid, $2
+		FROM messages m
+		WHERE m.conversation_id = $3::uuid
+		  AND m.server_order <= $4
+		  AND m.sender_user_id <> $1::uuid
+		  AND NOT EXISTS (
+		    SELECT 1 FROM message_read_receipts mrr
+		    WHERE mrr.message_id = m.id AND mrr.reader_user_id = $1::uuid
+		  )
+		ON CONFLICT(message_id, reader_user_id) DO NOTHING
+	`, actor, now, conversationID, through); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE messages
+		SET expires_at = CASE
+			WHEN expires_at IS NULL OR expires_at > now() THEN now()
+			ELSE expires_at
+		END
+		WHERE conversation_id = $1::uuid
+		  AND server_order <= $3
+		  AND sender_user_id <> $2::uuid
+		  AND content->>'expires_on_read' = 'true'
+		  AND deleted_at IS NULL
+		  AND visibility_state NOT IN ('SOFT_DELETED', 'REDACTED')
+	`, conversationID, actor, through); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(ctx, `
 		UPDATE conversations
 		SET updated_at = now()
 		WHERE id = $1::uuid
-	`, conversationID)
-	readAt := time.Now().UTC().Format(time.RFC3339Nano)
+	`, conversationID); err != nil {
+		return err
+	}
+
 	if s.replication != nil {
 		if err := s.replication.AppendDomainEvent(ctx, tx, conversationID, actor, replication.DomainEventReadCheckpointAdvanced, replication.ReadCheckpointPayload{
 			ConversationID:     conversationID,
 			ReaderUserID:       actor,
 			ThroughServerOrder: through,
-			ReadAt:             readAt,
+			ReadAt:             nowStr,
 		}); err != nil {
 			return err
 		}
 	}
 	return tx.Commit(ctx)
+}
+
+// GetConversationReadStatus returns read status for all members of a conversation
+func (s *Service) GetConversationReadStatus(ctx context.Context, userID, conversationID string) (map[string]any, error) {
+	// Verify caller is conversation member
+	if ok, err := s.hasMembership(ctx, s.db, userID, conversationID); err != nil {
+		return nil, err
+	} else if !ok {
+		return nil, ErrConversationAccess
+	}
+
+	rows, err := s.db.Query(ctx, `
+		SELECT u.id::text, u.primary_phone_e164, cm.last_read_server_order, cm.last_delivered_server_order, cm.read_at, cm.delivery_at
+		FROM conversation_members cm
+		JOIN users u ON u.id = cm.user_id
+		WHERE cm.conversation_id = $1::uuid
+		ORDER BY cm.read_at DESC NULLS LAST, cm.delivery_at DESC NULLS LAST
+	`, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	members := make([]map[string]any, 0, 8)
+	for rows.Next() {
+		var userID, phone string
+		var lastReadServerOrder int64
+		var lastDeliveredServerOrder int64
+		var readAt sql.NullTime
+		var deliveryAt sql.NullTime
+
+		if err := rows.Scan(&userID, &phone, &lastReadServerOrder, &lastDeliveredServerOrder, &readAt, &deliveryAt); err != nil {
+			return nil, err
+		}
+
+		m := map[string]any{
+			"user_id":                     userID,
+			"phone":                       phone,
+			"last_read_server_order":      lastReadServerOrder,
+			"last_delivered_server_order": lastDeliveredServerOrder,
+		}
+		if readAt.Valid {
+			m["read_at"] = readAt.Time.UTC().Format(time.RFC3339)
+		}
+		if deliveryAt.Valid {
+			m["delivery_at"] = deliveryAt.Time.UTC().Format(time.RFC3339)
+		}
+		members = append(members, m)
+	}
+
+	return map[string]any{"members": members}, rows.Err()
 }
 
 func (s *Service) DeliverPendingToUser(ctx context.Context, recipientUserID string) ([]map[string]any, error) {
@@ -1139,6 +2087,21 @@ func (s *Service) enforceSendRate(ctx context.Context, userID, conversationID, i
 		if !ipDecision.Allowed {
 			return RateLimitError{Scope: "ip", RetryAfter: ipDecision.RetryAfter}
 		}
+	}
+	return nil
+}
+
+func (s *Service) enforceSearchRate(ctx context.Context, userID, conversationID string) error {
+	if s.rateLimiter == nil {
+		return nil
+	}
+	scope := "rate:search:user:" + userID + ":conv:" + conversationID
+	decision, err := s.rateLimiter.Allow(ctx, scope, 30, 60*time.Second, 30, 1)
+	if err != nil {
+		return err
+	}
+	if !decision.Allowed {
+		return RateLimitError{Scope: "search", RetryAfter: decision.RetryAfter}
 	}
 	return nil
 }
@@ -1239,6 +2202,10 @@ func (s *Service) decideTransport(ctx context.Context, tx pgx.Tx, conversationID
 // removed: transport-selection comments restated the switch and fallback order
 
 func (s *Service) sendSync(ctx context.Context, userID, senderDeviceID, conversationID, idemKey, contentType string, content map[string]any, clientGeneratedID string) (Message, error) {
+	return s.sendSyncWithEndpoint(ctx, userID, senderDeviceID, conversationID, idemKey, contentType, content, clientGeneratedID, "/v1/messages", "")
+}
+
+func (s *Service) sendSyncWithEndpoint(ctx context.Context, userID, senderDeviceID, conversationID, idemKey, contentType string, content map[string]any, clientGeneratedID, endpoint, source string) (Message, error) {
 	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return Message{}, err
@@ -1261,8 +2228,8 @@ func (s *Service) sendSync(ctx context.Context, userID, senderDeviceID, conversa
 	err = tx.QueryRow(ctx, `
 		SELECT response_payload
 		FROM idempotency_keys
-		WHERE actor_user_id = $1::uuid AND endpoint = '/v1/messages' AND key = $2 AND expires_at > now()
-	`, userID, idemKey).Scan(&cached)
+		WHERE actor_user_id = $1::uuid AND endpoint = $2 AND key = $3 AND expires_at > now()
+	`, userID, endpoint, idemKey).Scan(&cached)
 	if err == nil {
 		var m Message
 		if err := json.Unmarshal(cached, &m); err == nil {
@@ -1306,7 +2273,23 @@ func (s *Service) sendSync(ctx context.Context, userID, senderDeviceID, conversa
 		return Message{}, err
 	}
 
-	contentJSON, err := json.Marshal(content)
+	expiresAt, err := resolveMessageExpiration(ctx, tx, conversationID, contentType, content)
+	if err != nil {
+		return Message{}, err
+	}
+	var expiresAtValue any
+	if expiresAt.Valid {
+		expiresAtValue = expiresAt.Time
+	}
+	contentForStorage := cloneMessageContent(content)
+	if contentForStorage == nil {
+		contentForStorage = map[string]any{}
+	}
+	replyToMessageID, err := resolveReplyTarget(ctx, tx, conversationID, contentForStorage)
+	if err != nil {
+		return Message{}, err
+	}
+	contentJSON, err := json.Marshal(contentForStorage)
 	if err != nil {
 		return Message{}, err
 	}
@@ -1330,10 +2313,10 @@ func (s *Service) sendSync(ctx context.Context, userID, senderDeviceID, conversa
 	var msgID string
 	var created time.Time
 	err = tx.QueryRow(ctx, `
-		INSERT INTO messages (conversation_id, sender_user_id, sender_device_id, content_type, content, client_generated_id, transport, server_order)
-		VALUES ($1::uuid, $2::uuid, NULLIF($3, '')::uuid, $4, $5::jsonb, $6, $7, $8)
+		INSERT INTO messages (conversation_id, sender_user_id, sender_device_id, reply_to_message_id, content_type, content, client_generated_id, transport, server_order, expires_at)
+		VALUES ($1::uuid, $2::uuid, NULLIF($3, '')::uuid, NULLIF($4, '')::uuid, $5, $6::jsonb, $7, $8, $9, $10)
 		RETURNING id::text, created_at
-	`, conversationID, userID, senderDeviceID, contentType, string(contentJSON), clientGeneratedID, chosenTransport, next).Scan(&msgID, &created)
+	`, conversationID, userID, senderDeviceID, replyToMessageID, contentType, string(contentJSON), clientGeneratedID, chosenTransport, next, expiresAtValue).Scan(&msgID, &created)
 	if err != nil {
 		return Message{}, err
 	}
@@ -1352,23 +2335,30 @@ func (s *Service) sendSync(ctx context.Context, userID, senderDeviceID, conversa
 		ConversationID:    conversationID,
 		SenderUserID:      userID,
 		SenderDeviceID:    senderDeviceID,
+		ReplyToMessageID:  replyToMessageID,
 		ContentType:       contentType,
-		Content:           content,
+		Content:           contentForStorage,
 		ClientGeneratedID: clientGeneratedID,
 		Transport:         chosenTransport,
 		ServerOrder:       next,
 		Status:            "SENT",
 		CreatedAt:         created.UTC().Format(time.RFC3339),
 	}
+	if expiresAt.Valid {
+		msg.ExpiresAt = expiresAt.Time.UTC().Format(time.RFC3339Nano)
+	}
+	if source != "" {
+		msg.Source = source
+	}
 	msg.SentAt = msg.CreatedAt
 	msg.StatusUpdatedAt = msg.CreatedAt
 	msgPayload, _ := json.Marshal(msg)
 	_, err = tx.Exec(ctx, `
 		INSERT INTO idempotency_keys (actor_user_id, endpoint, key, response_payload, status_code, expires_at)
-		VALUES ($1::uuid, '/v1/messages', $2, $3::jsonb, 201, now() + interval '24 hour')
+		VALUES ($1::uuid, $2, $3, $4::jsonb, 201, now() + interval '24 hour')
 		ON CONFLICT (actor_user_id, endpoint, key)
 		DO UPDATE SET response_payload = EXCLUDED.response_payload, status_code = EXCLUDED.status_code
-	`, userID, idemKey, string(msgPayload))
+	`, userID, endpoint, idemKey, string(msgPayload))
 	if err != nil {
 		return Message{}, err
 	}
@@ -1459,7 +2449,23 @@ func (s *Service) sendToPhoneSync(ctx context.Context, userID, senderDeviceID, p
 		return Message{}, err
 	}
 
-	contentJSON, err := json.Marshal(content)
+	expiresAt, err := resolveMessageExpiration(ctx, tx, conversationID, contentType, content)
+	if err != nil {
+		return Message{}, err
+	}
+	var expiresAtValue any
+	if expiresAt.Valid {
+		expiresAtValue = expiresAt.Time
+	}
+	contentForStorage := cloneMessageContent(content)
+	if contentForStorage == nil {
+		contentForStorage = map[string]any{}
+	}
+	replyToMessageID, err := resolveReplyTarget(ctx, tx, conversationID, contentForStorage)
+	if err != nil {
+		return Message{}, err
+	}
+	contentJSON, err := json.Marshal(contentForStorage)
 	if err != nil {
 		return Message{}, err
 	}
@@ -1467,10 +2473,10 @@ func (s *Service) sendToPhoneSync(ctx context.Context, userID, senderDeviceID, p
 	var msgID string
 	var created time.Time
 	err = tx.QueryRow(ctx, `
-		INSERT INTO messages (conversation_id, sender_user_id, sender_device_id, content_type, content, client_generated_id, transport, server_order)
-		VALUES ($1::uuid, $2::uuid, NULLIF($3, '')::uuid, $4, $5::jsonb, $6, 'SMS', $7)
+		INSERT INTO messages (conversation_id, sender_user_id, sender_device_id, reply_to_message_id, content_type, content, client_generated_id, transport, server_order, expires_at)
+		VALUES ($1::uuid, $2::uuid, NULLIF($3, '')::uuid, NULLIF($4, '')::uuid, $5, $6::jsonb, $7, 'SMS', $8, $9)
 		RETURNING id::text, created_at
-	`, conversationID, userID, senderDeviceID, contentType, string(contentJSON), clientGeneratedID, next).Scan(&msgID, &created)
+	`, conversationID, userID, senderDeviceID, replyToMessageID, contentType, string(contentJSON), clientGeneratedID, next, expiresAtValue).Scan(&msgID, &created)
 	if err != nil {
 		return Message{}, err
 	}
@@ -1489,13 +2495,17 @@ func (s *Service) sendToPhoneSync(ctx context.Context, userID, senderDeviceID, p
 		ConversationID:    conversationID,
 		SenderUserID:      userID,
 		SenderDeviceID:    senderDeviceID,
+		ReplyToMessageID:  replyToMessageID,
 		ContentType:       contentType,
-		Content:           content,
+		Content:           contentForStorage,
 		ClientGeneratedID: clientGeneratedID,
 		Transport:         "SMS",
 		ServerOrder:       next,
 		Status:            "SENT",
 		CreatedAt:         created.UTC().Format(time.RFC3339),
+	}
+	if expiresAt.Valid {
+		msg.ExpiresAt = expiresAt.Time.UTC().Format(time.RFC3339Nano)
 	}
 	msg.SentAt = msg.CreatedAt
 	msg.StatusUpdatedAt = msg.CreatedAt

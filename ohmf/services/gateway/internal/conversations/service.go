@@ -2,7 +2,9 @@ package conversations
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/base32"
 	"errors"
 	"fmt"
 	"strings"
@@ -10,54 +12,81 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/pgconn"
 	"ohmf/services/gateway/internal/devicekeys"
 	"ohmf/services/gateway/internal/phone"
 	"ohmf/services/gateway/internal/replication"
 )
 
 type Conversation struct {
-	ConversationID     string              `json:"conversation_id"`
-	Type               string              `json:"type"`
-	Title              string              `json:"title,omitempty"`
-	AvatarURL          string              `json:"avatar_url,omitempty"`
-	CreatorUserID      string              `json:"creator_user_id,omitempty"`
-	EncryptionState    string              `json:"encryption_state,omitempty"`
-	EncryptionEpoch    int                 `json:"encryption_epoch,omitempty"`
-	Participants       []string            `json:"participants"`
-	ExternalPhones     []string            `json:"external_phones,omitempty"`
-	UpdatedAt          string              `json:"updated_at"`
-	LastMessagePreview string              `json:"last_message_preview,omitempty"`
-	UnreadCount        int64               `json:"unread_count,omitempty"`
-	Nickname           string              `json:"nickname,omitempty"`
-	Closed             bool                `json:"closed,omitempty"`
-	Archived           bool                `json:"archived,omitempty"`
-	Pinned             bool                `json:"pinned,omitempty"`
-	MutedUntil         string              `json:"muted_until,omitempty"`
-	Blocked            bool                `json:"blocked,omitempty"`
-	BlockedByViewer    bool                `json:"blocked_by_viewer,omitempty"`
-	BlockedByOther     bool                `json:"blocked_by_other,omitempty"`
-	ThreadKeys         []map[string]string `json:"thread_keys,omitempty"`
+	ConversationID      string              `json:"conversation_id"`
+	Type                string              `json:"type"`
+	Title               string              `json:"title,omitempty"`
+	AvatarURL           string              `json:"avatar_url,omitempty"`
+	Description         string              `json:"description,omitempty"`
+	CreatorUserID       string              `json:"creator_user_id,omitempty"`
+	EncryptionState     string              `json:"encryption_state,omitempty"`
+	EncryptionEpoch     int                 `json:"encryption_epoch,omitempty"`
+	Participants        []string            `json:"participants"`
+	ExternalPhones      []string            `json:"external_phones,omitempty"`
+	UpdatedAt           string              `json:"updated_at"`
+	LastMessagePreview  string              `json:"last_message_preview,omitempty"`
+	UnreadCount         int64               `json:"unread_count,omitempty"`
+	Nickname            string              `json:"nickname,omitempty"`
+	ViewerRole          string              `json:"viewer_role,omitempty"`
+	Closed              bool                `json:"closed,omitempty"`
+	Archived            bool                `json:"archived,omitempty"`
+	Pinned              bool                `json:"pinned,omitempty"`
+	MutedUntil          string              `json:"muted_until,omitempty"`
+	Blocked             bool                `json:"blocked,omitempty"`
+	BlockedByViewer     bool                `json:"blocked_by_viewer,omitempty"`
+	BlockedByOther      bool                `json:"blocked_by_other,omitempty"`
+	AllowMessageEffects bool                `json:"allow_message_effects,omitempty"`
+	Theme               string              `json:"theme,omitempty"`
+	RetentionSeconds    int64               `json:"retention_seconds,omitempty"`
+	ExpiresAt           string              `json:"expires_at,omitempty"`
+	SettingsVersion     int64               `json:"settings_version,omitempty"`
+	SettingsUpdatedAt   string              `json:"settings_updated_at,omitempty"`
+	ThreadKeys          []map[string]string `json:"thread_keys,omitempty"`
+}
+
+type Invite struct {
+	InviteID        string `json:"invite_id"`
+	ConversationID  string `json:"conversation_id"`
+	Code            string `json:"code"`
+	CreatedByUserID string `json:"created_by_user_id"`
+	CreatedAt       string `json:"created_at"`
+	ExpiresAt       string `json:"expires_at"`
+	MaxUses         int    `json:"max_uses"`
+	UseCount        int    `json:"use_count"`
+	Revoked         bool   `json:"revoked"`
 }
 
 type CreateRequest struct {
-	Type            string
-	Participants    []string
+	Type              string
+	Participants      []string
 	ParticipantPhones []string
-	Title           string
-	AvatarURL       string
-	EncryptionState string
+	Title             string
+	AvatarURL         string
+	EncryptionState   string
 }
 
 var ErrNotFound = errors.New("conversation_not_found")
 var ErrEncryptedConversationNotReady = errors.New("encrypted_conversation_not_ready")
 
 type Service struct {
-	db          *pgxpool.Pool
+	db          DB
 	replication *replication.Store
 }
 
-func NewService(db *pgxpool.Pool, store *replication.Store) *Service {
+type DB interface {
+	BeginTx(ctx context.Context, txOptions pgx.TxOptions) (pgx.Tx, error)
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+func NewService(db DB, store *replication.Store) *Service {
 	return &Service{db: db, replication: store}
 }
 
@@ -249,13 +278,21 @@ func (s *Service) ListProjected(ctx context.Context, actor string, limit int) ([
 			c.type,
 			COALESCE(c.title, '') AS title,
 			COALESCE(c.avatar_url, '') AS avatar_url,
+			COALESCE(c.description, '') AS description,
 			COALESCE(c.created_by_user_id::text, '') AS creator_user_id,
 			COALESCE(c.encryption_state, 'PLAINTEXT') AS encryption_state,
 			COALESCE(c.encryption_epoch, 0) AS encryption_epoch,
+			COALESCE(c.allow_message_effects, TRUE) AS allow_message_effects,
+			COALESCE(c.theme, '') AS theme,
+			COALESCE(c.retention_seconds, 0) AS retention_seconds,
+			c.expires_at,
+			COALESCE(c.settings_version, 1) AS settings_version,
+			COALESCE(c.settings_updated_at, c.updated_at) AS settings_updated_at,
 			COALESCE(ucs.updated_at, c.updated_at) AS updated_at,
 			COALESCE(ucs.last_message_preview, '') AS last_message_preview,
 			COALESCE(ucs.unread_count, 0) AS unread_count,
 			COALESCE(ucs.nickname, '') AS nickname,
+			COALESCE(cm.role, 'MEMBER') AS viewer_role,
 			COALESCE(ucs.is_closed, false) AS is_closed,
 			COALESCE(ucs.is_archived, false) AS is_archived,
 			COALESCE(ucs.is_pinned, false) AS is_pinned,
@@ -297,18 +334,28 @@ func (s *Service) ListProjected(ctx context.Context, actor string, limit int) ([
 		var item Conversation
 		var updated time.Time
 		var mutedUntil sql.NullTime
+		var expiresAt sql.NullTime
+		var settingsUpdatedAt time.Time
 		if err := rows.Scan(
 			&item.ConversationID,
 			&item.Type,
 			&item.Title,
 			&item.AvatarURL,
+			&item.Description,
 			&item.CreatorUserID,
 			&item.EncryptionState,
 			&item.EncryptionEpoch,
+			&item.AllowMessageEffects,
+			&item.Theme,
+			&item.RetentionSeconds,
+			&expiresAt,
+			&item.SettingsVersion,
+			&settingsUpdatedAt,
 			&updated,
 			&item.LastMessagePreview,
 			&item.UnreadCount,
 			&item.Nickname,
+			&item.ViewerRole,
 			&item.Closed,
 			&item.Archived,
 			&item.Pinned,
@@ -330,8 +377,12 @@ func (s *Service) ListProjected(ctx context.Context, actor string, limit int) ([
 		item.ExternalPhones = externalPhones
 		item.ThreadKeys = tkeys
 		item.UpdatedAt = updated.UTC().Format(time.RFC3339)
+		item.SettingsUpdatedAt = settingsUpdatedAt.UTC().Format(time.RFC3339Nano)
 		if mutedUntil.Valid {
 			item.MutedUntil = mutedUntil.Time.UTC().Format(time.RFC3339Nano)
+		}
+		if expiresAt.Valid {
+			item.ExpiresAt = expiresAt.Time.UTC().Format(time.RFC3339Nano)
 		}
 		item.Blocked = item.BlockedByViewer || item.BlockedByOther
 		out = append(out, item)
@@ -351,18 +402,28 @@ func (s *Service) Get(ctx context.Context, actor, id string) (Conversation, erro
 	var out Conversation
 	var updated time.Time
 	var mutedUntil sql.NullTime
+	var expiresAt sql.NullTime
+	var settingsUpdatedAt time.Time
 	err := s.db.QueryRow(ctx, `
 		SELECT
 			c.type,
 			COALESCE(c.title, '') AS title,
 			COALESCE(c.avatar_url, '') AS avatar_url,
+			COALESCE(c.description, '') AS description,
 			COALESCE(c.created_by_user_id::text, '') AS creator_user_id,
 			COALESCE(c.encryption_state, 'PLAINTEXT') AS encryption_state,
 			COALESCE(c.encryption_epoch, 0) AS encryption_epoch,
+			COALESCE(c.allow_message_effects, TRUE) AS allow_message_effects,
+			COALESCE(c.theme, '') AS theme,
+			COALESCE(c.retention_seconds, 0) AS retention_seconds,
+			c.expires_at,
+			COALESCE(c.settings_version, 1) AS settings_version,
+			COALESCE(c.settings_updated_at, c.updated_at) AS settings_updated_at,
 			COALESCE(ucs.updated_at, c.updated_at) AS updated_at,
 			COALESCE(ucs.last_message_preview, '') AS last_message_preview,
 			COALESCE(ucs.unread_count, 0) AS unread_count,
 			COALESCE(ucs.nickname, '') AS nickname,
+			COALESCE(cm.role, 'MEMBER') AS viewer_role,
 			COALESCE(ucs.is_closed, false) AS is_closed,
 			COALESCE(ucs.is_archived, false) AS is_archived,
 			COALESCE(ucs.is_pinned, false) AS is_pinned,
@@ -395,13 +456,21 @@ func (s *Service) Get(ctx context.Context, actor, id string) (Conversation, erro
 		&out.Type,
 		&out.Title,
 		&out.AvatarURL,
+		&out.Description,
 		&out.CreatorUserID,
 		&out.EncryptionState,
 		&out.EncryptionEpoch,
+		&out.AllowMessageEffects,
+		&out.Theme,
+		&out.RetentionSeconds,
+		&expiresAt,
+		&out.SettingsVersion,
+		&settingsUpdatedAt,
 		&updated,
 		&out.LastMessagePreview,
 		&out.UnreadCount,
 		&out.Nickname,
+		&out.ViewerRole,
 		&out.Closed,
 		&out.Archived,
 		&out.Pinned,
@@ -428,8 +497,12 @@ func (s *Service) Get(ctx context.Context, actor, id string) (Conversation, erro
 	out.ExternalPhones = externalPhones
 	out.ThreadKeys = tkeys
 	out.UpdatedAt = updated.UTC().Format(time.RFC3339)
+	out.SettingsUpdatedAt = settingsUpdatedAt.UTC().Format(time.RFC3339Nano)
 	if mutedUntil.Valid {
 		out.MutedUntil = mutedUntil.Time.UTC().Format(time.RFC3339Nano)
+	}
+	if expiresAt.Valid {
+		out.ExpiresAt = expiresAt.Time.UTC().Format(time.RFC3339Nano)
 	}
 	out.Blocked = out.BlockedByViewer || out.BlockedByOther
 	return out, nil
@@ -592,28 +665,27 @@ func (s *Service) UpdatePreferences(ctx context.Context, actor, conversationID s
 	return updated, nil
 }
 
-func (s *Service) UpdateMetadata(ctx context.Context, actor, conversationID string, title, avatarURL, encryptionState *string) (Conversation, error) {
+func (s *Service) UpdateMetadata(ctx context.Context, actor, conversationID string, title, avatarURL, description, encryptionState *string) (Conversation, error) {
 	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return Conversation{}, err
 	}
 	defer tx.Rollback(ctx)
 
-	var exists bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM conversation_members WHERE conversation_id = $1::uuid AND user_id = $2::uuid)`, conversationID, actor).Scan(&exists); err != nil {
+	role, conversationType, err := s.loadActorConversationRole(ctx, tx, actor, conversationID)
+	if err != nil {
 		return Conversation{}, err
 	}
-	if !exists {
-		return Conversation{}, ErrNotFound
+	if conversationType == "GROUP" && !canManageConversation(role) {
+		return Conversation{}, errors.New("forbidden")
 	}
 
-	var conversationType string
 	var currentEncryptionState string
 	if err := tx.QueryRow(ctx, `
-		SELECT type, COALESCE(encryption_state, 'PLAINTEXT')
+		SELECT COALESCE(encryption_state, 'PLAINTEXT')
 		FROM conversations
 		WHERE id = $1::uuid
-	`, conversationID).Scan(&conversationType, &currentEncryptionState); err != nil {
+	`, conversationID).Scan(&currentEncryptionState); err != nil {
 		return Conversation{}, err
 	}
 
@@ -624,6 +696,10 @@ func (s *Service) UpdateMetadata(ctx context.Context, actor, conversationID stri
 	var avatarArg any
 	if avatarURL != nil {
 		avatarArg = strings.TrimSpace(*avatarURL)
+	}
+	var descriptionArg any
+	if description != nil {
+		descriptionArg = strings.TrimSpace(*description)
 	}
 
 	encryptionArg := ""
@@ -649,14 +725,17 @@ func (s *Service) UpdateMetadata(ctx context.Context, actor, conversationID stri
 		UPDATE conversations
 		SET title = CASE WHEN $2::bool THEN NULLIF($3::text, '') ELSE title END,
 		    avatar_url = CASE WHEN $4::bool THEN NULLIF($5::text, '') ELSE avatar_url END,
-		    encryption_state = CASE WHEN $6::bool THEN $7 ELSE encryption_state END,
+		    description = CASE WHEN $6::bool THEN NULLIF($7::text, '') ELSE description END,
+		    encryption_state = CASE WHEN $8::bool THEN $9 ELSE encryption_state END,
 		    encryption_epoch = CASE
-		      WHEN $6::bool AND $8::bool THEN encryption_epoch + 1
+		      WHEN $8::bool AND $10::bool THEN encryption_epoch + 1
 		      ELSE encryption_epoch
 		    END,
+		    settings_version = COALESCE(settings_version, 1) + 1,
+		    settings_updated_at = now(),
 		    updated_at = now()
 		WHERE id = $1::uuid
-	`, conversationID, title != nil, titleArg, avatarURL != nil, avatarArg, encryptionState != nil, encryptionArg, bumpEpoch); err != nil {
+	`, conversationID, title != nil, titleArg, avatarURL != nil, avatarArg, description != nil, descriptionArg, encryptionState != nil, encryptionArg, bumpEpoch); err != nil {
 		return Conversation{}, err
 	}
 
@@ -714,13 +793,21 @@ func (s *Service) encryptionReadyForDM(ctx context.Context, tx pgx.Tx, conversat
 	return true, nil
 }
 
-func (s *Service) AddMembers(ctx context.Context, actor, conversationID string, userIDs []string) (Conversation, error) {
-	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
-	if err != nil {
-		return Conversation{}, err
+func normalizeConversationRole(raw string) string {
+	switch strings.ToUpper(strings.TrimSpace(raw)) {
+	case "OWNER", "ADMIN", "MEMBER":
+		return strings.ToUpper(strings.TrimSpace(raw))
+	default:
+		return "MEMBER"
 	}
-	defer tx.Rollback(ctx)
+}
 
+func canManageConversation(role string) bool {
+	role = normalizeConversationRole(role)
+	return role == "OWNER" || role == "ADMIN"
+}
+
+func (s *Service) loadActorConversationRole(ctx context.Context, tx pgx.Tx, actor, conversationID string) (string, string, error) {
 	var role, conversationType string
 	if err := tx.QueryRow(ctx, `
 		SELECT cm.role, c.type
@@ -729,18 +816,110 @@ func (s *Service) AddMembers(ctx context.Context, actor, conversationID string, 
 		WHERE cm.conversation_id = $1::uuid AND cm.user_id = $2::uuid
 	`, conversationID, actor).Scan(&role, &conversationType); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return Conversation{}, ErrNotFound
+			return "", "", ErrNotFound
 		}
+		return "", "", err
+	}
+	return normalizeConversationRole(role), conversationType, nil
+}
+
+func (s *Service) loadMemberRoleTx(ctx context.Context, tx pgx.Tx, conversationID, userID string) (string, error) {
+	var role string
+	if err := tx.QueryRow(ctx, `
+		SELECT role
+		FROM conversation_members
+		WHERE conversation_id = $1::uuid AND user_id = $2::uuid
+	`, conversationID, userID).Scan(&role); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", err
+	}
+	return normalizeConversationRole(role), nil
+}
+
+func (s *Service) countOwnersTx(ctx context.Context, tx pgx.Tx, conversationID string) (int, error) {
+	var count int
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(1)
+		FROM conversation_members
+		WHERE conversation_id = $1::uuid
+		  AND role = 'OWNER'
+	`, conversationID).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (s *Service) loadConversationTypeTx(ctx context.Context, tx pgx.Tx, conversationID string) (string, error) {
+	var conversationType string
+	if err := tx.QueryRow(ctx, `SELECT type FROM conversations WHERE id = $1::uuid`, conversationID).Scan(&conversationType); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", err
+	}
+	return conversationType, nil
+}
+
+func (s *Service) isBannedTx(ctx context.Context, tx pgx.Tx, conversationID, userID string) (bool, error) {
+	var exists bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1
+			FROM conversation_bans
+			WHERE conversation_id = $1::uuid
+			  AND user_id = $2::uuid
+			  AND (expires_at IS NULL OR expires_at > now())
+		)
+	`, conversationID, userID).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
+func (s *Service) touchConversationTx(ctx context.Context, tx pgx.Tx, conversationID string) error {
+	_, err := tx.Exec(ctx, `UPDATE conversations SET updated_at = now() WHERE id = $1::uuid`, conversationID)
+	return err
+}
+
+func (s *Service) bumpConversationSettingsTx(ctx context.Context, tx pgx.Tx, conversationID string) error {
+	_, err := tx.Exec(ctx, `
+		UPDATE conversations
+		SET settings_version = COALESCE(settings_version, 1) + 1,
+		    settings_updated_at = now(),
+		    updated_at = now()
+		WHERE id = $1::uuid
+	`, conversationID)
+	return err
+}
+
+func (s *Service) AddMembers(ctx context.Context, actor, conversationID string, userIDs []string) (Conversation, error) {
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return Conversation{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	role, conversationType, err := s.loadActorConversationRole(ctx, tx, actor, conversationID)
+	if err != nil {
 		return Conversation{}, err
 	}
 	if conversationType != "GROUP" {
 		return Conversation{}, errors.New("member_changes_not_supported")
 	}
-	if role != "OWNER" {
+	if !canManageConversation(role) {
 		return Conversation{}, errors.New("forbidden")
 	}
 
 	for _, userID := range dedupeUsers(userIDs) {
+		banned, err := s.isBannedTx(ctx, tx, conversationID, userID)
+		if err != nil {
+			return Conversation{}, err
+		}
+		if banned {
+			return Conversation{}, errors.New("user_banned")
+		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO conversation_members (conversation_id, user_id, role)
 			VALUES ($1::uuid, $2::uuid, 'MEMBER')
@@ -749,7 +928,62 @@ func (s *Service) AddMembers(ctx context.Context, actor, conversationID string, 
 			return Conversation{}, err
 		}
 	}
-	if _, err := tx.Exec(ctx, `UPDATE conversations SET updated_at = now() WHERE id = $1::uuid`, conversationID); err != nil {
+	if err := s.touchConversationTx(ctx, tx, conversationID); err != nil {
+		return Conversation{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Conversation{}, err
+	}
+	return s.Get(ctx, actor, conversationID)
+}
+
+func (s *Service) UpdateMemberRole(ctx context.Context, actor, conversationID, targetUserID, role string) (Conversation, error) {
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return Conversation{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	actorRole, conversationType, err := s.loadActorConversationRole(ctx, tx, actor, conversationID)
+	if err != nil {
+		return Conversation{}, err
+	}
+	if conversationType != "GROUP" {
+		return Conversation{}, errors.New("member_changes_not_supported")
+	}
+	if actorRole != "OWNER" {
+		return Conversation{}, errors.New("forbidden")
+	}
+
+	targetRole, err := s.loadMemberRoleTx(ctx, tx, conversationID, targetUserID)
+	if err != nil {
+		return Conversation{}, err
+	}
+	nextRole := normalizeConversationRole(role)
+	if targetRole == nextRole {
+		if err := tx.Commit(ctx); err != nil {
+			return Conversation{}, err
+		}
+		return s.Get(ctx, actor, conversationID)
+	}
+	if targetRole == "OWNER" && nextRole != "OWNER" {
+		owners, err := s.countOwnersTx(ctx, tx, conversationID)
+		if err != nil {
+			return Conversation{}, err
+		}
+		if owners <= 1 {
+			return Conversation{}, errors.New("last_owner_required")
+		}
+	}
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE conversation_members
+		SET role = $3
+		WHERE conversation_id = $1::uuid AND user_id = $2::uuid
+	`, conversationID, targetUserID, nextRole); err != nil {
+		return Conversation{}, err
+	}
+	if err := s.bumpConversationSettingsTx(ctx, tx, conversationID); err != nil {
 		return Conversation{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -765,29 +999,41 @@ func (s *Service) RemoveMember(ctx context.Context, actor, conversationID, targe
 	}
 	defer tx.Rollback(ctx)
 
-	var role, conversationType string
-	if err := tx.QueryRow(ctx, `
-		SELECT cm.role, c.type
-		FROM conversation_members cm
-		JOIN conversations c ON c.id = cm.conversation_id
-		WHERE cm.conversation_id = $1::uuid AND cm.user_id = $2::uuid
-	`, conversationID, actor).Scan(&role, &conversationType); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return Conversation{}, ErrNotFound
-		}
+	role, conversationType, err := s.loadActorConversationRole(ctx, tx, actor, conversationID)
+	if err != nil {
 		return Conversation{}, err
 	}
 	if conversationType != "GROUP" {
 		return Conversation{}, errors.New("member_changes_not_supported")
 	}
-	if targetUserID != actor && role != "OWNER" {
-		return Conversation{}, errors.New("forbidden")
+
+	targetRole := role
+	if targetUserID != actor {
+		targetRole, err = s.loadMemberRoleTx(ctx, tx, conversationID, targetUserID)
+		if err != nil {
+			return Conversation{}, err
+		}
+		if !canManageConversation(role) {
+			return Conversation{}, errors.New("forbidden")
+		}
+		if role == "ADMIN" && targetRole != "MEMBER" {
+			return Conversation{}, errors.New("forbidden")
+		}
+	}
+	if targetRole == "OWNER" {
+		owners, err := s.countOwnersTx(ctx, tx, conversationID)
+		if err != nil {
+			return Conversation{}, err
+		}
+		if owners <= 1 {
+			return Conversation{}, errors.New("last_owner_required")
+		}
 	}
 
 	if _, err := tx.Exec(ctx, `DELETE FROM conversation_members WHERE conversation_id = $1::uuid AND user_id = $2::uuid`, conversationID, targetUserID); err != nil {
 		return Conversation{}, err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE conversations SET updated_at = now() WHERE id = $1::uuid`, conversationID); err != nil {
+	if err := s.touchConversationTx(ctx, tx, conversationID); err != nil {
 		return Conversation{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -814,17 +1060,22 @@ func (s *Service) UpdateTransportPolicy(ctx context.Context, actor, conversation
 	}
 	defer tx.Rollback(ctx)
 
-	// check membership
-	var exists bool
-	err = tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM conversation_members WHERE conversation_id = $1::uuid AND user_id = $2::uuid)`, conversationID, actor).Scan(&exists)
+	role, conversationType, err := s.loadActorConversationRole(ctx, tx, actor, conversationID)
 	if err != nil {
 		return Conversation{}, err
 	}
-	if !exists {
-		return Conversation{}, ErrNotFound
+	if conversationType == "GROUP" && !canManageConversation(role) {
+		return Conversation{}, errors.New("forbidden")
 	}
 
-	_, err = tx.Exec(ctx, `UPDATE conversations SET transport_policy = $2, updated_at = now() WHERE id = $1::uuid`, conversationID, policy)
+	_, err = tx.Exec(ctx, `
+		UPDATE conversations
+		SET transport_policy = $2,
+		    settings_version = COALESCE(settings_version, 1) + 1,
+		    settings_updated_at = now(),
+		    updated_at = now()
+		WHERE id = $1::uuid
+	`, conversationID, policy)
 	if err != nil {
 		return Conversation{}, err
 	}
@@ -832,6 +1083,352 @@ func (s *Service) UpdateTransportPolicy(ctx context.Context, actor, conversation
 		return Conversation{}, err
 	}
 	return s.Get(ctx, actor, conversationID)
+}
+
+func (s *Service) UpdateEffectPolicy(ctx context.Context, actor, conversationID string, allowEffects bool) error {
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	role, conversationType, err := s.loadActorConversationRole(ctx, tx, actor, conversationID)
+	if err != nil {
+		return err
+	}
+	if conversationType == "GROUP" && !canManageConversation(role) {
+		return errors.New("forbidden")
+	}
+
+	_, err = tx.Exec(ctx, `
+		UPDATE conversations
+		SET allow_message_effects = $2,
+		    settings_version = COALESCE(settings_version, 1) + 1,
+		    settings_updated_at = now(),
+		    updated_at = now()
+		WHERE id = $1::uuid
+	`, conversationID, allowEffects)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
+}
+
+func (s *Service) UpdateSettings(ctx context.Context, actor, conversationID string, theme *string, retentionSeconds *int64, expiresAt *string) (Conversation, error) {
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return Conversation{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	role, conversationType, err := s.loadActorConversationRole(ctx, tx, actor, conversationID)
+	if err != nil {
+		return Conversation{}, err
+	}
+	if conversationType == "GROUP" && !canManageConversation(role) {
+		return Conversation{}, errors.New("forbidden")
+	}
+
+	var themeArg any
+	if theme != nil {
+		themeArg = strings.TrimSpace(*theme)
+	}
+	var retentionArg any
+	if retentionSeconds != nil {
+		if *retentionSeconds < 0 {
+			return Conversation{}, errors.New("invalid_retention_seconds")
+		}
+		retentionArg = *retentionSeconds
+	}
+	var expiresAtArg any
+	if expiresAt != nil {
+		trimmed := strings.TrimSpace(*expiresAt)
+		if trimmed == "" {
+			expiresAtArg = nil
+		} else {
+			parsed, err := time.Parse(time.RFC3339Nano, trimmed)
+			if err != nil {
+				return Conversation{}, err
+			}
+			expiresAtArg = parsed.UTC()
+		}
+	}
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE conversations
+		SET theme = CASE WHEN $2::bool THEN NULLIF($3::text, '') ELSE theme END,
+		    retention_seconds = CASE
+		      WHEN $4::bool AND $5::bigint <= 0 THEN NULL
+		      WHEN $4::bool THEN $5::bigint
+		      ELSE retention_seconds
+		    END,
+		    expires_at = CASE
+		      WHEN $6::bool THEN $7::timestamptz
+		      ELSE expires_at
+		    END,
+		    settings_version = COALESCE(settings_version, 1) + 1,
+		    settings_updated_at = now(),
+		    updated_at = now()
+		WHERE id = $1::uuid
+	`, conversationID, theme != nil, themeArg, retentionSeconds != nil, retentionArg, expiresAt != nil, expiresAtArg); err != nil {
+		return Conversation{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Conversation{}, err
+	}
+	return s.Get(ctx, actor, conversationID)
+}
+
+func (s *Service) CreateInvite(ctx context.Context, actor, conversationID string, maxUses int, ttlSeconds int64) (Invite, error) {
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return Invite{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	role, conversationType, err := s.loadActorConversationRole(ctx, tx, actor, conversationID)
+	if err != nil {
+		return Invite{}, err
+	}
+	if conversationType != "GROUP" || !canManageConversation(role) {
+		return Invite{}, errors.New("forbidden")
+	}
+	if maxUses <= 0 {
+		maxUses = 1
+	}
+	if ttlSeconds <= 0 {
+		ttlSeconds = 7 * 24 * 60 * 60
+	}
+	expiresAt := time.Now().UTC().Add(time.Duration(ttlSeconds) * time.Second)
+
+	code, err := generateInviteCode()
+	if err != nil {
+		return Invite{}, err
+	}
+
+	var invite Invite
+	var createdAt time.Time
+	var expiresAtDB time.Time
+	err = tx.QueryRow(ctx, `
+		INSERT INTO conversation_invites (conversation_id, code, created_by_user_id, expires_at, max_uses)
+		VALUES ($1::uuid, $2, $3::uuid, $4, $5)
+		RETURNING id::text, created_at, expires_at
+	`, conversationID, code, actor, expiresAt, maxUses).Scan(&invite.InviteID, &createdAt, &expiresAtDB)
+	if err != nil {
+		return Invite{}, err
+	}
+	invite.ConversationID = conversationID
+	invite.Code = code
+	invite.CreatedByUserID = actor
+	invite.CreatedAt = createdAt.UTC().Format(time.RFC3339Nano)
+	invite.ExpiresAt = expiresAtDB.UTC().Format(time.RFC3339Nano)
+	invite.MaxUses = maxUses
+
+	if err := tx.Commit(ctx); err != nil {
+		return Invite{}, err
+	}
+	return invite, nil
+}
+
+func (s *Service) ListInvites(ctx context.Context, actor, conversationID string) ([]Invite, error) {
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	role, conversationType, err := s.loadActorConversationRole(ctx, tx, actor, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	if conversationType != "GROUP" || !canManageConversation(role) {
+		return nil, errors.New("forbidden")
+	}
+
+	rows, err := tx.Query(ctx, `
+		SELECT id::text, code, created_by_user_id::text, created_at, expires_at, max_uses, use_count, revoked_at
+		FROM conversation_invites
+		WHERE conversation_id = $1::uuid
+		  AND revoked_at IS NULL
+		  AND expires_at > now()
+		ORDER BY created_at DESC
+	`, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]Invite, 0, 4)
+	for rows.Next() {
+		var item Invite
+		var createdAt, expiresAt time.Time
+		var revokedAt sql.NullTime
+		if err := rows.Scan(&item.InviteID, &item.Code, &item.CreatedByUserID, &createdAt, &expiresAt, &item.MaxUses, &item.UseCount, &revokedAt); err != nil {
+			return nil, err
+		}
+		item.ConversationID = conversationID
+		item.CreatedAt = createdAt.UTC().Format(time.RFC3339Nano)
+		item.ExpiresAt = expiresAt.UTC().Format(time.RFC3339Nano)
+		item.Revoked = revokedAt.Valid
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *Service) RedeemInvite(ctx context.Context, actor, code string) (Conversation, error) {
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return Conversation{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	var inviteID, conversationID string
+	var maxUses, useCount int
+	if err := tx.QueryRow(ctx, `
+		SELECT id::text, conversation_id::text, max_uses, use_count
+		FROM conversation_invites
+		WHERE code = $1
+		  AND revoked_at IS NULL
+		  AND expires_at > now()
+		  AND (max_uses = 0 OR use_count < max_uses)
+	`, strings.ToUpper(strings.TrimSpace(code))).Scan(&inviteID, &conversationID, &maxUses, &useCount); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Conversation{}, errors.New("invite_not_found")
+		}
+		return Conversation{}, err
+	}
+
+	role, conversationType, err := s.loadActorConversationRole(ctx, tx, actor, conversationID)
+	if err == nil && role != "" {
+		if err := tx.Commit(ctx); err != nil {
+			return Conversation{}, err
+		}
+		return s.Get(ctx, actor, conversationID)
+	}
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return Conversation{}, err
+	}
+	if conversationType == "" {
+		conversationType, err = s.loadConversationTypeTx(ctx, tx, conversationID)
+		if err != nil {
+			return Conversation{}, err
+		}
+	}
+	if conversationType != "GROUP" {
+		return Conversation{}, errors.New("invite_not_found")
+	}
+
+	banned, err := s.isBannedTx(ctx, tx, conversationID, actor)
+	if err != nil {
+		return Conversation{}, err
+	}
+	if banned {
+		return Conversation{}, errors.New("user_banned")
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO conversation_members (conversation_id, user_id, role)
+		VALUES ($1::uuid, $2::uuid, 'MEMBER')
+		ON CONFLICT (conversation_id, user_id) DO NOTHING
+	`, conversationID, actor); err != nil {
+		return Conversation{}, err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE conversation_invites
+		SET use_count = use_count + 1,
+		    revoked_at = CASE
+		      WHEN max_uses > 0 AND use_count + 1 >= max_uses THEN now()
+		      ELSE revoked_at
+		    END
+		WHERE id = $1::uuid
+	`, inviteID); err != nil {
+		return Conversation{}, err
+	}
+	if err := s.touchConversationTx(ctx, tx, conversationID); err != nil {
+		return Conversation{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Conversation{}, err
+	}
+	return s.Get(ctx, actor, conversationID)
+}
+
+func (s *Service) BanMember(ctx context.Context, actor, conversationID, targetUserID, reason string) error {
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	role, conversationType, err := s.loadActorConversationRole(ctx, tx, actor, conversationID)
+	if err != nil {
+		return err
+	}
+	if conversationType != "GROUP" || !canManageConversation(role) {
+		return errors.New("forbidden")
+	}
+	targetRole, err := s.loadMemberRoleTx(ctx, tx, conversationID, targetUserID)
+	if err != nil {
+		return err
+	}
+	if role == "ADMIN" && targetRole != "MEMBER" {
+		return errors.New("forbidden")
+	}
+	if targetRole == "OWNER" {
+		owners, err := s.countOwnersTx(ctx, tx, conversationID)
+		if err != nil {
+			return err
+		}
+		if owners <= 1 {
+			return errors.New("last_owner_required")
+		}
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO conversation_bans (conversation_id, user_id, banned_by_user_id, reason, created_at)
+		VALUES ($1::uuid, $2::uuid, $3::uuid, NULLIF($4, ''), now())
+		ON CONFLICT (conversation_id, user_id)
+		DO UPDATE SET banned_by_user_id = EXCLUDED.banned_by_user_id,
+		              reason = EXCLUDED.reason,
+		              created_at = now(),
+		              expires_at = NULL
+	`, conversationID, targetUserID, actor, strings.TrimSpace(reason)); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM conversation_members WHERE conversation_id = $1::uuid AND user_id = $2::uuid`, conversationID, targetUserID); err != nil {
+		return err
+	}
+	if err := s.touchConversationTx(ctx, tx, conversationID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Service) UnbanMember(ctx context.Context, actor, conversationID, targetUserID string) error {
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	role, conversationType, err := s.loadActorConversationRole(ctx, tx, actor, conversationID)
+	if err != nil {
+		return err
+	}
+	if conversationType != "GROUP" || !canManageConversation(role) {
+		return errors.New("forbidden")
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM conversation_bans WHERE conversation_id = $1::uuid AND user_id = $2::uuid`, conversationID, targetUserID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *Service) participants(ctx context.Context, conversationID string) ([]string, []string, error) {
@@ -952,6 +1549,19 @@ func normalizeParticipantPhones(items []string) ([]string, error) {
 		out = append(out, normalized)
 	}
 	return out, nil
+}
+
+func generateInviteCode() (string, error) {
+	var buf [8]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return "", err
+	}
+	code := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(buf[:])
+	code = strings.ToUpper(strings.TrimSpace(code))
+	if len(code) > 10 {
+		code = code[:10]
+	}
+	return code, nil
 }
 
 func (s *Service) ensureConversationStateTx(ctx context.Context, tx pgx.Tx, actor, conversationID string) error {

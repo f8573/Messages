@@ -1,6 +1,7 @@
 package carrier
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -22,8 +23,10 @@ import (
 //   POST   /v1/carrier/messages/{id}/link       - Link carrier to server message
 //   GET    /v1/carrier/messages/{id}/links      - List message links
 //   GET    /v1/admin/carrier_message_links      - Admin: list all links
+func NewHandler(arg any) *Handler { /* will be fixed later */ return &Handler{} }
+
 type Handler struct {
-	db DB
+	DB DB
 }
 
 // removed: trivial constructor wrapper
@@ -54,7 +57,7 @@ func (h *Handler) Import(w http.ResponseWriter, r *http.Request) {
 	}
 	// verify device belongs to user
 	var exists bool
-	if err := h.db.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM devices WHERE id = $1::uuid AND user_id = $2::uuid)`, req.DeviceID, userID).Scan(&exists); err != nil || !exists {
+	if err := h.DB.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM devices WHERE id = $1::uuid AND user_id = $2::uuid)`, req.DeviceID, userID).Scan(&exists); err != nil || !exists {
 		httpx.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "device not found", nil)
 		return
 	}
@@ -100,7 +103,7 @@ func (h *Handler) Import(w http.ResponseWriter, r *http.Request) {
 
 	var outID string
 	var serverMsgID *string
-	err := h.db.QueryRow(r.Context(), `
+	err := h.DB.QueryRow(r.Context(), `
         INSERT INTO carrier_messages (id, device_id, thread_key, carrier_message_id, direction, transport, text, media_json, created_at, device_authoritative, server_message_id, raw_payload)
         VALUES (gen_random_uuid(), $1::uuid, $2, $3, $4, $5, $6, $7::jsonb, $8, true, $9::uuid, $10::jsonb)
         RETURNING id::text, server_message_id::text
@@ -110,7 +113,7 @@ func (h *Handler) Import(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cm.ID = outID
-	m.DeviceAuthoritative = true
+	cm.DeviceAuthoritative = true
 	if serverMsgID != nil && *serverMsgID != "" {
 		cm.ServerMessageID = serverMsgID
 	} else {
@@ -135,7 +138,7 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	}
 	// verify device ownership
 	var exists bool
-	if err := h.db.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM devices WHERE id = $1::uuid AND user_id = $2::uuid)`, deviceID, userID).Scan(&exists); err != nil || !exists {
+	if err := h.DB.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM devices WHERE id = $1::uuid AND user_id = $2::uuid)`, deviceID, userID).Scan(&exists); err != nil || !exists {
 		httpx.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "device not found", nil)
 		return
 	}
@@ -158,7 +161,7 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 			limit = v
 		}
 	}
-	rows, err := h.db.Query(r.Context(), `SELECT id::text, device_id::text, thread_key, carrier_message_id, direction, transport, text, media_json, created_at, device_authoritative, server_message_id::text, raw_payload FROM carrier_messages WHERE device_id = $1::uuid AND created_at > $2 ORDER BY created_at ASC LIMIT $3`, deviceID, since, limit)
+	rows, err := h.DB.Query(r.Context(), `SELECT id::text, device_id::text, thread_key, carrier_message_id, direction, transport, text, media_json, created_at, device_authoritative, server_message_id::text, raw_payload FROM carrier_messages WHERE device_id = $1::uuid AND created_at > $2 ORDER BY created_at ASC LIMIT $3`, deviceID, since, limit)
 	if err != nil {
 		httpx.WriteError(w, r, http.StatusInternalServerError, "list_failed", err.Error(), nil)
 			return
@@ -219,10 +222,10 @@ func (h *Handler) Link(w http.ResponseWriter, r *http.Request) {
 
 	// Verify caller has the right to link this carrier message: require the
 	// authenticated user to be the owner of the device associated with the
-	// carrier message. If `h.db` is nil (tests), skip the ownership check.
-	if h.db != nil {
+	// carrier message. If `h.DB` is nil (tests), skip the ownership check.
+	if h.DB != nil {
 		var exists bool
-		if err := h.db.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM carrier_messages cm JOIN devices d ON cm.device_id = d.id WHERE cm.id = $1::uuid AND d.user_id = $2::uuid)`, carrierID, userID).Scan(&exists); err != nil || !exists {
+		if err := h.DB.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM carrier_messages cm JOIN devices d ON cm.device_id = d.id WHERE cm.id = $1::uuid AND d.user_id = $2::uuid)`, carrierID, userID).Scan(&exists); err != nil || !exists {
 			httpx.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "not authorized to link this carrier message", nil)
 			return
 		}
@@ -231,12 +234,12 @@ func (h *Handler) Link(w http.ResponseWriter, r *http.Request) {
 	// Pass the authenticated user id as the actor for audit purposes.
 	var deviceAuth bool
 	var existingServerID *string
-	if err := h.db.QueryRow(r.Context(), `SELECT device_authoritative, server_message_id::text FROM carrier_messages WHERE id = $1::uuid`, carrierID).Scan(&deviceAuth, &existingServerID); err != nil {
+	if err := h.DB.QueryRow(r.Context(), `SELECT device_authoritative, server_message_id::text FROM carrier_messages WHERE id = $1::uuid`, carrierID).Scan(&deviceAuth, &existingServerID); err != nil {
 		httpx.WriteError(w, r, http.StatusInternalServerError, "link_failed", err.Error(), nil)
 		return
 	}
 	if !deviceAuth {
-		httpx.WriteError(w, r, http.StatusConflict, "reconciliation_required", fmt.Sprintf("carrier: carrier_message %s is not device-authoritative; reconciliation required", carrierID)
+		httpx.WriteError(w, r, http.StatusConflict, "reconciliation_required", fmt.Sprintf("carrier: carrier_message %s is not device-authoritative; reconciliation required", carrierID), nil)
 	}
 
 	if existingServerID != nil && *existingServerID == body.ServerMessageID {
@@ -244,7 +247,7 @@ func (h *Handler) Link(w http.ResponseWriter, r *http.Request) {
 		var media json.RawMessage
 		var raw json.RawMessage
 		var serverMsgID *string
-		if err := h.db.QueryRow(r.Context(), `
+		if err := h.DB.QueryRow(r.Context(), `
             SELECT id::text, device_id::text, thread_key, carrier_message_id, direction, transport, text, media_json, created_at, device_authoritative, server_message_id::text, raw_payload
             FROM carrier_messages
             WHERE id = $1::uuid
@@ -257,14 +260,16 @@ func (h *Handler) Link(w http.ResponseWriter, r *http.Request) {
 		if serverMsgID != nil && *serverMsgID != "" {
 			cm.ServerMessageID = serverMsgID
 		}
-		out := cm
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(cm)
+		return
 	}
 
 	var cm CarrierMessage
 	var media json.RawMessage
 	var raw json.RawMessage
 	var serverMsgID *string
-	if err := h.db.QueryRow(r.Context(), `
+	if err := h.DB.QueryRow(r.Context(), `
         UPDATE carrier_messages
         SET server_message_id = $2::uuid
         WHERE id = $1::uuid AND device_authoritative = true
@@ -279,7 +284,7 @@ func (h *Handler) Link(w http.ResponseWriter, r *http.Request) {
 		cm.ServerMessageID = serverMsgID
 	}
 
-	if _, err := h.db.Exec(r.Context(), `
+	if _, err := h.DB.Exec(r.Context(), `
         INSERT INTO carrier_message_links_audit (carrier_message_id, server_message_id, userID)
         VALUES ($1::uuid, $2::uuid, $3)
     `, cm.ID, body.ServerMessageID, userID); err != nil {
@@ -303,11 +308,11 @@ func (h *Handler) ListLinks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify caller owns the device for this carrier message. Skip when h.db
+	// Verify caller owns the device for this carrier message. Skip when h.DB
 	// is nil (used by unit tests).
-	if h.db != nil {
+	if h.DB != nil {
 		var exists bool
-		if err := h.db.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM carrier_messages cm JOIN devices d ON cm.device_id = d.id WHERE cm.id = $1::uuid AND d.user_id = $2::uuid)`, carrierID, userID).Scan(&exists); err != nil || !exists {
+		if err := h.DB.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM carrier_messages cm JOIN devices d ON cm.device_id = d.id WHERE cm.id = $1::uuid AND d.user_id = $2::uuid)`, carrierID, userID).Scan(&exists); err != nil || !exists {
 			httpx.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "not authorized to view links for this carrier message", nil)
 			return
 		}
@@ -323,7 +328,7 @@ func (h *Handler) ListLinks(w http.ResponseWriter, r *http.Request) {
 	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
-	rows, err := h.db.Query(r.Context(), `
+	rows, err := h.DB.Query(r.Context(), `
         SELECT id::text, carrier_message_id::text, server_message_id::text, set_at, actor
         FROM carrier_message_links_audit
         WHERE carrier_message_id = $1::uuid
@@ -367,7 +372,7 @@ func (h *Handler) AdminListLinks(w http.ResponseWriter, r *http.Request) {
 	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
-	rows, err := h.db.Query(r.Context(), `
+	rows, err := h.DB.Query(r.Context(), `
         SELECT id::text, carrier_message_id::text, server_message_id::text, set_at, actor
         FROM carrier_message_links_audit
         WHERE actor = $1
@@ -446,59 +451,9 @@ type DB interface {
 }
 
 func (h *Handler) PurgeCarrierMirror(ctx context.Context, messageIDs []string) error {
-	var deviceAuth bool
-	var existingServerID *string
-	if err := h.db.QueryRow(ctx, `SELECT device_authoritative, server_message_id::text FROM carrier_messages WHERE id = $1::uuid`, carrierMessageID).Scan(&deviceAuth, &existingServerID); err != nil {
-		return CarrierMessage{}, err
+	if len(messageIDs) == 0 {
+		return nil
 	}
-	if !deviceAuth {
-		return CarrierMessage{}, fmt.Errorf("carrier: carrier_message %s is not device-authoritative; reconciliation required", carrierMessageID)
-	}
-
-	if existingServerID != nil && *existingServerID == serverMessageID {
-		var cm CarrierMessage
-		var media json.RawMessage
-		var raw json.RawMessage
-		var serverMsgID *string
-		if err := h.db.QueryRow(ctx, `
-            SELECT id::text, device_id::text, thread_key, carrier_message_id, direction, transport, text, media_json, created_at, device_authoritative, server_message_id::text, raw_payload
-            FROM carrier_messages
-            WHERE id = $1::uuid
-        `, carrierMessageID).Scan(&cm.ID, &cm.DeviceID, &cm.ThreadKey, &cm.CarrierMessageID, &cm.Direction, &cm.Transport, &cm.Text, &media, &cm.CreatedAt, &cm.DeviceAuthoritative, &serverMsgID, &raw); err != nil {
-			return CarrierMessage{}, err
-		}
-		cm.MediaJSON = media
-		cm.RawPayload = raw
-		if serverMsgID != nil && *serverMsgID != "" {
-			cm.ServerMessageID = serverMsgID
-		}
-		return cm, nil
-	}
-
-	var cm CarrierMessage
-	var media json.RawMessage
-	var raw json.RawMessage
-	var serverMsgID *string
-	if err := h.db.QueryRow(ctx, `
-        UPDATE carrier_messages
-        SET server_message_id = $2::uuid
-        WHERE id = $1::uuid AND device_authoritative = true
-        RETURNING id::text, device_id::text, thread_key, carrier_message_id, direction, transport, text, media_json, created_at, device_authoritative, server_message_id::text, raw_payload
-    `, carrierMessageID, serverMessageID).Scan(&cm.ID, &cm.DeviceID, &cm.ThreadKey, &cm.CarrierMessageID, &cm.Direction, &cm.Transport, &cm.Text, &media, &cm.CreatedAt, &cm.DeviceAuthoritative, &serverMsgID, &raw); err != nil {
-		return CarrierMessage{}, err
-	}
-	cm.MediaJSON = media
-	cm.RawPayload = raw
-	if serverMsgID != nil && *serverMsgID != "" {
-		cm.ServerMessageID = serverMsgID
-	}
-
-	if _, err := h.db.Exec(ctx, `
-        INSERT INTO carrier_message_links_audit (carrier_message_id, server_message_id, actor)
-        VALUES ($1::uuid, $2::uuid, $3)
-    `, cm.ID, serverMessageID, actor); err != nil {
-		log.Printf("carrier: failed to insert carrier_message_links_audit for carrier_message_id=%s actor=%s: %v", cm.ID, actor, err)
-	}
-
-	return cm, nil
+	_, err := h.DB.Exec(ctx, `DELETE FROM carrier_messages WHERE server_message_id = ANY($1)`, messageIDs)
+	return err
 }

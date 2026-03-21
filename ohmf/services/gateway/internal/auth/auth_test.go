@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	miniredis "github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"ohmf/services/gateway/internal/config"
 	"ohmf/services/gateway/internal/otp"
@@ -46,6 +48,50 @@ func TestGenerateOTPCodeUsesRandomForNonDevProvider(t *testing.T) {
 		if ch < '0' || ch > '9' {
 			t.Fatalf("expected numeric OTP, got %q", code)
 		}
+	}
+}
+
+func TestNormalizeRemoteAddrStripsPortAndBrackets(t *testing.T) {
+	cases := map[string]string{
+		"203.0.113.10:443":       "203.0.113.10",
+		"[2001:db8::1]:8080":      "2001:db8::1",
+		"2001:db8::1":             "2001:db8::1",
+		"   198.51.100.4:12345  ": "198.51.100.4",
+	}
+	for input, want := range cases {
+		if got := normalizeRemoteAddr(input); got != want {
+			t.Fatalf("normalizeRemoteAddr(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestAllowRateUsesRedisCounters(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("start miniredis: %v", err)
+	}
+	defer mr.Close()
+
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer rdb.Close()
+
+	h := &Handler{redis: rdb}
+	ctx := context.Background()
+
+	allowed, err := h.allowRate(ctx, "otp:test:bucket", 1, time.Minute)
+	if err != nil {
+		t.Fatalf("first allowRate call: %v", err)
+	}
+	if !allowed {
+		t.Fatalf("expected first rate-limit check to pass")
+	}
+
+	allowed, err = h.allowRate(ctx, "otp:test:bucket", 1, time.Minute)
+	if err != nil {
+		t.Fatalf("second allowRate call: %v", err)
+	}
+	if allowed {
+		t.Fatalf("expected second rate-limit check to fail")
 	}
 }
 

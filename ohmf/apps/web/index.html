@@ -125,13 +125,7 @@
                 <span>Upload a file and send it as an attachment.</span>
               </span>
             </button>
-            <button type="button" class="miniapp-card" id="miniapp-counter-card">
-              <span class="miniapp-card-icon">#</span>
-              <span class="miniapp-card-copy">
-                <strong>Counter Lab</strong>
-                <span>Shared state demo with projected messages.</span>
-              </span>
-            </button>
+            <div id="miniapp-catalog-cards"></div>
           </div>
 
           <div class="miniapp-stage hidden" id="miniapp-stage">
@@ -173,7 +167,7 @@
               <button type="button" class="icon-btn miniapp-close-btn" id="miniapp-window-close-btn" aria-label="Close app window">x</button>
             </div>
             <div class="miniapp-frame-wrap miniapp-window-frame-wrap">
-              <iframe id="miniapp-frame" title="Embedded mini-app"></iframe>
+              <iframe id="miniapp-frame" title="Embedded mini-app" sandbox="allow-scripts allow-same-origin"></iframe>
             </div>
           </div>
         </section>

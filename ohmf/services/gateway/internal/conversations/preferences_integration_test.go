@@ -3,16 +3,21 @@ package conversations
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
 	miniredis "github.com/alicebob/miniredis/v2"
+	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
+	"ohmf/services/gateway/internal/middleware"
 	"ohmf/services/gateway/internal/replication"
 	"ohmf/services/gateway/internal/users"
 )
@@ -92,6 +97,66 @@ func TestUpdatePreferencesPersistsAndPublishesStateEvent(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for conversation state event")
+	}
+}
+
+func TestUpdateMetadataPersistsDescriptionAndPreservesEffectPolicy(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("skipping DB integration test; set TEST_DATABASE_URL to run")
+	}
+
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer pool.Close()
+
+	applyAllMigrations(t, ctx, pool)
+
+	actorID := insertTestUser(t, ctx, pool)
+	conversationID := uuid.NewString()
+
+	if _, err := pool.Exec(ctx, `INSERT INTO conversations (id, type, allow_message_effects) VALUES ($1, 'GROUP', false)`, conversationID); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO conversation_counters (conversation_id) VALUES ($1)`, conversationID); err != nil {
+		t.Fatalf("insert counter: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO conversation_members (conversation_id, user_id, role) VALUES ($1, $2::uuid, 'OWNER')`, conversationID, actorID); err != nil {
+		t.Fatalf("insert member: %v", err)
+	}
+
+	svc := NewService(pool, nil)
+	h := NewHandler(svc)
+
+	body := `{"description":"Launch coordination thread"}`
+	req := httptest.NewRequest(http.MethodPatch, "/v1/conversations/"+conversationID+"/metadata", strings.NewReader(body))
+	req = req.WithContext(middleware.WithUserID(req.Context(), actorID))
+	routeCtx := chi.NewRouteContext()
+	routeCtx.URLParams.Add("id", conversationID)
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, routeCtx))
+
+	rec := httptest.NewRecorder()
+	h.UpdateMetadata(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var updated Conversation
+	if err := json.NewDecoder(rec.Body).Decode(&updated); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if updated.Description != "Launch coordination thread" {
+		t.Fatalf("expected description to persist, got %q", updated.Description)
+	}
+	if updated.AllowMessageEffects {
+		t.Fatalf("expected effect policy to remain disabled, got %#v", updated.AllowMessageEffects)
+	}
+	if updated.ConversationID != conversationID {
+		t.Fatalf("expected conversation id %s, got %s", conversationID, updated.ConversationID)
 	}
 }
 
