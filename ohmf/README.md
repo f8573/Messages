@@ -1,6 +1,13 @@
 # OHMF Milestone 1 Foundation
 
-Setup guide: [`SETUP.md`](./SETUP.md)
+**Phase 1 Status**: ✅ COMPLETE (28/29 items, 96.6%)
+
+## 📚 Documentation
+
+- **Specification**: [`OHMF_COMPREHENSIVE_SPECIFICATION.md`](./OHMF_COMPREHENSIVE_SPECIFICATION.md) - Full system design, APIs, architecture, security model
+- **Setup guide**: [`SETUP.md`](./SETUP.md) - Local development setup
+- **Phase 1 Report**: [`FINAL_SESSION_REPORT.md`](./ohmf/FINAL_SESSION_REPORT.md) - Completion metrics and deliverables
+- **Phase 2 Roadmap**: [`PHASE_2_ROADMAP.md`](./PHASE_2_ROADMAP.md) - Future work, blockers, priorities
 
 ## Local toolchain (non-admin)
 
