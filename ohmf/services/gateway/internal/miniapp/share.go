@@ -102,6 +102,11 @@ func (s *Service) JoinSession(ctx context.Context, userID, sessionID string, gra
 	); err != nil {
 		return nil, err
 	}
+
+	// P4.1 Event Model: Log session_joined event with participant and permissions
+	participant := SessionParticipant{UserID: userID, Role: "PLAYER"}
+	_ = s.logSessionJoined(ctx, sessionID, userID, participant, normalized)
+
 	record.Participants = participants
 	record.ParticipantPermissions = participantPermissions
 	return s.sessionRecordToMapForUser(record, userID, permitted), nil
@@ -135,6 +140,23 @@ func (s *Service) AppendEventForUser(ctx context.Context, userID, sessionID, eve
 	if !record.hasJoined(userID) {
 		return 0, ErrMiniAppConsent
 	}
+
+	// P1.2: Capability Enforcement Layer - validate bridge method against granted capabilities
+	grantedCapabilities := record.viewerGrantedPermissions(userID)
+	if err := validateBridgeMethodWithRateLimit(sessionID, grantedCapabilities, eventName); err != nil {
+		// Log denied capability call for security audit
+		_ = s.auditLogCapabilityCheck(ctx, userID, sessionID, eventName, false, err.Error())
+
+		// Return generic error to prevent fingerprinting
+		if errors.Is(err, ErrBridgeMethodRateLimited) {
+			return 0, ErrBridgeMethodRateLimited
+		}
+		return 0, ErrBridgeMethodNotAllowed
+	}
+
+	// Log allowed capability call for audit trail
+	_ = s.auditLogCapabilityCheck(ctx, userID, sessionID, eventName, true, "")
+
 	return s.AppendEvent(ctx, sessionID, userID, eventName, body)
 }
 
@@ -152,7 +174,7 @@ func (s *Service) SnapshotSessionForUser(ctx context.Context, userID, sessionID 
 	if !record.hasJoined(userID) {
 		return 0, ErrMiniAppConsent
 	}
-	return s.SnapshotSession(ctx, sessionID, state, version, nil)
+	return s.SnapshotSession(ctx, sessionID, state, version, userID)
 }
 
 func (s *Service) ShareSession(ctx context.Context, userID string, input ShareInput) (map[string]any, error) {
@@ -258,10 +280,11 @@ func (s *Service) ShareSession(ctx context.Context, userID string, input ShareIn
 		}
 	}
 
-	manifestRow, err := s.loadManifestByAppID(ctx, appID)
+	entry, err := s.loadCatalogEntryByAppID(ctx, "", appID)
 	if err != nil {
 		return nil, err
 	}
+	manifestRow := catalogEntryToMap(entry)
 	cardContent := buildAppCardContent(manifestRow, record)
 	message, err := s.insertAppCardMessageTx(ctx, tx, userID, input.ConversationID, cardContent)
 	if err != nil {

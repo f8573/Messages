@@ -10,9 +10,10 @@ import (
 	"ohmf/services/gateway/internal/middleware"
 )
 
-type Handler struct{ svc *Service }
+type Handler struct{ Svc *Service }
 
-// removed: trivial constructor wrapper
+func NewHandler(svc *Service) *Handler { return &Handler{Svc: svc} }
+
 func (h *Handler) Incremental(w http.ResponseWriter, r *http.Request) {
 	_, ok := middleware.UserIDFromContext(r.Context())
 	if !ok {
@@ -27,7 +28,7 @@ func (h *Handler) Incremental(w http.ResponseWriter, r *http.Request) {
 			limit = l
 		}
 	}
-	resp, err := h.svc.IncrementalSync(r.Context(), cursor, limit)
+	resp, err := h.Svc.IncrementalSync(r.Context(), cursor, limit)
 	if err != nil {
 		httpx.WriteError(w, r, http.StatusInternalServerError, "sync_failed", err.Error(), nil)
 		return
@@ -49,7 +50,7 @@ func (h *Handler) IncrementalV2(w http.ResponseWriter, r *http.Request) {
 			limit = l
 		}
 	}
-	resp, err := h.svc.IncrementalSyncV2(r.Context(), userID, cursor, limit)
+	resp, err := h.Svc.IncrementalSyncV2(r.Context(), userID, cursor, limit)
 	if err != nil {
 		httpx.WriteError(w, r, http.StatusBadRequest, "sync_failed", err.Error(), nil)
 		return
@@ -72,7 +73,7 @@ func (h *Handler) MarkDeliveredV2(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "invalid body", nil)
 		return
 	}
-	if err := h.svc.MarkDelivered(r.Context(), userID, req.DeviceID, conversationID, req.ThroughServerOrder); err != nil {
+	if err := h.Svc.MarkDelivered(r.Context(), userID, req.DeviceID, conversationID, req.ThroughServerOrder); err != nil {
 		httpx.WriteError(w, r, http.StatusInternalServerError, "mark_delivered_failed", err.Error(), nil)
 		return
 	}

@@ -1,149 +1,88 @@
-# 19 — Backend Services: API Gateway
+# Gateway Service
 
-Mapping: OHMF spec section 19 ("Backend Services: API Gateway")
+Mapping: OHMF spec section 19.
 
-Purpose
-- Provide a single ingress for client traffic (HTTP + WebSocket), authentication, routing to internal services, rate limiting, observability headers, and protocol translation between client SDKs and internal protocol formats.
+## Purpose
 
-Expected behavior
-- Validate auth and tokens for incoming requests.
-- Route REST routes to internal services (gRPC/HTTP).
-- Serve OpenAPI documentation and health endpoints.
-- Upgrade connections to WebSocket for realtime and deliver bi-directional message frames.
-- Emit and subscribe to platform events on the internal bus when messages arrive or are delivered.
+The gateway is the single client-facing service for the current OHMF runtime. It terminates HTTP and WebSocket traffic, authenticates users/devices, applies rate limits, persists messaging state, emits sync/realtime events, and fronts account, conversation, media, relay, and discovery flows.
 
-Full specification details
-- API surface:
-	- REST control plane under /api/v1/*
-	- Public static assets under /openapi/*
-	- WebSocket endpoint: /realtime/v1?token=<jwt>
-	- Health: GET /healthz (200 JSON)
-- Invariants:
-	- Every request must contain either a valid access token or a valid API key header: `X-API-Key`.
-	- For producer paths, the gateway must ACK synchronous success OR return an error conforming to the JSON Problem spec.
-	- WebSocket sessions are long-lived with heartbeats (ping/pong) every 30s.
+## Current Route Surface
 
-Data shapes and protocol rules
-- All JSON payloads must be UTF-8 and follow Draft 2020-12 JSON Schema supplied below.
-- For cross-service transport, messages are converted to protocol envelope proto (see packages/protocol).
+Public routes:
 
-Implementation constraints
-- Must be stateless; session affinity only for sticky WebSocket routing via shared session store or layer 7 routing.
-- Configuration via environment and consul-style config: listen address, upstream addresses, JWT public keys, rate limits.
-- gRPC upstreams must use TLS.
+- `POST /v1/auth/phone/start`
+- `POST /v1/auth/phone/verify`
+- `POST /v1/auth/refresh`
+- `POST /v1/auth/recovery-code`
+- `GET /v1/ws`
+- `GET /v2/ws`
+- `GET /healthz`
+- `GET /readyz`
+- `GET /openapi.yaml`
 
-Security considerations
-- Validate JWT `iss` and `aud`. Reject tokens with `exp` in past.
-- Enforce per-token rate limits and global per-IP rate limits.
-- Protect WebSocket handshake against CSRF: require `Origin` header check and token in query param or `Sec-WebSocket-Protocol`.
-- Use strict Content Security Policy (CSP) for any served web UI.
+Authenticated route groups include:
 
-Observability and operational notes
-- Add request id header `X-Request-Id` if missing.
-- Export traces (OpenTelemetry) and metrics (Prometheus): request duration, active websocket connections, auth failures, rate-limited requests.
-- Health probes must verify upstream connectivity.
+- account: `/v1/account/*`
+- profile: `/v1/me`, `/v1/users/resolve`
+- discovery: `/v1/discovery`, `/v1/contacts/discover`
+- conversations: `/v1/conversations/*`, `/v2/conversations`
+- messages: `/v1/messages/*`, `/v1/conversations/{id}/messages`, `/v1/conversations/{id}/search`
+- realtime/sync: `/v1/events/stream`, `/v1/sync`, `/v2/sync`
+- relay: `/v1/relay/*`
+- presence: `/v1/presence/{userID}`, `/v1/conversations/{id}/presence`
+- attestation: `/v1/devices/{id}/attestation/*`
+- carrier/media/miniapps/notifications/device-keys/devices/abuse/blocks`
 
-Testing requirements
-- Unit tests for auth, routing, and error paths.
-- Integration tests simulating:
-	- HTTP request -> backend success/failure
-	- WebSocket connect -> receive push
-	- Token expiry and replay protection
-- Load test for websocket concurrency and rate limiting.
+## Implemented Capabilities
 
-API usage examples
-- Health check
-Request:
-POST example omitted for brevity; use GET below.
+- OTP auth, refresh rotation, recovery codes, and 2FA
+- Conversation and message persistence with idempotency
+- Read receipts, typing, effects, pinning, forwarding, search, and message lifecycle controls
+- Realtime websocket fanout plus sync replay/resume support
+- Device registration, push token management, and provider dispatch
+- Device attestation challenge/verify flows with relay enforcement against persisted attestation state
+- Account export/deletion flows with deletion audit state
+- Discovery hashing and abuse controls
+- Linked-device relay for SMS/MMS execution
 
-HTTP request
-GET /healthz HTTP/1.1
-Host: gateway.example
-Accept: application/json
+## Mini-App Platform Ownership
 
-HTTP response
-HTTP/1.1 200 OK
-Content-Type: application/json
-Body:
-{
-	"status": "ok",
-	"uptime_seconds": 12345
-}
+The gateway is **EXCLUSIVE owner** of:
+- Mini-app sessions (ephemeral runtime state tied to users/conversations)
+- Session events (append-only log of bridge calls)
+- Session snapshots (versioned state checkpoints within sessions)
+- Session joins (per-user participation in a session)
+- Conversation shares (initiated sharing events)
 
-- Send message (REST)
-HTTP request
-POST /api/v1/messages HTTP/1.1
-Host: api.example
-Authorization: Bearer <access_token>
-Content-Type: application/json
-X-Request-Id: req-123
+The gateway **delegates to app service** (via REST API):
+- App registry queries (read-only)
+- Release catalog and versions (read-only)
+- User installs data (read-only)
+- Update detection (computed by comparing installed vs latest approved release)
+- Publisher keys (never touched by gateway)
 
-Body:
-{
-	"conversation_id": "conv_abc",
-	"from": "+15551234567",
-	"to": "+15557654321",
-	"body": "Hello from gateway"
-}
+**Legacy Tables (Deprecated):**
+- `miniapp_releases` — deprecated; use apps service instead
+- `miniapp_installs` — deprecated; use apps service instead
+- See: Migration 000043_remove_miniapp_legacy_tables
 
-HTTP response
-HTTP/1.1 202 Accepted
-Content-Type: application/json
-Body:
-{
-	"message_id": "msg_123",
-	"status": "ingested"
-}
+In production, the `AppsAddr` configuration option MUST be set to enable RegistryClient for proper delegation.
+See `docs/miniapp/ownership-boundaries.md` for detailed ownership matrix, data flow, and failure modes.
 
-- WebSocket connect
-Client requests:
-GET /realtime/v1?token=<jwt> HTTP/1.1
-Host: api.example
-Upgrade: websocket
-Connection: Upgrade
-Sec-WebSocket-Version: 13
+## Operational Notes
 
-Example WebSocket message (JSON text frame)
-Client -> Server:
-{"type":"subscribe","topic":"conversation:conv_abc"}
+- The gateway uses Redis for rate limiting, presence, typing freshness, and some realtime/session state.
+- PostgreSQL is the primary store; Cassandra remains an optional read path for message timelines.
+- OpenAPI is served from `services/gateway/internal/openapi/openapi.yaml`.
+- The canonical websocket behavior is documented in `docs/websocket-protocol.md`.
 
-Server -> Client:
-{"type":"message","message_id":"msg_123","conversation_id":"conv_abc","from":"+15551234567","body":"Hello"}
+## Verification
 
-JSON Schema (Draft 2020-12) — message ingestion request
-```json
-{
-	"$schema":"https://json-schema.org/draft/2020-12/schema",
-	"$id":"https://ohmf.example/schemas/gateway.message.request.json",
-	"title":"GatewayMessageRequest",
-	"type":"object",
-	"required":["conversation_id","from","to","body"],
-	"properties":{
-		"conversation_id":{"type":"string"},
-		"from":{"type":"string","pattern":"^\\+?[0-9]{6,15}$"},
-		"to":{"type":"string","pattern":"^\\+?[0-9]{6,15}$"},
-		"body":{"type":"string","maxLength":4096},
-		"metadata":{"type":"object","additionalProperties":true}
-	},
-	"additionalProperties":false
-}
+Run:
+
+```powershell
+cd C:\Users\James\Downloads\Messages\ohmf\services\gateway
+C:\Users\James\Downloads\Messages\ohmf\.tools\go\bin\go.exe test ./...
 ```
 
-SQL snippet — ingestion audit table
-```sql
-CREATE TABLE gateway_message_ingest (
-	id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-	message_id TEXT NOT NULL,
-	conversation_id TEXT NOT NULL,
-	actor TEXT NOT NULL,
-	payload JSONB NOT NULL,
-	status TEXT NOT NULL,
-	created_at TIMESTAMPTZ DEFAULT now()
-);
-CREATE INDEX ON gateway_message_ingest (conversation_id);
-```
-
-References
-- See packages/protocol for envelope formats.
-- See internal/realtime for WS specifics.
-- See OHMF spec sections 7 (protocol), 10 (security), 20 (observability).
+That command passes on the current branch state reflected by this README.

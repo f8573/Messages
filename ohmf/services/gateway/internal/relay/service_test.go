@@ -4,11 +4,20 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/go-chi/chi/v5"
 	pgxmock "github.com/pashagolub/pgxmock"
+	"ohmf/services/gateway/internal/middleware"
 )
 
 type mockAdapter struct{ p pgxmock.PgxPoolIface }
@@ -58,12 +67,13 @@ func TestCreateListAcceptAndFinishJob(t *testing.T) {
 	ctx := context.Background()
 	destination := map[string]any{"phone_e164": "+15551234567"}
 	content := map[string]any{"text": "hello"}
+	transportHint, requiredCapability := svc.canonicalRelayPolicy("SMS", content)
 
 	mock.ExpectExec(`INSERT INTO relay_jobs`).
-		WithArgs(pgxmock.AnyArg(), "11111111-1111-1111-1111-111111111111", string(mustJSON(t, destination)), "SMS", string(mustJSON(t, content))).
+		WithArgs(pgxmock.AnyArg(), "11111111-1111-1111-1111-111111111111", string(mustJSON(t, destination)), transportHint, string(mustJSON(t, content)), requiredCapability).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 
-	jobID, err := svc.CreateJob(ctx, "11111111-1111-1111-1111-111111111111", destination, "SMS", content)
+	jobID, err := svc.CreateJob(ctx, "11111111-1111-1111-1111-111111111111", destination, transportHint, content, requiredCapability)
 	if err != nil {
 		t.Fatalf("CreateJob failed: %v", err)
 	}
@@ -72,7 +82,7 @@ func TestCreateListAcceptAndFinishJob(t *testing.T) {
 	}
 
 	rows := pgxmock.NewRows([]string{"id", "creator_user_id", "destination", "transport_hint", "content", "status", "executing_device_id", "consent_state", "required_capability", "expires_at", "accepted_at", "attested_at", "result", "created_at", "updated_at"}).
-		AddRow(jobID, "11111111-1111-1111-1111-111111111111", mustJSON(t, destination), "SMS", mustJSON(t, content), "queued", "", "PENDING_DEVICE", "RELAY_EXECUTOR", nil, nil, nil, []byte(nil), nil, nil)
+		AddRow(jobID, "11111111-1111-1111-1111-111111111111", mustJSON(t, destination), transportHint, mustJSON(t, content), "queued", "", "PENDING_DEVICE", requiredCapability, nil, nil, nil, []byte(nil), nil, nil)
 	mock.ExpectQuery(`SELECT id::text, creator_user_id::text, destination, transport_hint, content, status, executing_device_id::text, consent_state, required_capability, expires_at, accepted_at, attested_at, result, created_at, updated_at FROM relay_jobs WHERE status = 'queued'`).
 		WithArgs(10).
 		WillReturnRows(rows)
@@ -105,6 +115,20 @@ func TestCreateListAcceptAndFinishJob(t *testing.T) {
 	}
 }
 
+func TestCanonicalRelayPolicyFallbacks(t *testing.T) {
+	svc := NewHandlerWithDB(&mockAdapter{p: nil})
+
+	transport, required := svc.canonicalRelayPolicy("MMS", map[string]any{"text": "hello"})
+	if transport != "RELAY_SMS" || required != "RELAY_EXECUTOR" {
+		t.Fatalf("expected MMS hint with text-only content to downgrade to SMS, got %s/%s", transport, required)
+	}
+
+	transport, required = svc.canonicalRelayPolicy("SMS", map[string]any{"attachments": []any{map[string]any{"id": "att-1"}}})
+	if transport != "RELAY_MMS" || required != "ANDROID_CARRIER" {
+		t.Fatalf("expected SMS hint with attachments to upgrade to MMS, got %s/%s", transport, required)
+	}
+}
+
 func TestVerifyDeviceSignature(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
@@ -129,6 +153,127 @@ func TestVerifyDeviceSignature(t *testing.T) {
 		t.Fatalf("verifyDeviceSignature failed: %v", err)
 	}
 
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestVerifyAcceptanceSignatureV2(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mock.Close()
+
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := &relayJobRecord{
+		RelayJob: RelayJob{
+			ID:                 "job-1",
+			TransportHint:      "RELAY_MMS",
+			ConsentState:       "DEVICE_CONFIRMED",
+			Status:             "queued",
+			RequiredCapability: "ANDROID_CARRIER",
+		},
+	}
+	ts := "1700000000"
+	payload := []byte(fmt.Sprintf("relay_accept:v2:%s:%s:%s:%s:%s:%s:%s", job.ID, "33333333-3333-3333-3333-333333333333", ts, job.TransportHint, job.RequiredCapability, job.ConsentState, job.Status))
+	signature := ed25519.Sign(privateKey, payload)
+
+	rows := pgxmock.NewRows([]string{"public_key"}).AddRow(base64.StdEncoding.EncodeToString(publicKey))
+	mock.ExpectQuery(`SELECT public_key FROM devices WHERE id = \$1::uuid`).
+		WithArgs("33333333-3333-3333-3333-333333333333").
+		WillReturnRows(rows)
+
+	svc := NewHandlerWithDB(&mockAdapter{p: mock})
+	if err := svc.verifyAcceptanceSignature(context.Background(), job, "33333333-3333-3333-3333-333333333333", ts, base64.StdEncoding.EncodeToString(signature)); err != nil {
+		t.Fatalf("verifyAcceptanceSignature failed: %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestAcceptJobForActorRequiresDeviceCapability(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mock.Close()
+
+	now := time.Now().UTC()
+	rows := pgxmock.NewRows([]string{"public_key", "capabilities", "sms_role_state", "last_seen_at", "attestation_state", "attestation_expires_at"}).
+		AddRow("", []string{"RELAY_EXECUTOR"}, "DEFAULT_SMS_HANDLER", now, "UNVERIFIED", nil)
+	mock.ExpectQuery(`SELECT COALESCE\(public_key, ''\),\s+COALESCE\(capabilities, ARRAY\[\]::text\[\]\),\s+COALESCE\(sms_role_state, ''\),\s+COALESCE\(last_seen_at, now\(\)\),\s+COALESCE\(attestation_state, 'UNVERIFIED'\),\s+attestation_expires_at\s+FROM devices\s+WHERE id = \$1::uuid\s+AND user_id = \$2::uuid`).
+		WithArgs("44444444-4444-4444-4444-444444444444", "11111111-1111-1111-1111-111111111111").
+		WillReturnRows(rows)
+
+	svc := NewHandlerWithDB(&mockAdapter{p: mock})
+	err = svc.ensureRelayDeviceAuthorized(context.Background(), "11111111-1111-1111-1111-111111111111", "44444444-4444-4444-4444-444444444444", "ANDROID_CARRIER")
+	if !errors.Is(err, ErrRelayUnauthorized) {
+		t.Fatalf("expected unauthorized for missing carrier capability, got %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestLoadJobRecordForActorRejectsExpiredQueuedJob(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mock.Close()
+
+	expired := time.Now().Add(-time.Minute).UTC()
+	rows := pgxmock.NewRows([]string{"id", "creator_user_id", "destination", "transport_hint", "content", "status", "executing_device_id", "consent_state", "required_capability", "expires_at", "accepted_at", "attested_at", "result", "created_at", "updated_at"}).
+		AddRow("job-1", "11111111-1111-1111-1111-111111111111", mustJSON(t, map[string]any{"phone_e164": "+15551234567"}), "RELAY_SMS", mustJSON(t, map[string]any{"text": "hello"}), "queued", "", "PENDING_DEVICE", "RELAY_EXECUTOR", sql.NullTime{Time: expired, Valid: true}, nil, nil, []byte(nil), nil, nil)
+	mock.ExpectQuery(`SELECT id::text, creator_user_id::text, destination, transport_hint, content, status, executing_device_id::text, consent_state, required_capability, expires_at, accepted_at, attested_at, result, created_at, updated_at FROM relay_jobs WHERE id = \$1::uuid`).
+		WithArgs("job-1").
+		WillReturnRows(rows)
+
+	svc := NewHandlerWithDB(&mockAdapter{p: mock})
+	_, err = svc.loadJobRecordForActor(context.Background(), "11111111-1111-1111-1111-111111111111", "job-1")
+	if !errors.Is(err, ErrRelayExpired) {
+		t.Fatalf("expected expired error, got %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestAcceptHandlerRejectsExpiredJob(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mock.Close()
+
+	expired := time.Now().Add(-time.Minute).UTC()
+	rows := pgxmock.NewRows([]string{"id", "creator_user_id", "destination", "transport_hint", "content", "status", "executing_device_id", "consent_state", "required_capability", "expires_at", "accepted_at", "attested_at", "result", "created_at", "updated_at"}).
+		AddRow("job-1", "11111111-1111-1111-1111-111111111111", mustJSON(t, map[string]any{"phone_e164": "+15551234567"}), "RELAY_SMS", mustJSON(t, map[string]any{"text": "hello"}), "queued", "", "PENDING_DEVICE", "RELAY_EXECUTOR", sql.NullTime{Time: expired, Valid: true}, nil, nil, []byte(nil), nil, nil)
+	mock.ExpectQuery(`SELECT id::text, creator_user_id::text, destination, transport_hint, content, status, executing_device_id::text, consent_state, required_capability, expires_at, accepted_at, attested_at, result, created_at, updated_at FROM relay_jobs WHERE id = \$1::uuid`).
+		WithArgs("job-1").
+		WillReturnRows(rows)
+
+	svc := NewHandlerWithDB(&mockAdapter{p: mock})
+	req := httptest.NewRequest(http.MethodPost, "/v1/relay/jobs/job-1/accept", strings.NewReader(`{"device_id":"44444444-4444-4444-4444-444444444444"}`))
+	req = req.WithContext(middleware.WithUserID(req.Context(), "11111111-1111-1111-1111-111111111111"))
+	routeCtx := chi.NewRouteContext()
+	routeCtx.URLParams.Add("id", "job-1")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, routeCtx))
+	rec := httptest.NewRecorder()
+
+	svc.Accept(rec, req)
+
+	if rec.Code != http.StatusGone {
+		t.Fatalf("expected 410 for expired job, got %d", rec.Code)
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
 	}

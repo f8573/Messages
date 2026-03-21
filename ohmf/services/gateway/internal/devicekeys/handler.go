@@ -19,9 +19,10 @@ import (
 	"time"
 )
 
+func NewHandler(db *pgxpool.Pool) *Handler { return &Handler{DB: db} }
 
 type Handler struct {
-	db *pgxpool.Pool
+	DB *pgxpool.Pool
 }
 
 // removed: trivial constructor wrapper with type mismatch fixed
@@ -119,6 +120,102 @@ func (h *Handler) ClaimForUser(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
+func (h *Handler) UpsertBackup(w http.ResponseWriter, r *http.Request) {
+	actor, ok := middleware.UserIDFromContext(r.Context())
+	if !ok {
+		httpx.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing auth", nil)
+		return
+	}
+	backupName := chi.URLParam(r, "name")
+	var req UpsertBackupRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "invalid body", nil)
+		return
+	}
+	item, err := (&Service{pool: h.DB}).UpsertBackup(r.Context(), actor, backupName, req)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrDeviceNotOwned):
+			httpx.WriteError(w, r, http.StatusForbidden, "forbidden", "device not owned by actor", nil)
+			return
+		case err.Error() == "encrypted_blob_required":
+			httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "encrypted_blob required", nil)
+			return
+		default:
+			httpx.WriteError(w, r, http.StatusInternalServerError, "backup_failed", err.Error(), nil)
+			return
+		}
+	}
+	httpx.WriteJSON(w, http.StatusOK, item)
+}
+
+func (h *Handler) ListBackups(w http.ResponseWriter, r *http.Request) {
+	actor, ok := middleware.UserIDFromContext(r.Context())
+	if !ok {
+		httpx.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing auth", nil)
+		return
+	}
+	items, err := (&Service{pool: h.DB}).ListBackups(r.Context(), actor)
+	if err != nil {
+		httpx.WriteError(w, r, http.StatusInternalServerError, "list_failed", err.Error(), nil)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (h *Handler) GetBackup(w http.ResponseWriter, r *http.Request) {
+	actor, ok := middleware.UserIDFromContext(r.Context())
+	if !ok {
+		httpx.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing auth", nil)
+		return
+	}
+	item, err := (&Service{pool: h.DB}).GetBackup(r.Context(), actor, chi.URLParam(r, "name"), false)
+	if err != nil {
+		if errors.Is(err, ErrBackupNotFound) {
+			httpx.WriteError(w, r, http.StatusNotFound, "not_found", "backup not found", nil)
+			return
+		}
+		httpx.WriteError(w, r, http.StatusInternalServerError, "get_failed", err.Error(), nil)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, item)
+}
+
+func (h *Handler) RestoreBackup(w http.ResponseWriter, r *http.Request) {
+	actor, ok := middleware.UserIDFromContext(r.Context())
+	if !ok {
+		httpx.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing auth", nil)
+		return
+	}
+	item, err := (&Service{pool: h.DB}).GetBackup(r.Context(), actor, chi.URLParam(r, "name"), true)
+	if err != nil {
+		if errors.Is(err, ErrBackupNotFound) {
+			httpx.WriteError(w, r, http.StatusNotFound, "not_found", "backup not found", nil)
+			return
+		}
+		httpx.WriteError(w, r, http.StatusInternalServerError, "restore_failed", err.Error(), nil)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, item)
+}
+
+func (h *Handler) DeleteBackup(w http.ResponseWriter, r *http.Request) {
+	actor, ok := middleware.UserIDFromContext(r.Context())
+	if !ok {
+		httpx.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing auth", nil)
+		return
+	}
+	if err := (&Service{pool: h.DB}).DeleteBackup(r.Context(), actor, chi.URLParam(r, "name")); err != nil {
+		if errors.Is(err, ErrBackupNotFound) {
+			httpx.WriteError(w, r, http.StatusNotFound, "not_found", "backup not found", nil)
+			return
+		}
+		httpx.WriteError(w, r, http.StatusInternalServerError, "delete_failed", err.Error(), nil)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 var (
 	ErrDeviceNotOwned               = errors.New("device_not_owned")
 	ErrDeviceCapabilityRequired     = errors.New("device_e2ee_capability_required")
@@ -186,10 +283,6 @@ type PublishRequest struct {
 	OneTimePrekeys             []OneTimePrekey `json:"one_time_prekeys,omitempty"`
 }
 
-
-
-func NewService(db *pgxpool.Pool) *Service { return &Service{db: db} }
-
 func (h *Handler) PublishBundle(ctx context.Context, actorUserID, deviceID string, req PublishRequest) (Bundle, error) {
 	if err := h.ensureDeviceOwnership(ctx, actorUserID, deviceID); err != nil {
 		return Bundle{}, err
@@ -199,7 +292,7 @@ func (h *Handler) PublishBundle(ctx context.Context, actorUserID, deviceID strin
 	}
 	req = normalizePublishRequest(req)
 	var priorFingerprint string
-	_ = h.db.QueryRow(ctx, `SELECT COALESCE(fingerprint, '') FROM device_identity_keys WHERE device_id = $1::uuid`, deviceID).Scan(&priorFingerprint)
+	_ = h.DB.QueryRow(ctx, `SELECT COALESCE(fingerprint, '') FROM device_identity_keys WHERE device_id = $1::uuid`, deviceID).Scan(&priorFingerprint)
 	if err := validatePublishRequest(req, priorFingerprint == ""); err != nil {
 		return Bundle{}, err
 	}
@@ -220,7 +313,7 @@ func (h *Handler) PublishBundle(ctx context.Context, actorUserID, deviceID strin
 		req.TrustLevel = "TRUSTED_SELF"
 	}
 
-	tx, err := h.db.BeginTx(ctx, pgx.TxOptions{})
+	tx, err := h.DB.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return Bundle{}, err
 	}
@@ -305,7 +398,7 @@ func (h *Handler) AddOneTimePrekeys(ctx context.Context, actorUserID, deviceID s
 	if len(prekeys) == 0 {
 		return Bundle{}, ErrEncryptedPrekeysRequired
 	}
-	tx, err := h.db.BeginTx(ctx, pgx.TxOptions{})
+	tx, err := h.DB.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return Bundle{}, err
 	}
@@ -321,7 +414,7 @@ func (h *Handler) AddOneTimePrekeys(ctx context.Context, actorUserID, deviceID s
 }
 
 func (h *Handler) ListBundlesForUser(ctx context.Context, userID string) ([]Bundle, error) {
-	rows, err := h.db.Query(ctx, `
+	rows, err := h.DB.Query(ctx, `
 		SELECT
 			dik.device_id::text,
 			dik.user_id::text,
@@ -399,7 +492,7 @@ func (h *Handler) ListBundlesForUser(ctx context.Context, userID string) ([]Bund
 }
 
 func (h *Handler) ClaimBundles(ctx context.Context, userID string) ([]Bundle, error) {
-	tx, err := h.db.BeginTx(ctx, pgx.TxOptions{})
+	tx, err := h.DB.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -507,7 +600,7 @@ func (h *Handler) ClaimBundles(ctx context.Context, userID string) ([]Bundle, er
 
 func (h *Handler) ensureDeviceOwnership(ctx context.Context, actorUserID, deviceID string) error {
 	var exists bool
-	if err := h.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM devices WHERE id = $1::uuid AND user_id = $2::uuid)`, deviceID, actorUserID).Scan(&exists); err != nil {
+	if err := h.DB.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM devices WHERE id = $1::uuid AND user_id = $2::uuid)`, deviceID, actorUserID).Scan(&exists); err != nil {
 		return err
 	}
 	if !exists {
@@ -518,7 +611,7 @@ func (h *Handler) ensureDeviceOwnership(ctx context.Context, actorUserID, device
 
 func (h *Handler) ensureDeviceCapability(ctx context.Context, actorUserID, deviceID, capability string) error {
 	var exists bool
-	if err := h.db.QueryRow(ctx, `
+	if err := h.DB.QueryRow(ctx, `
 		SELECT EXISTS(
 			SELECT 1
 			FROM devices
@@ -562,7 +655,7 @@ func (h *Handler) loadBundle(ctx context.Context, actorUserID, deviceID string) 
 	var bundle Bundle
 	var publishedAt time.Time
 	var updatedAt time.Time
-	err := h.db.QueryRow(ctx, `
+	err := h.DB.QueryRow(ctx, `
 		SELECT
 			dik.device_id::text,
 			dik.user_id::text,

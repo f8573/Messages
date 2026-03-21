@@ -48,10 +48,11 @@ Gateway API should be running at:
   - Per-user conversation state cached in `localStorage`
   - Auth session stored in `sessionStorage`
 - Mini-app runtime lab:
-  - Loads `./miniapps/counter/manifest.json`
+  - Loads mini-apps through the gateway-backed `/v1/apps` catalog instead of a hardcoded local manifest URL
+  - Bootstraps the built-in `Counter Lab` and `Mystic 8-Ball` examples into the local dev registry when running on `localhost`
   - Runs the app in a sandboxed iframe
   - Exposes a browser mini-app SDK and host bridge with `host.getLaunchContext`, `conversation.readContext`, `conversation.sendMessage`, `participants.readBasic`, `storage.session.*`, `storage.sharedConversation.*`, `session.updateState`, `media.pickUser`, and `notifications.inApp.show`
-  - Uses gateway-backed manifest registration and session persistence when an OHMF web auth session is available, with local fallback otherwise
+  - Uses gateway-backed catalog lookup, app install tracking, manifest registration, and session persistence when an OHMF web auth session is available
   - Lets you toggle granted permissions to verify host-side capability enforcement
   - The default frontend port is configured in `frontend-config.js` as `frontend_port`
 

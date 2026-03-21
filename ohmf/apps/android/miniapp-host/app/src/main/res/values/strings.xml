@@ -1,0 +1,9 @@
+<resources>
+  <string name="app_name">OHMF Mini-App Host</string>
+  <string name="api_base_hint">API base URL</string>
+  <string name="bearer_token_hint">Bearer token</string>
+  <string name="developer_mode">Enable developer-mode apps</string>
+  <string name="refresh_catalog">Refresh catalog</string>
+  <string name="catalog_idle">Load the catalog to install or open an app.</string>
+  <string name="runtime_loading">Launching mini-app runtime…</string>
+</resources>

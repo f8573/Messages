@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: OHMF MVP API
-  version: 1.0.0
+  version: 1.1.0
 servers:
   - url: http://localhost:18081
 components:
@@ -59,6 +59,130 @@ components:
       properties:
         access_token: { type: string }
         refresh_token: { type: string }
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token: { type: string }
+    PhoneVerifyResponse:
+      type: object
+      properties:
+        user:
+          type: object
+          properties:
+            user_id: { type: string }
+            primary_phone_e164: { type: string }
+        device:
+          type: object
+          properties:
+            device_id: { type: string }
+            platform: { type: string }
+        tokens:
+          $ref: '#/components/schemas/TokenPair'
+    RecoveryCodeAuthRequest:
+      type: object
+      required: [phone_e164, code, device]
+      properties:
+        phone_e164: { type: string }
+        code: { type: string }
+        device:
+          type: object
+          properties:
+            platform: { type: string }
+            device_name: { type: string }
+            public_key: { type: string }
+            capabilities:
+              type: array
+              items: { type: string }
+    RecoveryCodeAuthResponse:
+      type: object
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+        user_id: { type: string }
+        device_id: { type: string }
+        expires_in: { type: integer }
+    PairingStartResponse:
+      type: object
+      properties:
+        pairing_session_id: { type: string }
+        pairing_code: { type: string }
+        expires_at:
+          type: string
+          format: date-time
+    PairingCompleteRequest:
+      type: object
+      required: [pairing_code, device]
+      properties:
+        pairing_code: { type: string }
+        device:
+          type: object
+          required: [platform]
+          properties:
+            platform: { type: string }
+            device_name: { type: string }
+            public_key: { type: string }
+            push_token: { type: string }
+            capabilities:
+              type: array
+              items: { type: string }
+    PairingCompleteResponse:
+      type: object
+      properties:
+        user_id: { type: string }
+        device_id: { type: string }
+        access_token: { type: string }
+        refresh_token: { type: string }
+        expires_in: { type: integer }
+    RecoveryCodesResponse:
+      type: object
+      properties:
+        recovery_codes:
+          type: array
+          items: { type: string }
+        expires_at:
+          type: string
+          format: date-time
+    TwoFASetupRequest:
+      type: object
+      required: [method]
+      properties:
+        method:
+          type: string
+          enum: [sms, totp]
+    TwoFASetupResponse:
+      type: object
+      properties:
+        method: { type: string }
+        secret: { type: string }
+        provisioning_uri: { type: string }
+    TwoFAVerifyRequest:
+      type: object
+      required: [method, code]
+      properties:
+        method:
+          type: string
+          enum: [sms, totp]
+        code: { type: string }
+    TwoFAVerifyResponse:
+      type: object
+      properties:
+        verified: { type: boolean }
+    TwoFAMethod:
+      type: object
+      properties:
+        id: { type: integer }
+        method_type: { type: string }
+        enabled: { type: boolean }
+        created_at:
+          type: string
+          format: date-time
+    TwoFAMethodsResponse:
+      type: object
+      properties:
+        methods:
+          type: array
+          items: { $ref: '#/components/schemas/TwoFAMethod' }
     CreateConversationRequest:
       type: object
       required: [type]
@@ -81,6 +205,7 @@ components:
         type: { type: string }
         title: { type: string }
         avatar_url: { type: string }
+        description: { type: string }
         creator_user_id: { type: string }
         encryption_state: { type: string }
         encryption_epoch: { type: integer }
@@ -96,6 +221,7 @@ components:
         last_message_preview: { type: string }
         unread_count: { type: integer }
         nickname: { type: string }
+        viewer_role: { type: string, enum: [OWNER, ADMIN, MEMBER] }
         closed: { type: boolean }
         archived: { type: boolean }
         pinned: { type: boolean }
@@ -105,6 +231,16 @@ components:
         blocked: { type: boolean }
         blocked_by_viewer: { type: boolean }
         blocked_by_other: { type: boolean }
+        allow_message_effects: { type: boolean }
+        theme: { type: string }
+        retention_seconds: { type: integer }
+        expires_at:
+          type: string
+          format: date-time
+        settings_version: { type: integer }
+        settings_updated_at:
+          type: string
+          format: date-time
         thread_keys:
           type: array
           items:
@@ -134,7 +270,17 @@ components:
       properties:
         title: { type: string, nullable: true }
         avatar_url: { type: string, nullable: true }
+        description: { type: string, nullable: true }
         encryption_state: { type: string, enum: [PLAINTEXT, PENDING_E2EE, ENCRYPTED, CARRIER_PLAINTEXT] }
+    UpdateConversationSettingsRequest:
+      type: object
+      properties:
+        theme: { type: string, nullable: true }
+        retention_seconds: { type: integer, nullable: true }
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
     UpdateConversationMembersRequest:
       type: object
       required: [user_ids]
@@ -142,6 +288,49 @@ components:
         user_ids:
           type: array
           items: { type: string }
+    UpdateConversationMemberRoleRequest:
+      type: object
+      required: [role]
+      properties:
+        role: { type: string, enum: [OWNER, ADMIN, MEMBER] }
+    ConversationInvite:
+      type: object
+      properties:
+        invite_id: { type: string }
+        conversation_id: { type: string }
+        code: { type: string }
+        created_by_user_id: { type: string }
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        max_uses: { type: integer }
+        use_count: { type: integer }
+        revoked: { type: boolean }
+    ConversationInviteListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/ConversationInvite' }
+    CreateConversationInviteRequest:
+      type: object
+      properties:
+        max_uses: { type: integer }
+        ttl_seconds: { type: integer }
+    RedeemConversationInviteRequest:
+      type: object
+      required: [code]
+      properties:
+        code: { type: string }
+    ConversationBanRequest:
+      type: object
+      required: [user_id]
+      properties:
+        user_id: { type: string }
+        reason: { type: string }
     Profile:
       type: object
       properties:
@@ -230,6 +419,15 @@ components:
         push_provider: { type: string }
         has_push_subscription: { type: boolean }
         public_key: { type: string }
+        attestation_type: { type: string }
+        attestation_state: { type: string }
+        attested_at:
+          type: string
+          format: date-time
+        attestation_expires_at:
+          type: string
+          format: date-time
+        attestation_last_error: { type: string }
     DeviceUpdateRequest:
       type: object
       properties:
@@ -243,6 +441,20 @@ components:
         push_subscription: { type: string }
         push_token: { type: string }
         public_key: { type: string }
+    DeviceAttestationChallengeResponse:
+      type: object
+      properties:
+        nonce: { type: string }
+        expires_at:
+          type: string
+          format: date-time
+    DeviceAttestationVerifyRequest:
+      type: object
+      required: [attestation_type, payload, signature]
+      properties:
+        attestation_type: { type: string }
+        payload: { type: string }
+        signature: { type: string }
     MediaUploadInitRequest:
       type: object
       required: [mime_type]
@@ -294,9 +506,12 @@ components:
         idempotency_key: { type: string }
         content_type: { type: string }
         content:
-          type: object
-          additionalProperties: true
+          oneOf:
+            - $ref: '#/components/schemas/RichTextContent'
+            - type: object
+              additionalProperties: true
         client_generated_id: { type: string }
+        reply_to_message_id: { type: string }
     SendPhoneMessageRequest:
       type: object
       required: [phone_e164, idempotency_key, content_type, content]
@@ -305,8 +520,46 @@ components:
         idempotency_key: { type: string }
         content_type: { type: string }
         content:
-          type: object
-          additionalProperties: true
+          oneOf:
+            - $ref: '#/components/schemas/RichTextContent'
+            - type: object
+              additionalProperties: true
+        client_generated_id: { type: string }
+        reply_to_message_id: { type: string }
+    RichTextSpan:
+      type: object
+      properties:
+        start: { type: integer }
+        end: { type: integer }
+        style:
+          type: string
+          enum: [bold, italic, underline, strikethrough, spoiler, link, mention, code, quote]
+        url: { type: string }
+        user_id: { type: string }
+    RichTextMention:
+      type: object
+      properties:
+        user_id: { type: string }
+        id: { type: string }
+        display: { type: string }
+        start: { type: integer }
+        end: { type: integer }
+    RichTextContent:
+      type: object
+      required: [text]
+      properties:
+        text: { type: string }
+        spans:
+          type: array
+          items: { $ref: '#/components/schemas/RichTextSpan' }
+        mentions:
+          type: array
+          items: { $ref: '#/components/schemas/RichTextMention' }
+        expires_on_read: { type: boolean }
+        expires_in_seconds: { type: integer }
+        expires_at:
+          type: string
+          format: date-time
     SMSDeliveryStatus:
       type: string
       enum: [SENT, FAIL_SEND]
@@ -318,6 +571,8 @@ components:
       required: [message_id, server_order, transport, status, queued]
       properties:
         message_id: { type: string }
+        conversation_id: { type: string }
+        reply_to_message_id: { type: string }
         server_order: { type: integer }
         transport: { type: string, enum: [OHMF] }
         status: { $ref: '#/components/schemas/OHMFDeliveryStatus' }
@@ -329,11 +584,318 @@ components:
       properties:
         message_id: { type: string }
         conversation_id: { type: string }
+        reply_to_message_id: { type: string }
         server_order: { type: integer }
         transport: { type: string, enum: [SMS] }
         status: { $ref: '#/components/schemas/SMSDeliveryStatus' }
         queued: { type: boolean }
         ack_timeout_ms: { type: integer, nullable: true }
+    Message:
+      type: object
+      properties:
+        message_id: { type: string }
+        conversation_id: { type: string }
+        sender_user_id: { type: string }
+        sender_device_id: { type: string }
+        reply_to_message_id: { type: string }
+        reply_count: { type: integer }
+        content_type: { type: string }
+        content:
+          oneOf:
+            - $ref: '#/components/schemas/RichTextContent'
+            - type: object
+              additionalProperties: true
+        reactions:
+          type: object
+          additionalProperties: { type: integer }
+        client_generated_id: { type: string }
+        transport: { type: string }
+        server_order: { type: integer }
+        status: { type: string }
+        created_at:
+          type: string
+          format: date-time
+        sent_at:
+          type: string
+          format: date-time
+        delivered_at:
+          type: string
+          format: date-time
+        read_at:
+          type: string
+          format: date-time
+        status_updated_at:
+          type: string
+          format: date-time
+        edited_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        deleted: { type: boolean }
+        deleted_at:
+          type: string
+          format: date-time
+        visibility_state: { type: string }
+        source: { type: string }
+        pinned_at:
+          type: string
+          format: date-time
+        pinned_by_user_id: { type: string }
+    MessageListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Message' }
+        next_cursor: { type: string, nullable: true }
+    MessageEditHistoryResponse:
+      type: object
+      properties:
+        edits:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+    ConversationSearchResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Message' }
+    PresenceSession:
+      type: object
+      properties:
+        session_id: { type: string }
+        device_id: { type: string }
+        version: { type: string }
+        last_seen_at_ms: { type: integer }
+    UserPresence:
+      type: object
+      properties:
+        user_id: { type: string }
+        online: { type: boolean }
+        last_seen_at:
+          type: string
+          format: date-time
+        session_count: { type: integer }
+        sessions:
+          type: array
+          items: { $ref: '#/components/schemas/PresenceSession' }
+    UserPresenceListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/UserPresence' }
+    DeviceKeyBackup:
+      type: object
+      properties:
+        backup_name: { type: string }
+        source_device_id: { type: string }
+        encrypted_blob: { type: string }
+        wrapping_alg: { type: string }
+        wrapped_key: { type: string }
+        recovery_data:
+          type: object
+          additionalProperties: true
+        attestation_type: { type: string }
+        attestation_payload:
+          type: object
+          additionalProperties: true
+        backup_hash: { type: string }
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        last_restored_at:
+          type: string
+          format: date-time
+    DeviceKeyBackupUpsertRequest:
+      type: object
+      required: [encrypted_blob]
+      properties:
+        source_device_id: { type: string }
+        encrypted_blob: { type: string }
+        wrapping_alg: { type: string }
+        wrapped_key: { type: string }
+        recovery_data:
+          type: object
+          additionalProperties: true
+        attestation_type: { type: string }
+        attestation_payload:
+          type: object
+          additionalProperties: true
+        backup_hash: { type: string }
+    DeviceKeyBackupListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/DeviceKeyBackup' }
+    ConversationReadStatusMember:
+      type: object
+      properties:
+        user_id: { type: string }
+        phone: { type: string }
+        last_read_server_order: { type: integer }
+        last_delivered_server_order: { type: integer }
+        read_at:
+          type: string
+          format: date-time
+        delivery_at:
+          type: string
+          format: date-time
+    ConversationReadStatusResponse:
+      type: object
+      properties:
+        members:
+          type: array
+          items: { $ref: '#/components/schemas/ConversationReadStatusMember' }
+    MessageEffectRequest:
+      type: object
+      required: [effect_type]
+      properties:
+        effect_type: { type: string }
+    AccountExportResponse:
+      type: object
+      properties:
+        export_version: { type: integer }
+        exported_at:
+          type: string
+          format: date-time
+        user:
+          type: object
+          additionalProperties: true
+        devices:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        security:
+          type: object
+          additionalProperties: true
+        conversations:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        messages:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+    AccountExportArtifact:
+      type: object
+      properties:
+        export_id: { type: string }
+        status: { type: string }
+        format: { type: string }
+        download_token: { type: string }
+        size_bytes: { type: integer }
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        downloaded_at:
+          type: string
+          format: date-time
+        payload:
+          type: object
+          additionalProperties: true
+    AccountExportArtifactListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/AccountExportArtifact' }
+    RelayCreateMessageRequest:
+      type: object
+      required: [destination, content]
+      properties:
+        destination:
+          type: object
+          additionalProperties: true
+        transport_hint: { type: string }
+        content:
+          type: object
+          additionalProperties: true
+    RelayCreateMessageResponse:
+      type: object
+      properties:
+        relay_job_id: { type: string }
+    RelayJob:
+      type: object
+      properties:
+        id: { type: string }
+        creator_user_id: { type: string }
+        destination:
+          type: object
+          additionalProperties: true
+        transport_hint: { type: string }
+        content:
+          type: object
+          additionalProperties: true
+        status: { type: string }
+        executing_device_id: { type: string }
+        consent_state: { type: string }
+        required_capability: { type: string }
+        expires_at:
+          type: string
+          format: date-time
+        accepted_at:
+          type: string
+          format: date-time
+        attested_at:
+          type: string
+          format: date-time
+        result:
+          type: object
+          additionalProperties: true
+    RelayJobListResponse:
+      type: object
+      properties:
+        jobs:
+          type: array
+          items: { $ref: '#/components/schemas/RelayJob' }
+    RelayAcceptRequest:
+      type: object
+      required: [device_id]
+      properties:
+        device_id: { type: string }
+    RelayResultRequest:
+      type: object
+      required: [device_id, status]
+      properties:
+        device_id: { type: string }
+        status: { type: string }
+        result:
+          type: object
+          additionalProperties: true
+    ForwardMessageRequest:
+      type: object
+      required: [conversation_id, idempotency_key]
+      properties:
+        conversation_id: { type: string }
+        idempotency_key: { type: string }
+        client_generated_id: { type: string }
+    ForwardMessageResponse:
+      type: object
+      required: [message_id, conversation_id, server_order, transport, status, queued]
+      properties:
+        message_id: { type: string }
+        conversation_id: { type: string }
+        server_order: { type: integer }
+        transport: { type: string, enum: [OHMF, SMS] }
+        status: { type: string }
+        queued: { type: boolean }
+        ack_timeout_ms: { type: integer, nullable: true }
+        source: { type: string }
     MiniAppParticipant:
       type: object
       required: [user_id, role]
@@ -353,6 +915,94 @@ components:
         created_at:
           type: string
           format: date-time
+    MiniAppInstallState:
+      type: object
+      properties:
+        installed: { type: boolean }
+        installed_version: { type: string }
+        auto_update: { type: boolean }
+        enabled: { type: boolean }
+    MiniAppPermissionDelta:
+      type: object
+      properties:
+        added:
+          type: array
+          items: { type: string }
+        removed:
+          type: array
+          items: { type: string }
+    MiniAppCatalogEntry:
+      type: object
+      properties:
+        app_id: { type: string }
+        title: { type: string }
+        summary: { type: string }
+        version: { type: string }
+        latest_version: { type: string }
+        latest_approved_version: { type: string }
+        review_status: { type: string, enum: [draft, submitted, under_review, needs_changes, approved, rejected, suspended, revoked] }
+        source_type: { type: string }
+        published_at:
+          type: string
+          format: date-time
+        manifest:
+          type: object
+          additionalProperties: true
+        install: { $ref: '#/components/schemas/MiniAppInstallState' }
+        install_state: { type: string }
+        update_available: { type: boolean }
+        update_requires_consent: { type: boolean }
+        permission_delta: { $ref: '#/components/schemas/MiniAppPermissionDelta' }
+    MiniAppCatalogResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/MiniAppCatalogEntry' }
+        next_cursor: { type: string }
+        total: { type: integer }
+    MiniAppUpdateStatus:
+      type: object
+      properties:
+        app_id: { type: string }
+        installed_version: { type: string }
+        latest_version: { type: string }
+        latest_approved_version: { type: string }
+        update_available: { type: boolean }
+        update_requires_consent: { type: boolean }
+        permission_delta: { $ref: '#/components/schemas/MiniAppPermissionDelta' }
+    MiniAppPublisherAppRequest:
+      type: object
+      required: [app_id, name]
+      properties:
+        app_id: { type: string }
+        name: { type: string }
+    MiniAppPublisherReleaseRequest:
+      type: object
+      required: [manifest]
+      properties:
+        manifest:
+          type: object
+          additionalProperties: true
+    MiniAppRelease:
+      type: object
+      properties:
+        app_id: { type: string }
+        version: { type: string }
+        review_status: { type: string, enum: [draft, submitted, under_review, needs_changes, approved, rejected, suspended, revoked] }
+        manifest_hash: { type: string }
+        source_type: { type: string }
+        visibility: { type: string }
+        supported_platforms:
+          type: array
+          items: { type: string }
+        published_at:
+          type: string
+          format: date-time
+        reviewed_at:
+          type: string
+          format: date-time
+        reviewed_by: { type: string }
     MiniAppSessionState:
       type: object
       properties:
@@ -373,7 +1023,9 @@ components:
     MiniAppLaunchContext:
       type: object
       properties:
+        bridge_version: { type: string }
         app_id: { type: string }
+        app_version: { type: string }
         app_session_id: { type: string }
         conversation_id: { type: string }
         viewer: { $ref: '#/components/schemas/MiniAppParticipant' }
@@ -381,6 +1033,9 @@ components:
           type: array
           items: { $ref: '#/components/schemas/MiniAppParticipant' }
         capabilities_granted:
+          type: array
+          items: { type: string }
+        host_capabilities:
           type: array
           items: { type: string }
         state_snapshot:
@@ -554,13 +1209,151 @@ paths:
       responses:
         '200':
           description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PhoneVerifyResponse' }
   /v1/auth/refresh:
     post:
       security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefreshRequest' }
       responses:
         '200':
           description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tokens: { $ref: '#/components/schemas/TokenPair' }
+  /v1/auth/recovery-code:
+    post:
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RecoveryCodeAuthRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecoveryCodeAuthResponse' }
+  /v1/auth/pairing/complete:
+    post:
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PairingCompleteRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PairingCompleteResponse' }
   /v1/auth/logout:
+    post:
+      responses:
+        '204':
+          description: No Content
+  /v1/auth/pairing/start:
+    post:
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PairingStartResponse' }
+  /v1/account/recovery-codes:
+    get:
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecoveryCodesResponse' }
+  /v1/account/2fa/setup:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TwoFASetupRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TwoFASetupResponse' }
+  /v1/account/2fa/verify:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TwoFAVerifyRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TwoFAVerifyResponse' }
+  /v1/account/2fa/methods:
+    get:
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TwoFAMethodsResponse' }
+  /v1/account/export:
+    post:
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccountExportResponse' }
+  /v1/account/exports:
+    get:
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccountExportArtifactListResponse' }
+    post:
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccountExportArtifact' }
+  /v1/account/exports/{id}:
+    get:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccountExportArtifact' }
+  /v1/account/delete:
+    post:
+      responses:
+        '204':
+          description: No Content
+  /v1/account/delete/finalize:
     post:
       responses:
         '204':
@@ -667,6 +1460,24 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Conversation' }
+  /v1/conversations/{id}/settings:
+    patch:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateConversationSettingsRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Conversation' }
   /v1/conversations/{id}/members:
     post:
       parameters:
@@ -685,6 +1496,100 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Conversation' }
+  /v1/conversations/{id}/members/{userID}/role:
+    put:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+        - in: path
+          name: userID
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateConversationMemberRoleRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Conversation' }
+  /v1/conversations/{id}/invites:
+    get:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationInviteListResponse' }
+    post:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateConversationInviteRequest' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationInvite' }
+  /v1/conversations/invites/redeem:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RedeemConversationInviteRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Conversation' }
+  /v1/conversations/{id}/bans:
+    post:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConversationBanRequest' }
+      responses:
+        '204':
+          description: No Content
+  /v1/conversations/{id}/bans/{userID}:
+    delete:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+        - in: path
+          name: userID
+          required: true
+          schema: { type: string }
+      responses:
+        '204':
+          description: No Content
   /v1/conversations/{id}/members/{userID}:
     delete:
       parameters:
@@ -702,6 +1607,92 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Conversation' }
+  /v1/conversations/{id}/presence:
+    get:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserPresenceListResponse' }
+  /v1/presence/{userID}:
+    get:
+      parameters:
+        - in: path
+          name: userID
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserPresence' }
+  /v1/device-keys/backups:
+    get:
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeviceKeyBackupListResponse' }
+  /v1/device-keys/backups/{name}:
+    put:
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeviceKeyBackupUpsertRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeviceKeyBackup' }
+    get:
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeviceKeyBackup' }
+    delete:
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: { type: string }
+      responses:
+        '204':
+          description: No Content
+  /v1/device-keys/backups/{name}/restore:
+    post:
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeviceKeyBackup' }
   /v1/device-keys/{deviceID}:
     put:
       parameters:
@@ -809,6 +1800,37 @@ paths:
         content:
           application/json:
             schema: { $ref: '#/components/schemas/DeviceUpdateRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Device' }
+  /v1/devices/{id}/attestation/challenge:
+    post:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeviceAttestationChallengeResponse' }
+  /v1/devices/{id}/attestation/verify:
+    post:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeviceAttestationVerifyRequest' }
       responses:
         '200':
           description: OK
@@ -934,6 +1956,20 @@ paths:
       responses:
         '101':
           description: Switching Protocols
+  /v2/ws:
+    get:
+      summary: WebSocket gateway endpoint (resume-aware v2)
+      description: >
+        Upgrade this request to WebSocket. Clients should send `hello` with
+        `device_id`, `last_user_cursor`, or `last_cursor` to resume missed events.
+      parameters:
+        - in: query
+          name: access_token
+          required: false
+          schema: { type: string }
+      responses:
+        '101':
+          description: Switching Protocols
   /v1/conversations/{id}/messages:
     get:
       parameters:
@@ -944,6 +1980,22 @@ paths:
       responses:
         '200':
           description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessageListResponse' }
+  /v1/conversations/{id}/pins:
+    get:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessageListResponse' }
   /v1/conversations/{id}/read:
     post:
       parameters:
@@ -954,6 +2006,138 @@ paths:
       responses:
         '204':
           description: No Content
+  /v1/conversations/{id}/search:
+    get:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+        - in: query
+          name: q
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          required: false
+          schema: { type: integer }
+        - in: query
+          name: sender_user_id
+          required: false
+          schema: { type: string }
+        - in: query
+          name: content_type
+          required: false
+          schema: { type: string }
+        - in: query
+          name: after
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - in: query
+          name: before
+          required: false
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationSearchResponse' }
+  /v1/conversations/{id}/read-status:
+    get:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationReadStatusResponse' }
+  /v1/messages/{id}/pin:
+    post:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '204':
+          description: No Content
+    delete:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '204':
+          description: No Content
+  /v1/messages/{id}/forward:
+    post:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ForwardMessageRequest' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ForwardMessageResponse' }
+  /v1/messages/{id}/replies:
+    get:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessageListResponse' }
+  /v1/messages/{id}/effects:
+    post:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MessageEffectRequest' }
+      responses:
+        '204':
+          description: No Content
+  /v1/messages/{id}/edits:
+    get:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessageEditHistoryResponse' }
   /v1/apps/register:
     post:
       requestBody:
@@ -964,11 +2148,157 @@ paths:
       responses:
         '201':
           description: Created
-  /v1/apps:
+  /v1/relay/messages:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RelayCreateMessageRequest' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RelayCreateMessageResponse' }
+  /v1/relay/jobs/available:
     get:
+      parameters:
+        - in: query
+          name: limit
+          required: false
+          schema: { type: integer }
       responses:
         '200':
           description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RelayJobListResponse' }
+  /v1/relay/jobs/{id}:
+    get:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RelayJob' }
+  /v1/relay/jobs/{id}/accept:
+    post:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+        - in: header
+          name: X-Device-Signature
+          required: false
+          schema: { type: string }
+        - in: header
+          name: X-Device-Timestamp
+          required: false
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RelayAcceptRequest' }
+      responses:
+        '204':
+          description: No Content
+  /v1/relay/jobs/{id}/result:
+    post:
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RelayResultRequest' }
+      responses:
+        '204':
+          description: No Content
+  /v1/apps:
+    get:
+      parameters:
+        - in: query
+          name: q
+          required: false
+          schema: { type: string }
+        - in: query
+          name: source_type
+          required: false
+          schema: { type: string }
+        - in: query
+          name: visibility
+          required: false
+          schema: { type: string }
+        - in: query
+          name: platform
+          required: false
+          schema: { type: string }
+        - in: query
+          name: installed
+          required: false
+          schema: { type: boolean }
+        - in: query
+          name: review_status
+          required: false
+          schema: { type: string }
+        - in: query
+          name: limit
+          required: false
+          schema: { type: integer }
+        - in: query
+          name: cursor
+          required: false
+          schema: { type: string }
+        - in: query
+          name: developer_mode
+          required: false
+          schema: { type: boolean }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MiniAppCatalogResponse' }
+  /v1/apps/installed:
+    get:
+      parameters:
+        - in: query
+          name: q
+          required: false
+          schema: { type: string }
+        - in: query
+          name: platform
+          required: false
+          schema: { type: string }
+        - in: query
+          name: review_status
+          required: false
+          schema: { type: string }
+        - in: query
+          name: limit
+          required: false
+          schema: { type: integer }
+        - in: query
+          name: cursor
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MiniAppCatalogResponse' }
   /v1/apps/{appID}:
     get:
       parameters:
@@ -979,6 +2309,52 @@ paths:
       responses:
         '200':
           description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MiniAppCatalogEntry' }
+  /v1/apps/{appID}/install:
+    post:
+      parameters:
+        - in: path
+          name: appID
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                accept_permission_changes: { type: boolean }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MiniAppCatalogEntry' }
+    delete:
+      parameters:
+        - in: path
+          name: appID
+          required: true
+          schema: { type: string }
+      responses:
+        '204':
+          description: No Content
+  /v1/apps/{appID}/updates:
+    get:
+      parameters:
+        - in: path
+          name: appID
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MiniAppUpdateStatus' }
   /v1/apps/sessions:
     post:
       requestBody:
@@ -1068,3 +2444,183 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/MiniAppShareResponse' }
+  /v1/publisher/apps:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MiniAppPublisherAppRequest' }
+      responses:
+        '201':
+          description: Created
+  /v1/publisher/apps/{appID}/releases:
+    post:
+      parameters:
+        - in: path
+          name: appID
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MiniAppPublisherReleaseRequest' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MiniAppRelease' }
+    get:
+      parameters:
+        - in: path
+          name: appID
+          required: true
+          schema: { type: string }
+        - in: query
+          name: q
+          required: false
+          schema: { type: string }
+        - in: query
+          name: review_status
+          required: false
+          schema: { type: string }
+        - in: query
+          name: limit
+          required: false
+          schema: { type: integer }
+        - in: query
+          name: cursor
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/MiniAppRelease' }
+  /v1/publisher/apps/{appID}/releases/{version}/submit:
+    post:
+      parameters:
+        - in: path
+          name: appID
+          required: true
+          schema: { type: string }
+        - in: path
+          name: version
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MiniAppRelease' }
+  /v1/publisher/apps/{appID}/releases/{version}/revoke:
+    post:
+      parameters:
+        - in: path
+          name: appID
+          required: true
+          schema: { type: string }
+        - in: path
+          name: version
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MiniAppRelease' }
+  /v1/admin/apps/{appID}/releases/{version}/approve:
+    post:
+      parameters:
+        - in: path
+          name: appID
+          required: true
+          schema: { type: string }
+        - in: path
+          name: version
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MiniAppRelease' }
+  /v1/admin/apps/{appID}/releases/{version}/start-review:
+    post:
+      parameters:
+        - in: path
+          name: appID
+          required: true
+          schema: { type: string }
+        - in: path
+          name: version
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MiniAppRelease' }
+  /v1/admin/apps/{appID}/releases/{version}/needs-changes:
+    post:
+      parameters:
+        - in: path
+          name: appID
+          required: true
+          schema: { type: string }
+        - in: path
+          name: version
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MiniAppRelease' }
+  /v1/admin/apps/{appID}/releases/{version}/reject:
+    post:
+      parameters:
+        - in: path
+          name: appID
+          required: true
+          schema: { type: string }
+        - in: path
+          name: version
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MiniAppRelease' }
+  /v1/admin/apps/{appID}/releases/{version}/suspend:
+    post:
+      parameters:
+        - in: path
+          name: appID
+          required: true
+          schema: { type: string }
+        - in: path
+          name: version
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MiniAppRelease' }

@@ -39,6 +39,19 @@ type Config struct {
 	SupportedProfiles      string
 	ClaimAndroidCarrier    bool
 	DiscoveryPepper        string
+	DiscoveryMaxContacts   int
+	DiscoveryRateWindow    time.Duration
+	DiscoveryRatePerUser   int
+	DiscoveryRatePerIP     int
+	OTPStartWindow         time.Duration
+	OTPStartPerPhoneLimit  int
+	OTPStartPerIPLimit     int
+	OTPStartPerSubnetLimit int
+	OTPVerifyWindow        time.Duration
+	OTPVerifyPerChallenge  int
+	OTPVerifyPerIP         int
+	OTPVerifyPerDevice     int
+	OTPVerifyPerPhone      int
 	// Optional headers for API deprecation and sunset information.
 	// When non-empty these values will be emitted as `Deprecation` and
 	// `Sunset` response headers by the API versioning middleware.
@@ -55,6 +68,11 @@ type Config struct {
 	EnableMediaPipeline     bool
 	EnableWebPush           bool
 	RequireRelayAttestation bool
+	DeviceAttestationSecret string
+	AttestationAndroidAppID string
+	AttestationIOSAppID     string
+	AttestationWebAppID     string
+	AttestationChallengeTTL time.Duration
 	UseRealOTPProvider      bool
 	OTPProvider             string
 	OTPFrom                 string
@@ -62,11 +80,21 @@ type Config struct {
 	TwilioAuthToken         string
 	TwilioMessagingService  string
 	MediaRootDir            string
+	MiniappRootDir          string
 	MediaPublicBaseURL      string
 	WebPushVAPIDPublicKey   string
 	WebPushVAPIDPrivateKey  string
 	WebPushSubject          string
 	PushSubscriptionKey     string
+	// Firebase Cloud Messaging
+	FirebaseProjectID       string
+	FirebaseCredentialsPath string
+	// Apple Push Notifications
+	APNsCertPath string
+	APNsKeyPath  string
+	APNsBundleID string
+	APNsTeamID   string
+	APNsKeyID    string
 }
 
 func Load() Config {
@@ -103,6 +131,19 @@ func Load() Config {
 		SupportedProfiles:       get("APP_SUPPORTED_PROFILES", "CORE_OTT"),
 		ClaimAndroidCarrier:     getBool("APP_CLAIM_ANDROID_CARRIER", false),
 		DiscoveryPepper:         get("APP_DISCOVERY_PEPPER", ""),
+		DiscoveryMaxContacts:    getInt("APP_DISCOVERY_MAX_CONTACTS", 256),
+		DiscoveryRateWindow:     time.Duration(getInt("APP_DISCOVERY_RATE_WINDOW_MINUTES", 1)) * time.Minute,
+		DiscoveryRatePerUser:    getInt("APP_DISCOVERY_RATE_PER_USER", 10),
+		DiscoveryRatePerIP:      getInt("APP_DISCOVERY_RATE_PER_IP", 30),
+		OTPStartWindow:          time.Duration(getInt("APP_OTP_START_WINDOW_MINUTES", 10)) * time.Minute,
+		OTPStartPerPhoneLimit:   getInt("APP_OTP_START_PER_PHONE_LIMIT", 5),
+		OTPStartPerIPLimit:      getInt("APP_OTP_START_PER_IP_LIMIT", 20),
+		OTPStartPerSubnetLimit:  getInt("APP_OTP_START_PER_SUBNET_LIMIT", 100),
+		OTPVerifyWindow:         time.Duration(getInt("APP_OTP_VERIFY_WINDOW_MINUTES", 10)) * time.Minute,
+		OTPVerifyPerChallenge:   getInt("APP_OTP_VERIFY_PER_CHALLENGE_LIMIT", 10),
+		OTPVerifyPerIP:          getInt("APP_OTP_VERIFY_PER_IP_LIMIT", 50),
+		OTPVerifyPerDevice:      getInt("APP_OTP_VERIFY_PER_DEVICE_LIMIT", 10),
+		OTPVerifyPerPhone:       getInt("APP_OTP_VERIFY_PER_PHONE_LIMIT", 10),
 		APIDeprecation:          get("APP_API_DEPRECATION", ""),
 		APISunset:               get("APP_API_SUNSET", ""),
 		MiniappPublicKeyPEM:     get("APP_MINIAPP_PUBLIC_KEY_PEM", ""),
@@ -114,6 +155,11 @@ func Load() Config {
 		EnableMediaPipeline:     getBool("APP_ENABLE_MEDIA_PIPELINE_V1", false),
 		EnableWebPush:           getBool("APP_ENABLE_WEB_PUSH_V1", false),
 		RequireRelayAttestation: getBool("APP_REQUIRE_RELAY_ATTESTATION", false),
+		DeviceAttestationSecret: get("APP_DEVICE_ATTESTATION_SECRET", ""),
+		AttestationAndroidAppID: get("APP_ATTESTATION_ANDROID_APP_ID", ""),
+		AttestationIOSAppID:     get("APP_ATTESTATION_IOS_APP_ID", ""),
+		AttestationWebAppID:     get("APP_ATTESTATION_WEB_APP_ID", ""),
+		AttestationChallengeTTL: time.Duration(getInt("APP_ATTESTATION_CHALLENGE_TTL_MINUTES", 10)) * time.Minute,
 		UseRealOTPProvider:      getBool("APP_USE_REAL_OTP_PROVIDER", false),
 		OTPProvider:             get("APP_OTP_PROVIDER", "dev"),
 		OTPFrom:                 get("APP_OTP_FROM", ""),
@@ -121,11 +167,19 @@ func Load() Config {
 		TwilioAuthToken:         get("APP_TWILIO_AUTH_TOKEN", ""),
 		TwilioMessagingService:  get("APP_TWILIO_MESSAGING_SERVICE_SID", ""),
 		MediaRootDir:            get("APP_MEDIA_ROOT_DIR", "var/media"),
+		MiniappRootDir:          get("APP_MINIAPP_ROOT_DIR", "var/miniapps"),
 		MediaPublicBaseURL:      get("APP_MEDIA_PUBLIC_BASE_URL", "http://localhost:18080"),
 		WebPushVAPIDPublicKey:   get("APP_WEB_PUSH_VAPID_PUBLIC_KEY", ""),
 		WebPushVAPIDPrivateKey:  get("APP_WEB_PUSH_VAPID_PRIVATE_KEY", ""),
 		WebPushSubject:          get("APP_WEB_PUSH_SUBJECT", "mailto:devnull@localhost"),
 		PushSubscriptionKey:     get("APP_PUSH_SUBSCRIPTION_KEY", ""),
+		FirebaseProjectID:       get("APP_FIREBASE_PROJECT_ID", ""),
+		FirebaseCredentialsPath: get("APP_FIREBASE_CREDENTIALS_PATH", ""),
+		APNsCertPath:            get("APP_APNS_CERT_PATH", ""),
+		APNsKeyPath:             get("APP_APNS_KEY_PATH", ""),
+		APNsBundleID:            get("APP_APNS_BUNDLE_ID", ""),
+		APNsTeamID:              get("APP_APNS_TEAM_ID", ""),
+		APNsKeyID:               get("APP_APNS_KEY_ID", ""),
 	}
 }
 

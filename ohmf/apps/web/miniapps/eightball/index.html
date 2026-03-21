@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'self'"
+    />
+    <meta name="referrer" content="no-referrer" />
+    <title>Mystic 8-Ball</title>
+    <script src="../../runtime-config.js"></script>
+    <script src="../../asset-loader.js" data-css="./styles.css"></script>
+  </head>
+  <body>
+    <main id="app-shell" class="app-shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">Open Mini-App SDK Example</p>
+          <h1>Mystic 8-Ball</h1>
+          <p class="subcopy">Uses launch context, session storage, shared session state, recent conversation context, and projected messages.</p>
+        </div>
+        <p id="status-pill" class="status-pill">Finding the future...</p>
+      </header>
+
+      <section class="stage-grid">
+        <article class="ball-card">
+          <div class="ball-shell">
+            <div class="ball-core">
+              <p class="ball-label">Answer</p>
+              <p id="answer-text" class="answer-text">Ask a question</p>
+            </div>
+          </div>
+          <div class="button-strip">
+            <button id="ask-btn" type="button">Shake 8-Ball</button>
+            <button id="send-btn" type="button">Send To Thread</button>
+          </div>
+        </article>
+
+        <article class="card">
+          <p class="label">Question</p>
+          <label class="sr-only" for="question-input">Question</label>
+          <textarea id="question-input" rows="4" maxlength="220" placeholder="Will the SDK demo make sense?"></textarea>
+          <div class="meta-block">
+            <p id="viewer-line" class="meta-line">Viewer: unavailable</p>
+            <p id="participants-line" class="meta-line">Participants: unavailable</p>
+          </div>
+        </article>
+
+        <article class="card">
+          <p class="label">Shared Session</p>
+          <p id="shared-line" class="meta-line">No shared answer yet.</p>
+          <p id="count-line" class="meta-line">Questions asked: 0</p>
+          <div class="button-strip">
+            <button id="refresh-btn" type="button">Refresh Context</button>
+            <button id="load-draft-btn" type="button">Load Draft</button>
+            <button id="save-draft-btn" type="button">Save Draft</button>
+          </div>
+        </article>
+      </section>
+
+      <section class="history-grid">
+        <article class="card">
+          <p class="label">Recent Answers</p>
+          <ul id="history-list" class="stack-list"></ul>
+        </article>
+
+        <article class="card">
+          <p class="label">Recent Thread Messages</p>
+          <ul id="message-list" class="stack-list"></ul>
+        </article>
+      </section>
+    </main>
+
+    <section id="preview-shell" class="preview-shell" hidden>
+      <div class="preview-card">
+        <p class="preview-kicker">Mystic 8-Ball</p>
+        <div class="preview-ball">
+          <div class="preview-answer-wrap">
+            <p id="preview-answer-text" class="preview-answer-text">Reply hazy, try again.</p>
+          </div>
+        </div>
+        <p id="preview-caption" class="preview-caption">Shared answer ready for the thread.</p>
+      </div>
+    </section>
+
+    <script type="module" src="./boot.js"></script>
+  </body>
+</html>

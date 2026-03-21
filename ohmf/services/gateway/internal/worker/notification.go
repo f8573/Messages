@@ -8,11 +8,11 @@ import (
 )
 
 type NotificationWorker struct {
-	svc  *notification.Service
+	svc  *notification.Handler
 	stop chan struct{}
 }
 
-func NewNotificationWorker(svc *notification.Service) *NotificationWorker {
+func NewNotificationWorker(svc *notification.Handler) *NotificationWorker {
 	return &NotificationWorker{svc: svc, stop: make(chan struct{})}
 }
 
@@ -27,7 +27,7 @@ func (n *NotificationWorker) Start(ctx context.Context) error {
 			return nil
 		default:
 		}
-		if n.svc != nil && n.svc.HasUsableWebPush() {
+		if n.svc != nil && n.svc.HasUsablePushProviders() {
 			_ = n.svc.DispatchPending(ctx, 25)
 		}
 		time.Sleep(1 * time.Second)

@@ -278,6 +278,7 @@ CREATE TABLE device_refresh_tokens (
 - Status: Partially implemented.
 - Evidence: `miniapp` service for manifest registration and session creation exists ([ohmf/services/gateway/internal/miniapp/service.go](ohmf/services/gateway/internal/miniapp/service.go#L1-L120) and handler.go). Manifest signature verification exists (RSA).
 - Gaps: No runtime sandbox, no permission enforcement at runtime, no manifest schema validation beyond presence of `signature` field, and no CI tests.
+  - TODO: Revisit the web iframe sandbox policy. The current `allow-scripts allow-same-origin` combination avoids the null-origin and local asset loading failures seen in development, but browsers correctly warn that it weakens sandbox isolation. Replace it with a safer runtime model such as origin-isolated hosting, asset bundling or inlining, or a stricter bridge/container design that does not require `allow-same-origin`.
   - Remediation: Add manifest JSON Schema under `ohmf/packages/protocol/openapi` and JSON schema validation in `miniapp/handler.go` using the middleware JSON schema system. Add a simple sandboxed runner for mini-apps or document runtime requirements. Add unit tests for manifest verification and signature acceptance/rejection.
   - Priority: Medium, Effort: 12–24h.
 

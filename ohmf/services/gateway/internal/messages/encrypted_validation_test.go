@@ -41,3 +41,15 @@ func TestValidateSendContentAcceptsSignalEnvelope(t *testing.T) {
 		t.Fatalf("expected valid signal envelope, got %v", err)
 	}
 }
+
+func TestValidateSendContentRejectsMalformedRichText(t *testing.T) {
+	err := validateSendContent("text", map[string]any{
+		"text": "hello",
+		"spans": []any{
+			map[string]any{"start": int64(0), "end": int64(9), "style": "bold"},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected invalid span range to be rejected")
+	}
+}
