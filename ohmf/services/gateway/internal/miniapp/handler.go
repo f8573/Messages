@@ -39,16 +39,6 @@ const (
 	maxMiniappTTLSeconds         = 24 * 60 * 60
 )
 
-func (h *Handler) cacheManifestIfPresent(ctx context.Context, userID string, payload map[string]any) {
-	if h == nil || h.Svc == nil || payload == nil {
-		return
-	}
-	manifest, ok := payload["manifest"].(map[string]any)
-	if !ok || len(manifest) == 0 {
-		return
-	}
-	_, _ = h.Svc.RegisterManifest(ctx, userID, manifest)
-}
 
 func statusOr(actual, fallback int) int {
 	if actual > 0 {
@@ -618,7 +608,11 @@ func (h *Handler) GetApp(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, statusOr(status, http.StatusBadGateway), "get_failed", err.Error(), nil)
 		return
 	}
-	h.cacheManifestIfPresent(r.Context(), userID, payload)
+	if h.Svc != nil && payload != nil {
+		if m, ok := payload["manifest"].(map[string]any); ok && len(m) > 0 {
+			_, _ = h.Svc.RegisterManifest(r.Context(), userID, m)
+		}
+	}
 	httpx.WriteJSON(w, http.StatusOK, payload)
 }
 
@@ -655,7 +649,11 @@ func (h *Handler) InstallApp(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, statusOr(status, http.StatusBadGateway), "install_failed", err.Error(), nil)
 		return
 	}
-	h.cacheManifestIfPresent(r.Context(), userID, payload)
+	if h.Svc != nil && payload != nil {
+		if m, ok := payload["manifest"].(map[string]any); ok && len(m) > 0 {
+			_, _ = h.Svc.RegisterManifest(r.Context(), userID, m)
+		}
+	}
 	httpx.WriteJSON(w, http.StatusOK, payload)
 }
 
