@@ -26,6 +26,7 @@ const state = {
   launchContext: null,
   sessionState: null,
   sessionMode: "local",
+  appOrigin: null, // P3.2: Isolated runtime origin (e.g., "a7f3e1c5.miniapp.local")
   logEntries: [],
 };
 
@@ -399,6 +400,8 @@ function applySessionRecord(record, mode) {
     shared_conversation_storage: record?.state?.shared_conversation_storage,
     projected_messages: record?.state?.projected_messages,
   });
+  // P3.2: Extract isolated origin from session response
+  state.appOrigin = record?.app_origin || null;
   state.launchContext = record?.launch_context || {
     app_id: state.manifest.app_id,
     app_session_id: record?.app_session_id || randomId("aps"),
@@ -509,21 +512,40 @@ async function initializeSession() {
 }
 
 function buildFrameUrl() {
-  const url = new URL(state.manifest.entrypoint.url, window.location.href);
+  // P3.2: For isolated origins, use the app_origin if available (requires DNS/infra setup)
+  // For local dev without isolated origin infrastructure, fall back to manifest entrypoint
+  let baseUrl = state.manifest.entrypoint.url;
+
+  // In production with isolated origin infrastructure, the app_origin would be used as:
+  // const protocol = new URL(state.manifest.entrypoint.url).protocol;
+  // baseUrl = `${protocol}//${state.appOrigin}` if state.appOrigin exists
+
+  const url = new URL(baseUrl, window.location.href);
   url.searchParams.set("channel", state.channelId);
   url.searchParams.set("parent_origin", window.location.origin);
   url.searchParams.set("app_id", state.manifest.app_id);
+  url.searchParams.set("app_origin", state.appOrigin || ""); // P3.2: Include origin for client-side validation
   return url.toString();
 }
 
 function launchFrame() {
   state.channelId = randomId("chan");
   state.frameWindow = null;
-  el.frame.setAttribute("sandbox", "allow-scripts allow-same-origin");
+  // P3.2: Sandbox attributes enforce isolation
+  // allow-scripts: required for app code execution
+  // allow-same-origin removed (P3.1): no direct host access via cookies/storage
+  el.frame.setAttribute("sandbox", "allow-scripts");
   el.frame.src = buildFrameUrl();
   const suffix = state.sessionMode === "gateway" ? " using gateway session." : " using local fallback session.";
-  setStatus(`Launching ${state.manifest.name}${suffix}`);
-  addLog("ok", "runtime.launch", { entrypoint: state.manifest.entrypoint.url, channel: state.channelId, mode: state.sessionMode });
+  const originNote = state.appOrigin ? ` (isolated: ${state.appOrigin})` : "";
+  setStatus(`Launching ${state.manifest.name}${suffix}${originNote}`);
+  addLog("ok", "runtime.launch", {
+    entrypoint: state.manifest.entrypoint.url,
+    app_origin: state.appOrigin,
+    channel: state.channelId,
+    mode: state.sessionMode,
+    sandbox: "allow-scripts",
+  });
 }
 
 function requirePermission(permission) {
@@ -805,10 +827,27 @@ async function loadAndLaunch(manifestUrl) {
 
 window.addEventListener("message", async (event) => {
   if (event.source !== el.frame.contentWindow) return;
-  if (state.manifest?.entrypoint?.url) {
-    const expectedOrigin = new URL(state.manifest.entrypoint.url, window.location.href).origin;
-    if (event.origin !== expectedOrigin) return;
+
+  // P3.2: Validate origin if isolated origin is available
+  // In production, this validates that the iframe is running at the expected isolated origin
+  if (state.appOrigin) {
+    const expectedOriginUrl = new URL(`http://${state.appOrigin}`);
+    const messageOrigin = new URL(event.origin);
+    if (messageOrigin.host !== expectedOriginUrl.host) {
+      addLog("error", "runtime.invalid_origin", {
+        expected: expectedOriginUrl.host,
+        received: messageOrigin.host,
+      });
+      return;
+    }
+  } else {
+    // Fallback: validate against manifest entrypoint origin
+    if (state.manifest?.entrypoint?.url) {
+      const expectedOrigin = new URL(state.manifest.entrypoint.url, window.location.href).origin;
+      if (event.origin !== expectedOrigin) return;
+    }
   }
+
   const message = event.data;
   if (!message || typeof message !== "object") return;
   if (message.channel !== state.channelId) return;
