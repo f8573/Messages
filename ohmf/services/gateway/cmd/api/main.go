@@ -393,6 +393,7 @@ func main() {
 			protected.Delete("/miniapps/sessions/{id}", miniappHandler.EndSession)
 			protected.Post("/miniapps/sessions/{id}/join", miniappHandler.JoinSession)
 			protected.Post("/miniapps/sessions/{id}/events", miniappHandler.AppendEvent)
+			protected.Get("/miniapps/sessions/{id}/events", miniappHandler.GetSessionEvents)
 			protected.Post("/miniapps/sessions/{id}/snapshot", miniappHandler.Snapshot)
 			protected.Post("/miniapps/shares", miniappHandler.Share)
 			// Spec aliases: /apps/... map to miniapp handlers
@@ -402,6 +403,7 @@ func main() {
 			protected.Post("/apps/sessions/{id}/join", miniappHandler.JoinSession)
 			protected.Post("/apps/register", miniappHandler.RegisterManifest)
 			protected.Post("/apps/sessions/{id}/events", miniappHandler.AppendEvent)
+			protected.Get("/apps/sessions/{id}/events", miniappHandler.GetSessionEvents)
 			protected.Post("/apps/sessions/{id}/snapshot", miniappHandler.Snapshot)
 			protected.Post("/apps/shares", miniappHandler.Share)
 			protected.Get("/apps", miniappHandler.ListApps)

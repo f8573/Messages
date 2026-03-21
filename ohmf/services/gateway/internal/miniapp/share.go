@@ -23,6 +23,18 @@ var (
 	ErrMiniAppConsent     = errors.New("miniapp_consent_required")
 )
 
+// validateBridgeMethodWithRateLimit validates that a bridge method is allowed and not rate-limited.
+// This is part of P1.2 Capability Enforcement Layer.
+// For Phase 1, this is a simplified implementation that allows all granted capabilities.
+func validateBridgeMethodWithRateLimit(sessionID string, grantedCapabilities []string, methodName string) error {
+	// P1.2: TODO - implement full capability policy validation with rate limiting
+	// For now, if any capabilities are granted, the method is allowed
+	if len(grantedCapabilities) == 0 {
+		return ErrBridgeMethodNotAllowed
+	}
+	return nil
+}
+
 type ShareInput struct {
 	ManifestID         string
 	AppID              string
@@ -157,7 +169,8 @@ func (s *Service) AppendEventForUser(ctx context.Context, userID, sessionID, eve
 	// Log allowed capability call for audit trail
 	_ = s.auditLogCapabilityAllowed(ctx, userID, sessionID, eventName)
 
-	return s.AppendEvent(ctx, sessionID, userID, eventName, body)
+	// Append event (automatically logged with storage_updated type and bridge method name)
+	return s.AppendEvent(ctx, sessionID, userID, EventTypeStorageUpdated, eventName, body)
 }
 
 func (s *Service) SnapshotSessionForUser(ctx context.Context, userID, sessionID string, state any, version int) (int, error) {

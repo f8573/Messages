@@ -763,7 +763,7 @@ type SessionEvent struct {
 }
 
 // GetSessionEvents retrieves events for a session, optionally filtered by type and paginated by event_seq
-func (s *Service) GetSessionEvents(ctx context.Context, sessionID string, eventType *string, limit int, offset int) ([]SessionEvent, error) {
+func (s *Service) GetSessionEvents(ctx context.Context, sessionID string, eventType *string, limit int, offset int, sinceSeq *int64) ([]SessionEvent, error) {
 	if limit <= 0 {
 		limit = 100
 	}
@@ -781,13 +781,27 @@ func (s *Service) GetSessionEvents(ctx context.Context, sessionID string, eventT
 	`
 	args := []any{sessionID}
 
+	// Support cursor-based pagination with since_seq (preferred for polling)
+	if sinceSeq != nil {
+		query += ` AND event_seq > $` + fmt.Sprintf("%d", len(args)+1)
+		args = append(args, *sinceSeq)
+	} else if offset > 0 {
+		// Fallback to offset-based pagination for backward compatibility
+		query += ` AND event_seq > (
+			SELECT COALESCE(MAX(event_seq) - $` + fmt.Sprintf("%d", len(args)+1) + `, 0)
+			FROM miniapp_events
+			WHERE app_session_id = $1::uuid
+		)`
+		args = append(args, offset)
+	}
+
 	if eventType != nil && *eventType != "" {
 		query += ` AND event_type = $` + fmt.Sprintf("%d", len(args)+1)
 		args = append(args, *eventType)
 	}
 
-	query += ` ORDER BY event_seq ASC LIMIT $` + fmt.Sprintf("%d", len(args)+1) + ` OFFSET $` + fmt.Sprintf("%d", len(args)+2)
-	args = append(args, limit, offset)
+	query += ` ORDER BY event_seq ASC LIMIT $` + fmt.Sprintf("%d", len(args)+1)
+	args = append(args, limit)
 
 	rows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
@@ -856,7 +870,7 @@ func (s *Service) logSessionCreated(ctx context.Context, sessionID, actorID stri
 		"permissions":       permissions,
 		"participants":      participants,
 	}
-	_, err := s.AppendEvent(ctx, sessionID, actorID, EventTypeSessionCreated, metadata)
+	_, err := s.AppendEvent(ctx, sessionID, actorID, EventTypeSessionCreated, "", metadata)
 	return err
 }
 
@@ -866,7 +880,7 @@ func (s *Service) logSessionJoined(ctx context.Context, sessionID, actorID strin
 		"participant": participant,
 		"permissions": permissions,
 	}
-	_, err := s.AppendEvent(ctx, sessionID, actorID, EventTypeSessionJoined, metadata)
+	_, err := s.AppendEvent(ctx, sessionID, actorID, EventTypeSessionJoined, "", metadata)
 	return err
 }
 
@@ -876,7 +890,7 @@ func (s *Service) logStorageUpdated(ctx context.Context, sessionID, actorID, bri
 		"bridge_method": bridgeMethod,
 		"state_size":    stateSize,
 	}
-	_, err := s.AppendEvent(ctx, sessionID, actorID, EventTypeStorageUpdated, metadata)
+	_, err := s.AppendEvent(ctx, sessionID, actorID, EventTypeStorageUpdated, bridgeMethod, metadata)
 	return err
 }
 
@@ -886,7 +900,7 @@ func (s *Service) logSnapshotWritten(ctx context.Context, sessionID, actorID str
 		"state_version": stateVersion,
 		"state_size":    stateSize,
 	}
-	_, err := s.AppendEvent(ctx, sessionID, actorID, EventTypeSnapshotWritten, metadata)
+	_, err := s.AppendEvent(ctx, sessionID, actorID, EventTypeSnapshotWritten, "", metadata)
 	return err
 }
 
@@ -899,14 +913,16 @@ func (s *Service) logMessageProjected(ctx context.Context, sessionID, messageID 
 	if messageMetadata != nil {
 		metadata["message_metadata"] = messageMetadata
 	}
-	_, err := s.AppendEvent(ctx, sessionID, "", EventTypeMessageProjected, metadata)
+	_, err := s.AppendEvent(ctx, sessionID, "", EventTypeMessageProjected, "", metadata)
 	return err
 }
 
 // AppendEvent appends an event to a mini-app session's event log.
-func (s *Service) AppendEvent(ctx context.Context, sessionID, actorID, eventName string, body any) (int64, error) {
-	if eventName == "" {
-		return 0, fmt.Errorf("event_name required")
+// eventType must be one of the EventType* constants.
+// eventName is optional (used for custom event identification, e.g., bridge method names).
+func (s *Service) AppendEvent(ctx context.Context, sessionID, actorID, eventType, eventName string, body any) (int64, error) {
+	if eventType == "" {
+		return 0, fmt.Errorf("event_type required")
 	}
 	record, err := s.loadSessionRecord(ctx, sessionID)
 	if err != nil {
@@ -922,11 +938,12 @@ func (s *Service) AppendEvent(ctx context.Context, sessionID, actorID, eventName
 	var seq int64
 	err = s.db.QueryRow(
 		ctx,
-		`INSERT INTO miniapp_events (app_session_id, actor_user_id, event_name, body, created_at)
-		 VALUES ($1::uuid, $2::uuid, $3, $4::jsonb, now())
+		`INSERT INTO miniapp_events (app_session_id, actor_user_id, event_type, event_name, body, created_at)
+		 VALUES ($1::uuid, $2::uuid, $3::miniapp_event_type, $4, $5::jsonb, now())
 		 RETURNING event_seq`,
 		sessionID,
 		nullUUIDArg(actorID),
+		eventType,
 		eventName,
 		string(b),
 	).Scan(&seq)
@@ -1694,15 +1711,6 @@ func (s *Service) TerminateSessionsForRelease(ctx context.Context, appID, versio
 
 	// Send suspension event to each session and end it
 	for _, sessionID := range sessionIDs {
-		body := map[string]any{
-			"app_id":   appID,
-			"version":  version,
-			"reason":   reason,
-			"event_at": time.Now().UTC(),
-		}
-		// Append event (ignore errors, best-effort notification)
-		_, _ = s.AppendEvent(ctx, sessionID, "", "release.suspended", body)
-
 		// End the session gracefully
 		_ = s.EndSession(ctx, sessionID)
 	}
