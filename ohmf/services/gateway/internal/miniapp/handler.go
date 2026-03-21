@@ -1,7 +1,6 @@
 package miniapp
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -317,21 +316,30 @@ func (h *Handler) GetSessionEvents(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Parse since_seq for cursor-based polling (preferred over offset)
+	var sinceSeq *int64
+	if s := r.URL.Query().Get("since_seq"); s != "" {
+		if parsedS, err := strconv.ParseInt(s, 10, 64); err == nil {
+			sinceSeq = &parsedS
+		}
+	}
+
 	var eventTypePtr *string
 	if eventType != "" {
 		eventTypePtr = &eventType
 	}
 
-	events, err := h.Svc.GetSessionEvents(r.Context(), id, eventTypePtr, limit, offset)
+	events, err := h.Svc.GetSessionEvents(r.Context(), id, eventTypePtr, limit, offset, sinceSeq)
 	if err != nil {
 		httpx.WriteError(w, r, http.StatusInternalServerError, "events_failed", err.Error(), nil)
 		return
 	}
 
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
-		"events": events,
-		"limit":  limit,
-		"offset": offset,
+		"events":    events,
+		"limit":     limit,
+		"offset":    offset,
+		"since_seq": sinceSeq,
 	})
 }
 
