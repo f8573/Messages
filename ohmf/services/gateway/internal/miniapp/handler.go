@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"ohmf/services/gateway/internal/config"
 	"ohmf/services/gateway/internal/httpx"
 	"ohmf/services/gateway/internal/middleware"
 )
