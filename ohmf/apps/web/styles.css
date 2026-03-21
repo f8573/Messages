@@ -915,6 +915,10 @@ body {
   flex-wrap: wrap;
 }
 
+#miniapp-catalog-cards {
+  display: contents;
+}
+
 .miniapp-card {
   border: 1px solid rgba(31, 122, 80, 0.18);
   background: rgba(255, 255, 255, 0.85);

@@ -40,6 +40,8 @@ const SIGNAL_PREKEY_REPLENISH_AT = 20;
 const CRYPTO_DB_NAME = "ohmf.crypto";
 const CRYPTO_DB_VERSION = 1;
 const CRYPTO_DEVICE_STORE = "device_state";
+const MINIAPP_CONSENT_STORAGE_PREFIX = "ohmf.miniapp.consent.v1";
+const DECRYPTED_MESSAGE_CACHE_LIMIT = 500;
 const SMS_DELIVERY_STATUSES = Object.freeze({
   SENT: "SENT",
   FAIL_SEND: "FAIL_SEND",
@@ -52,12 +54,18 @@ const OHMF_DELIVERY_STATUSES = Object.freeze({
   FAIL_SEND: "FAIL_SEND",
 });
 const LIVE_SYNC_INTERVAL_MS = 5000;
-const MINIAPP_CATALOG = Object.freeze([
+const BUILTIN_DEV_MINIAPP_CATALOG = Object.freeze([
   {
     appId: "app.ohmf.counter-lab",
     manifestUrl: "./miniapps/counter/manifest.json",
     title: "Counter Lab",
     summary: "Shared state demo with projected messages.",
+  },
+  {
+    appId: "app.ohmf.eightball",
+    manifestUrl: "./miniapps/eightball/manifest.json",
+    title: "Mystic 8-Ball",
+    summary: "Open-source SDK demo with shared answers and projected summaries.",
   },
 ]);
 
@@ -75,6 +83,8 @@ const state = {
     drawerOpen: false,
     popupOpen: false,
     selectedAppId: "",
+    catalog: [],
+    catalogLoaded: false,
     manifest: null,
     launchContext: null,
     sessionState: null,
@@ -84,6 +94,8 @@ const state = {
     sessionMode: "idle",
     consentRequired: false,
     lastShareError: "",
+    loading: false,
+    loadTimer: 0,
   },
   sync: {
     deviceId: "",
@@ -95,6 +107,8 @@ const state = {
     device: null,
     published: false,
     bundleCache: {},
+    decryptedMessageCache: {},
+    decryptChain: Promise.resolve(),
   },
 };
 let liveSyncInFlight = false;
@@ -151,7 +165,7 @@ const el = {
   miniappWindowCloseBtn: document.getElementById("miniapp-window-close-btn"),
   miniappPicker: document.getElementById("miniapp-picker"),
   miniappUploadCard: document.getElementById("miniapp-upload-card"),
-  miniappCounterCard: document.getElementById("miniapp-counter-card"),
+  miniappCatalogCards: document.getElementById("miniapp-catalog-cards"),
   miniappStage: document.getElementById("miniapp-stage"),
   miniappPreviewTitle: document.getElementById("miniapp-preview-title"),
   miniappPreviewSubtitle: document.getElementById("miniapp-preview-subtitle"),
@@ -997,6 +1011,140 @@ function recipientHeaderSummary(recipients) {
     .join(";");
 }
 
+function encryptedRecipientCacheKey(recipient) {
+  return [
+    sanitizeText(recipient?.user_id, 80),
+    sanitizeText(recipient?.device_id, 80),
+    sanitizeText(recipient?.wrap_nonce, 4000),
+    sanitizeText(recipient?.wrapped_key, 12000),
+    sanitizeText(recipient?.ratchet_public_key, 4000),
+    String(Number(recipient?.previous_chain_length || 0)),
+    String(Number(recipient?.message_number || 0)),
+    sanitizeText(recipient?.initial_session?.sender_ephemeral_public_key, 4000),
+    String(Number(recipient?.initial_session?.signed_prekey_id || 0)),
+    String(Number(recipient?.initial_session?.one_time_prekey_id || 0)),
+  ].join(":");
+}
+
+function encryptedEnvelopeFingerprint(message) {
+  if (sanitizeText(message?.contentType, 40) !== CONTENT_TYPE_ENCRYPTED) return "";
+  const envelope = message?.content && typeof message.content === "object" ? message.content : {};
+  const encryption = envelope.encryption && typeof envelope.encryption === "object" ? envelope.encryption : {};
+  const recipients = Array.isArray(encryption.recipients) ? encryption.recipients : [];
+  return [
+    sanitizeText(message?.id, 80),
+    sanitizeText(encryption.scheme, 120),
+    sanitizeText(encryption.sender_user_id, 80),
+    sanitizeText(encryption.sender_device_id, 80),
+    sanitizeText(encryption.sender_signature, 8000),
+    String(Number(encryption.conversation_epoch || 1)),
+    sanitizeText(envelope.nonce, 4000),
+    sanitizeText(envelope.ciphertext, 16000),
+    recipients.map(encryptedRecipientCacheKey).sort().join(";"),
+  ].join("|");
+}
+
+function applyDecryptedMessageView(message, cached) {
+  if (!message || !cached) return message;
+  const contentType = sanitizeText(cached.contentType, 40) || CONTENT_TYPE_TEXT;
+  const content = cached.content && typeof cached.content === "object"
+    ? cloneJson(cached.content)
+    : { text: sanitizeText(cached.content, 1000) };
+  return {
+    ...message,
+    text: sanitizeText(cached.text || content?.text || "[Encrypted message]", 1000),
+    contentType,
+    content,
+    isEncrypted: true,
+    decryptStatus: sanitizeText(cached.decryptStatus, 24) || "ok",
+  };
+}
+
+function cachedDecryptedMessage(messageOrFingerprint) {
+  const fingerprint = typeof messageOrFingerprint === "string"
+    ? sanitizeText(messageOrFingerprint, 24000)
+    : encryptedEnvelopeFingerprint(messageOrFingerprint);
+  if (!fingerprint) return null;
+  const cached = state.crypto.decryptedMessageCache?.[fingerprint];
+  return cached && typeof cached === "object" ? cached : null;
+}
+
+function rememberDecryptedMessage(message) {
+  const fingerprint = encryptedEnvelopeFingerprint(message);
+  if (!fingerprint || sanitizeText(message?.decryptStatus, 24) !== "ok") return;
+  const next = {
+    ...(state.crypto.decryptedMessageCache || {}),
+    [fingerprint]: {
+      text: sanitizeText(message.text, 1000),
+      contentType: sanitizeText(message.contentType, 40) || CONTENT_TYPE_TEXT,
+      content: cloneJson(message.content || {}),
+      decryptStatus: "ok",
+      cachedAt: nowISO(),
+    },
+  };
+  const keys = Object.keys(next);
+  if (keys.length > DECRYPTED_MESSAGE_CACHE_LIMIT) {
+    keys
+      .sort((a, b) => new Date(next[a]?.cachedAt || 0).getTime() - new Date(next[b]?.cachedAt || 0).getTime())
+      .slice(0, keys.length - DECRYPTED_MESSAGE_CACHE_LIMIT)
+      .forEach((key) => {
+        delete next[key];
+      });
+  }
+  state.crypto.decryptedMessageCache = next;
+}
+
+function cacheEncryptedMessagePlaintext(messageId, envelope, plainContentType, plainContent, fallbackText) {
+  const fingerprint = encryptedEnvelopeFingerprint({
+    id: sanitizeText(messageId, 80),
+    contentType: CONTENT_TYPE_ENCRYPTED,
+    content: envelope && typeof envelope === "object" ? envelope : {},
+  });
+  if (!fingerprint) return;
+  const next = {
+    ...(state.crypto.decryptedMessageCache || {}),
+    [fingerprint]: {
+      text: sanitizeText(
+        fallbackText || plainContent?.text || plainContent?.file_name || plainContent?.attachment_id || "[Encrypted message]",
+        1000
+      ),
+      contentType: sanitizeText(plainContentType, 40) || CONTENT_TYPE_TEXT,
+      content: cloneJson(plainContent || {}),
+      decryptStatus: "ok",
+      cachedAt: nowISO(),
+    },
+  };
+  const keys = Object.keys(next);
+  if (keys.length > DECRYPTED_MESSAGE_CACHE_LIMIT) {
+    keys
+      .sort((a, b) => new Date(next[a]?.cachedAt || 0).getTime() - new Date(next[b]?.cachedAt || 0).getTime())
+      .slice(0, keys.length - DECRYPTED_MESSAGE_CACHE_LIMIT)
+      .forEach((key) => {
+        delete next[key];
+      });
+  }
+  state.crypto.decryptedMessageCache = next;
+}
+
+function queueCryptoDecrypt(task) {
+  const chain = state.crypto?.decryptChain instanceof Promise ? state.crypto.decryptChain : Promise.resolve();
+  const next = chain
+    .catch(() => {})
+    .then(() => task());
+  state.crypto.decryptChain = next.catch(() => {});
+  return next;
+}
+
+function canReuseDecryptedMessage(existingMessage, mappedMessage) {
+  return Boolean(
+    existingMessage
+    && mappedMessage
+    && sanitizeText(existingMessage.decryptStatus, 24) === "ok"
+    && sanitizeText(existingMessage.encryptedEnvelopeFingerprint, 24000)
+    && existingMessage.encryptedEnvelopeFingerprint === mappedMessage.encryptedEnvelopeFingerprint
+  );
+}
+
 function ratchetSignaturePayloadForEnvelope({ scheme, conversationEpoch, nonce, ciphertext, recipients }) {
   return [
     String(scheme || ""),
@@ -1380,6 +1528,8 @@ async function encryptConversationContent(thread, plainContent, innerContentType
 
 async function decryptConversationContent(message) {
   if (sanitizeText(message?.contentType, 40) !== CONTENT_TYPE_ENCRYPTED) return message;
+  const cached = cachedDecryptedMessage(message);
+  if (cached) return applyDecryptedMessageView(message, cached);
   const envelope = message.content && typeof message.content === "object" ? message.content : {};
   const encryption = envelope.encryption && typeof envelope.encryption === "object" ? envelope.encryption : {};
   const recipients = Array.isArray(encryption.recipients) ? encryption.recipients : [];
@@ -1390,61 +1540,184 @@ async function decryptConversationContent(message) {
       text: "[Encrypted message for another device]",
       content: { text: "[Encrypted message for another device]" },
       isEncrypted: true,
+      decryptStatus: "other_device",
     };
   }
 
-  try {
-    let device = await ensureCryptoDeviceState();
-    const scheme = sanitizeText(encryption.scheme || ENCRYPTION_SCHEME, 120);
-    if (scheme === LEGACY_ENCRYPTION_SCHEME) {
-      if (!device.legacyAgreementPrivateKeyJwk) throw new Error("Missing legacy key material");
-      const legacyDevice = {
-        agreementPrivateKeyJwk: device.legacyAgreementPrivateKeyJwk,
-        ratchetSessions: device.legacyRatchetSessions || {},
-      };
-      const legacyAgreementPrivateKey = await importECDHPrivateKey(legacyDevice.agreementPrivateKeyJwk);
+  return queueCryptoDecrypt(async () => {
+    try {
+      let device = await ensureCryptoDeviceState();
+      const scheme = sanitizeText(encryption.scheme || ENCRYPTION_SCHEME, 120);
+      if (scheme === LEGACY_ENCRYPTION_SCHEME) {
+        if (!device.legacyAgreementPrivateKeyJwk) throw new Error("Missing legacy key material");
+        const legacyDevice = {
+          agreementPrivateKeyJwk: device.legacyAgreementPrivateKeyJwk,
+          ratchetSessions: device.legacyRatchetSessions || {},
+        };
+        const legacyAgreementPrivateKey = await importECDHPrivateKey(legacyDevice.agreementPrivateKeyJwk);
+        let wrapKey;
+        const ratchetPublicKey = sanitizeText(recipient.ratchet_public_key, 4000);
+        if (ratchetPublicKey) {
+          const senderUserId = sanitizeText(encryption.sender_user_id, 80);
+          const senderDeviceId = sanitizeText(encryption.sender_device_id, 80);
+          const senderBundles = await refetchDeviceBundles(senderUserId);
+          const senderBundle = senderBundles.find((item) => sanitizeText(item?.device_id, 80) === senderDeviceId) || {};
+          const signingPublicKeyValue = sanitizeText(senderBundle?.signing_public_key, 4000);
+          if (signingPublicKeyValue) {
+            try {
+              const signingPublicKey = await importECDSAPublicKey(signingPublicKeyValue);
+              const valid = await verifyDetached(
+                signingPublicKey,
+                ratchetSignaturePayloadForEnvelope({
+                  scheme,
+                  conversationEpoch: Number(encryption.conversation_epoch || 1),
+                  nonce: String(envelope.nonce || ""),
+                  ciphertext: String(envelope.ciphertext || ""),
+                  recipients,
+                }),
+                sanitizeText(encryption.sender_signature, 8000)
+              );
+              if (!valid) throw new Error("Invalid legacy sender signature");
+            } catch {}
+          }
+          let session = getRatchetSession(legacyDevice, senderUserId, senderDeviceId) || normalizeRatchetSession(null, legacyDevice);
+          let messageKey = takeSkippedMessageKey(session, ratchetPublicKey, Number(recipient.message_number || 0));
+          if (!messageKey) {
+            if (session.remoteRatchetPublicKey !== ratchetPublicKey || !session.receiveChainKey) {
+              const initialInbound = !session.receiveChainKey;
+              const localPrivateKey = await importECDHPrivateKey(
+                initialInbound ? legacyDevice.agreementPrivateKeyJwk : (session.localRatchetPrivateKeyJwk || legacyDevice.agreementPrivateKeyJwk)
+              );
+              const remotePublicKey = await importECDHPublicKey(ratchetPublicKey);
+              const sharedSecret = await deriveSharedSecretBytes(localPrivateKey, remotePublicKey);
+              let rootBase = session.rootKey;
+              if (initialInbound) {
+                const senderAgreementPublicKey = await importECDHPublicKey(sanitizeText(encryption.sender_identity_public_key, 4000));
+                const handshakeSharedSecret = await deriveSharedSecretBytes(legacyAgreementPrivateKey, senderAgreementPublicKey);
+                const handshake = await kdfRoot("", handshakeSharedSecret);
+                rootBase = handshake.rootKey;
+              }
+              const next = await kdfRoot(rootBase, sharedSecret);
+              session.rootKey = next.rootKey;
+              session.receiveChainKey = next.chainKey;
+              session.receiveCount = 0;
+              session.remoteRatchetPublicKey = ratchetPublicKey;
+              session.pendingRatchet = true;
+            }
+            const targetNumber = Number(recipient.message_number || 0);
+            while (Number(session.receiveCount || 0) < targetNumber) {
+              const skipped = await kdfChain(session.receiveChainKey);
+              stashSkippedMessageKey(session, ratchetPublicKey, session.receiveCount, skipped.messageKey);
+              session.receiveChainKey = skipped.nextChainKey;
+              session.receiveCount = Number(session.receiveCount || 0) + 1;
+            }
+            const current = await kdfChain(session.receiveChainKey);
+            messageKey = current.messageKey;
+            session.receiveChainKey = current.nextChainKey;
+            session.receiveCount = Number(session.receiveCount || 0) + 1;
+          }
+          device = persistCryptoDeviceState({
+            ...device,
+            legacyRatchetSessions: {
+              ...(device.legacyRatchetSessions || {}),
+              ...legacyDevice.ratchetSessions,
+              [ratchetSessionId(senderUserId, senderDeviceId)]: session,
+            },
+          });
+          wrapKey = await importAESKey(base64ToBytes(messageKey), ["decrypt"]);
+        } else {
+          const peerPublicKey = await importECDHPublicKey(sanitizeText(encryption.sender_identity_public_key, 4000));
+          wrapKey = await deriveWrapKey(legacyAgreementPrivateKey, peerPublicKey);
+        }
+        const contentKeyRaw = await window.crypto.subtle.decrypt(
+          { name: "AES-GCM", iv: base64ToBytes(recipient.wrap_nonce) },
+          wrapKey,
+          base64ToBytes(recipient.wrapped_key)
+        );
+        const contentKey = await importAESKey(new Uint8Array(contentKeyRaw), ["decrypt"]);
+        const plaintext = await window.crypto.subtle.decrypt(
+          { name: "AES-GCM", iv: base64ToBytes(envelope.nonce) },
+          contentKey,
+          base64ToBytes(envelope.ciphertext)
+        );
+        const decoded = JSON.parse(new TextDecoder().decode(plaintext));
+        const innerContentType = sanitizeText(decoded?.content_type, 40) || CONTENT_TYPE_TEXT;
+        const innerContent = decoded && typeof decoded.body === "object" ? decoded.body : decoded?.body || decoded || {};
+        const decrypted = {
+          ...message,
+          text: sanitizeText(innerContent?.text || "[Legacy encrypted message]", 1000),
+          contentType: innerContentType,
+          content: innerContent && typeof innerContent === "object" ? innerContent : { text: sanitizeText(innerContent, 1000) },
+          isEncrypted: true,
+          decryptStatus: "ok",
+        };
+        rememberDecryptedMessage(decrypted);
+        return decrypted;
+      }
+
+      const agreementPrivateKey = await signalImportAgreementPrivateKey(device.agreementPrivateKeyJwk);
       let wrapKey;
       const ratchetPublicKey = sanitizeText(recipient.ratchet_public_key, 4000);
-      if (ratchetPublicKey) {
+      if (ratchetPublicKey && sanitizeText(encryption.sender_signature, 8000)) {
         const senderUserId = sanitizeText(encryption.sender_user_id, 80);
         const senderDeviceId = sanitizeText(encryption.sender_device_id, 80);
         const senderBundles = await refetchDeviceBundles(senderUserId);
-        const senderBundle = senderBundles.find((item) => sanitizeText(item?.device_id, 80) === senderDeviceId) || {};
+        const senderBundle = senderBundles.find((item) => sanitizeText(item?.device_id, 80) === senderDeviceId);
         const signingPublicKeyValue = sanitizeText(senderBundle?.signing_public_key, 4000);
-        if (signingPublicKeyValue) {
-          try {
-            const signingPublicKey = await importECDSAPublicKey(signingPublicKeyValue);
-            const valid = await verifyDetached(
-              signingPublicKey,
-              ratchetSignaturePayloadForEnvelope({
-                scheme,
-                conversationEpoch: Number(encryption.conversation_epoch || 1),
-                nonce: String(envelope.nonce || ""),
-                ciphertext: String(envelope.ciphertext || ""),
-                recipients,
-              }),
-              sanitizeText(encryption.sender_signature, 8000)
-            );
-            if (!valid) throw new Error("Invalid legacy sender signature");
-          } catch {} // removed: descriptive compatibility comment
-        }
-        let session = getRatchetSession(legacyDevice, senderUserId, senderDeviceId) || normalizeRatchetSession(null, legacyDevice);
+        if (!signingPublicKeyValue) throw new Error("Missing sender signing key");
+        const signingPublicKey = await signalImportSigningPublicKey(signingPublicKeyValue);
+        const valid = await signalVerifyDetached(
+          signingPublicKey,
+          ratchetSignaturePayloadForEnvelope({
+            scheme,
+            conversationEpoch: Number(encryption.conversation_epoch || 1),
+            nonce: String(envelope.nonce || ""),
+            ciphertext: String(envelope.ciphertext || ""),
+            recipients,
+          }),
+          sanitizeText(encryption.sender_signature, 8000)
+        );
+        if (!valid) throw new Error("Invalid sender signature");
+
+        let session = getSignalRatchetSession(device, senderUserId, senderDeviceId) || normalizeSignalRatchetSession(null, device);
         let messageKey = takeSkippedMessageKey(session, ratchetPublicKey, Number(recipient.message_number || 0));
         if (!messageKey) {
           if (session.remoteRatchetPublicKey !== ratchetPublicKey || !session.receiveChainKey) {
-            const initialInbound = !session.receiveChainKey;
-            const localPrivateKey = await importECDHPrivateKey(
-              initialInbound ? legacyDevice.agreementPrivateKeyJwk : (session.localRatchetPrivateKeyJwk || legacyDevice.agreementPrivateKeyJwk)
-            );
-            const remotePublicKey = await importECDHPublicKey(ratchetPublicKey);
-            const sharedSecret = await deriveSharedSecretBytes(localPrivateKey, remotePublicKey);
+            const initialSession = recipient.initial_session && typeof recipient.initial_session === "object" ? recipient.initial_session : null;
+            let localPrivateKey;
             let rootBase = session.rootKey;
-            if (initialInbound) {
-              const senderAgreementPublicKey = await importECDHPublicKey(sanitizeText(encryption.sender_identity_public_key, 4000));
-              const handshakeSharedSecret = await deriveSharedSecretBytes(legacyAgreementPrivateKey, senderAgreementPublicKey);
-              const handshake = await kdfRoot("", handshakeSharedSecret);
-              rootBase = handshake.rootKey;
+            if (!session.receiveChainKey && initialSession?.sender_ephemeral_public_key) {
+              const senderIdentityPublicKey = await signalImportAgreementPublicKey(sanitizeText(encryption.sender_identity_public_key, 4000));
+              const senderEphemeralPublicKey = await signalImportAgreementPublicKey(sanitizeText(initialSession.sender_ephemeral_public_key, 4000));
+              const signedPrekeyPrivateKey = await signalImportAgreementPrivateKey(device.signedPrekeyPrivateKeyJwk);
+              const segments = [
+                await signalDeriveSharedSecretBytes(signedPrekeyPrivateKey, senderIdentityPublicKey),
+                await signalDeriveSharedSecretBytes(agreementPrivateKey, senderEphemeralPublicKey),
+                await signalDeriveSharedSecretBytes(signedPrekeyPrivateKey, senderEphemeralPublicKey),
+              ];
+              const oneTimePrekeyId = String(Number(initialSession.one_time_prekey_id || 0));
+              if (oneTimePrekeyId && device.oneTimePrekeys?.[oneTimePrekeyId]?.private_key_jwk) {
+                const oneTimePrivateKey = await signalImportAgreementPrivateKey(device.oneTimePrekeys[oneTimePrekeyId].private_key_jwk);
+                segments.push(await signalDeriveSharedSecretBytes(oneTimePrivateKey, senderEphemeralPublicKey));
+                device = persistCryptoDeviceState({
+                  ...device,
+                  oneTimePrekeys: {
+                    ...(device.oneTimePrekeys || {}),
+                    [oneTimePrekeyId]: {
+                      ...(device.oneTimePrekeys?.[oneTimePrekeyId] || {}),
+                      consumed_at: nowISO(),
+                    },
+                  },
+                });
+              }
+              const rootMaterial = await hkdfExpand(concatBytes(...segments), new Uint8Array(32), "OHMF_SIGNAL_X3DH_V1", 32);
+              rootBase = bytesToBase64(rootMaterial);
+              localPrivateKey = signedPrekeyPrivateKey;
+            } else {
+              localPrivateKey = await signalImportAgreementPrivateKey(session.localRatchetPrivateKeyJwk || device.signedPrekeyPrivateKeyJwk);
             }
+            const remotePublicKey = await signalImportAgreementPublicKey(ratchetPublicKey);
+            const sharedSecret = await signalDeriveSharedSecretBytes(localPrivateKey, remotePublicKey);
             const next = await kdfRoot(rootBase, sharedSecret);
             session.rootKey = next.rootKey;
             session.receiveChainKey = next.chainKey;
@@ -1453,6 +1726,9 @@ async function decryptConversationContent(message) {
             session.pendingRatchet = true;
           }
           const targetNumber = Number(recipient.message_number || 0);
+          if (targetNumber < Number(session.receiveCount || 0)) {
+            throw new Error("Missing skipped message key");
+          }
           while (Number(session.receiveCount || 0) < targetNumber) {
             const skipped = await kdfChain(session.receiveChainKey);
             stashSkippedMessageKey(session, ratchetPublicKey, session.receiveCount, skipped.messageKey);
@@ -1464,18 +1740,11 @@ async function decryptConversationContent(message) {
           session.receiveChainKey = current.nextChainKey;
           session.receiveCount = Number(session.receiveCount || 0) + 1;
         }
-        device = persistCryptoDeviceState({
-          ...device,
-          legacyRatchetSessions: {
-            ...(device.legacyRatchetSessions || {}),
-            ...legacyDevice.ratchetSessions,
-            [ratchetSessionId(senderUserId, senderDeviceId)]: session,
-          },
-        });
+        device = setSignalRatchetSession(device, senderUserId, senderDeviceId, session);
         wrapKey = await importAESKey(base64ToBytes(messageKey), ["decrypt"]);
       } else {
-        const peerPublicKey = await importECDHPublicKey(sanitizeText(encryption.sender_identity_public_key, 4000));
-        wrapKey = await deriveWrapKey(legacyAgreementPrivateKey, peerPublicKey);
+        const peerPublicKey = await signalImportAgreementPublicKey(device.agreementPublicKey);
+        wrapKey = await signalDeriveWrapKey(agreementPrivateKey, peerPublicKey);
       }
       const contentKeyRaw = await window.crypto.subtle.decrypt(
         { name: "AES-GCM", iv: base64ToBytes(recipient.wrap_nonce) },
@@ -1489,150 +1758,41 @@ async function decryptConversationContent(message) {
         base64ToBytes(envelope.ciphertext)
       );
       const decoded = JSON.parse(new TextDecoder().decode(plaintext));
-      const innerContentType = sanitizeText(decoded?.content_type, 40) || CONTENT_TYPE_TEXT;
-      const innerContent = decoded && typeof decoded.body === "object" ? decoded.body : decoded?.body || decoded || {};
-      return {
+      const innerContentType = sanitizeText(decoded?.content_type, 40)
+        || (decoded?.body && typeof decoded.body === "object" && decoded.body?.attachment_id ? CONTENT_TYPE_ATTACHMENT : "")
+        || (decoded && typeof decoded === "object" && decoded?.attachment_id ? CONTENT_TYPE_ATTACHMENT : "")
+        || CONTENT_TYPE_TEXT;
+      const innerContent = decoded && typeof decoded.body === "object"
+        ? decoded.body
+        : decoded?.body !== undefined
+        ? decoded.body
+        : decoded && typeof decoded === "object"
+        ? decoded
+        : { text: sanitizeText(decoded, 1000) };
+      const fallbackText = innerContentType === CONTENT_TYPE_ATTACHMENT
+        ? sanitizeText(innerContent?.file_name || innerContent?.attachment_id || "Attachment", 1000)
+        : sanitizeText(innerContent?.text || "[Encrypted message]", 1000);
+      const decrypted = {
         ...message,
-        text: sanitizeText(innerContent?.text || "[Legacy encrypted message]", 1000),
+        text: fallbackText,
         contentType: innerContentType,
         content: innerContent && typeof innerContent === "object" ? innerContent : { text: sanitizeText(innerContent, 1000) },
         isEncrypted: true,
+        decryptStatus: "ok",
+      };
+      rememberDecryptedMessage(decrypted);
+      return decrypted;
+    } catch (error) {
+      console.error(error);
+      return {
+        ...message,
+        text: "[Unable to decrypt message]",
+        content: { text: "[Unable to decrypt message]" },
+        isEncrypted: true,
+        decryptStatus: "error",
       };
     }
-
-    const agreementPrivateKey = await signalImportAgreementPrivateKey(device.agreementPrivateKeyJwk);
-    let wrapKey;
-    const ratchetPublicKey = sanitizeText(recipient.ratchet_public_key, 4000);
-    if (ratchetPublicKey && sanitizeText(encryption.sender_signature, 8000)) {
-      const senderUserId = sanitizeText(encryption.sender_user_id, 80);
-      const senderDeviceId = sanitizeText(encryption.sender_device_id, 80);
-      const senderBundles = await refetchDeviceBundles(senderUserId);
-      const senderBundle = senderBundles.find((item) => sanitizeText(item?.device_id, 80) === senderDeviceId);
-      const signingPublicKeyValue = sanitizeText(senderBundle?.signing_public_key, 4000);
-      if (!signingPublicKeyValue) throw new Error("Missing sender signing key");
-      const signingPublicKey = await signalImportSigningPublicKey(signingPublicKeyValue);
-      const valid = await signalVerifyDetached(
-        signingPublicKey,
-        ratchetSignaturePayloadForEnvelope({
-          scheme,
-          conversationEpoch: Number(encryption.conversation_epoch || 1),
-          nonce: String(envelope.nonce || ""),
-          ciphertext: String(envelope.ciphertext || ""),
-          recipients,
-        }),
-        sanitizeText(encryption.sender_signature, 8000)
-      );
-      if (!valid) throw new Error("Invalid sender signature");
-
-      let session = getSignalRatchetSession(device, senderUserId, senderDeviceId) || normalizeSignalRatchetSession(null, device);
-      let messageKey = takeSkippedMessageKey(session, ratchetPublicKey, Number(recipient.message_number || 0));
-      if (!messageKey) {
-        if (session.remoteRatchetPublicKey !== ratchetPublicKey || !session.receiveChainKey) {
-          const initialSession = recipient.initial_session && typeof recipient.initial_session === "object" ? recipient.initial_session : null;
-          let localPrivateKey;
-          let rootBase = session.rootKey;
-          if (!session.receiveChainKey && initialSession?.sender_ephemeral_public_key) {
-            const senderIdentityPublicKey = await signalImportAgreementPublicKey(sanitizeText(encryption.sender_identity_public_key, 4000));
-            const senderEphemeralPublicKey = await signalImportAgreementPublicKey(sanitizeText(initialSession.sender_ephemeral_public_key, 4000));
-            const signedPrekeyPrivateKey = await signalImportAgreementPrivateKey(device.signedPrekeyPrivateKeyJwk);
-            const segments = [
-              await signalDeriveSharedSecretBytes(signedPrekeyPrivateKey, senderIdentityPublicKey),
-              await signalDeriveSharedSecretBytes(agreementPrivateKey, senderEphemeralPublicKey),
-              await signalDeriveSharedSecretBytes(signedPrekeyPrivateKey, senderEphemeralPublicKey),
-            ];
-            const oneTimePrekeyId = String(Number(initialSession.one_time_prekey_id || 0));
-            if (oneTimePrekeyId && device.oneTimePrekeys?.[oneTimePrekeyId]?.private_key_jwk) {
-              const oneTimePrivateKey = await signalImportAgreementPrivateKey(device.oneTimePrekeys[oneTimePrekeyId].private_key_jwk);
-              segments.push(await signalDeriveSharedSecretBytes(oneTimePrivateKey, senderEphemeralPublicKey));
-              device = persistCryptoDeviceState({
-                ...device,
-                oneTimePrekeys: {
-                  ...(device.oneTimePrekeys || {}),
-                  [oneTimePrekeyId]: {
-                    ...(device.oneTimePrekeys?.[oneTimePrekeyId] || {}),
-                    consumed_at: nowISO(),
-                  },
-                },
-              });
-            }
-            const rootMaterial = await hkdfExpand(concatBytes(...segments), new Uint8Array(32), "OHMF_SIGNAL_X3DH_V1", 32);
-            rootBase = bytesToBase64(rootMaterial);
-            localPrivateKey = signedPrekeyPrivateKey;
-          } else {
-            localPrivateKey = await signalImportAgreementPrivateKey(session.localRatchetPrivateKeyJwk || device.signedPrekeyPrivateKeyJwk);
-          }
-          const remotePublicKey = await signalImportAgreementPublicKey(ratchetPublicKey);
-          const sharedSecret = await signalDeriveSharedSecretBytes(localPrivateKey, remotePublicKey);
-          const next = await kdfRoot(rootBase, sharedSecret);
-          session.rootKey = next.rootKey;
-          session.receiveChainKey = next.chainKey;
-          session.receiveCount = 0;
-          session.remoteRatchetPublicKey = ratchetPublicKey;
-          session.pendingRatchet = true;
-        }
-        const targetNumber = Number(recipient.message_number || 0);
-        if (targetNumber < Number(session.receiveCount || 0)) {
-          throw new Error("Missing skipped message key");
-        }
-        while (Number(session.receiveCount || 0) < targetNumber) {
-          const skipped = await kdfChain(session.receiveChainKey);
-          stashSkippedMessageKey(session, ratchetPublicKey, session.receiveCount, skipped.messageKey);
-          session.receiveChainKey = skipped.nextChainKey;
-          session.receiveCount = Number(session.receiveCount || 0) + 1;
-        }
-        const current = await kdfChain(session.receiveChainKey);
-        messageKey = current.messageKey;
-        session.receiveChainKey = current.nextChainKey;
-        session.receiveCount = Number(session.receiveCount || 0) + 1;
-      }
-      device = setSignalRatchetSession(device, senderUserId, senderDeviceId, session);
-      wrapKey = await importAESKey(base64ToBytes(messageKey), ["decrypt"]);
-    } else {
-      const peerPublicKey = await signalImportAgreementPublicKey(device.agreementPublicKey);
-      wrapKey = await signalDeriveWrapKey(agreementPrivateKey, peerPublicKey);
-    }
-    const contentKeyRaw = await window.crypto.subtle.decrypt(
-      { name: "AES-GCM", iv: base64ToBytes(recipient.wrap_nonce) },
-      wrapKey,
-      base64ToBytes(recipient.wrapped_key)
-    );
-    const contentKey = await importAESKey(new Uint8Array(contentKeyRaw), ["decrypt"]);
-    const plaintext = await window.crypto.subtle.decrypt(
-      { name: "AES-GCM", iv: base64ToBytes(envelope.nonce) },
-      contentKey,
-      base64ToBytes(envelope.ciphertext)
-    );
-    const decoded = JSON.parse(new TextDecoder().decode(plaintext));
-    const innerContentType = sanitizeText(decoded?.content_type, 40)
-      || (decoded?.body && typeof decoded.body === "object" && decoded.body?.attachment_id ? CONTENT_TYPE_ATTACHMENT : "")
-      || (decoded && typeof decoded === "object" && decoded?.attachment_id ? CONTENT_TYPE_ATTACHMENT : "")
-      || CONTENT_TYPE_TEXT;
-    const innerContent = decoded && typeof decoded.body === "object"
-      ? decoded.body
-      : decoded?.body !== undefined
-      ? decoded.body
-      : decoded && typeof decoded === "object"
-      ? decoded
-      : { text: sanitizeText(decoded, 1000) };
-    const fallbackText = innerContentType === CONTENT_TYPE_ATTACHMENT
-      ? sanitizeText(innerContent?.file_name || innerContent?.attachment_id || "Attachment", 1000)
-      : sanitizeText(innerContent?.text || "[Encrypted message]", 1000);
-    return {
-      ...message,
-      text: fallbackText,
-      contentType: innerContentType,
-      content: innerContent && typeof innerContent === "object" ? innerContent : { text: sanitizeText(innerContent, 1000) },
-      isEncrypted: true,
-    };
-  } catch (error) {
-    console.error(error);
-    return {
-      ...message,
-      text: "[Unable to decrypt message]",
-      content: { text: "[Unable to decrypt message]" },
-      isEncrypted: true,
-    };
-  }
+  });
 }
 
 function saveConversationStore() {
@@ -1669,6 +1829,10 @@ function loadConversationStore() {
       closed: Boolean(thread.closed),
       previewText: sanitizeText(thread.previewText, 180),
       unreadCount: Number(thread.unreadCount || 0),
+      deliveredThroughServerOrder: Number(thread.deliveredThroughServerOrder || 0),
+      deliveredStatusUpdatedAt: thread.deliveredStatusUpdatedAt || "",
+      readThroughServerOrder: Number(thread.readThroughServerOrder || 0),
+      readStatusUpdatedAt: thread.readStatusUpdatedAt || "",
       externalPhones: Array.isArray(thread.externalPhones) ? thread.externalPhones.map((p) => sanitizeText(p, 32)) : [],
       participants: Array.isArray(thread.participants) ? thread.participants.map((p) => sanitizeText(p, 80)) : [],
       messages: Array.isArray(thread.messages)
@@ -1868,7 +2032,7 @@ function randomId(prefix) {
 }
 
 function getMiniappCatalogEntry(appId = state.miniapp.selectedAppId) {
-  return MINIAPP_CATALOG.find((item) => item.appId === appId) || null;
+  return state.miniapp.catalog.find((item) => item.appId === appId) || null;
 }
 
 function miniappSupportReason(thread = getActiveThread()) {
@@ -1886,6 +2050,46 @@ function rewriteLocalDevEntrypoint(rawUrl) {
     url.host = `${window.location.hostname}:${window.location.port}`;
   }
   return url.toString();
+}
+
+function shouldBootstrapBuiltinMiniapps() {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get("dev_apps") === "1") return true;
+  if (window.localStorage.getItem("ohmf.dev_apps") === "1") return true;
+  return new Set(["localhost", "127.0.0.1"]).has(window.location.hostname) && Boolean(window.OHMF_RUNTIME_CONFIG?.developer_mode);
+}
+
+function normalizeMiniappCatalogEntry(raw) {
+  const manifest = raw?.manifest && typeof raw.manifest === "object" ? cloneJson(raw.manifest) : null;
+  if (manifest?.entrypoint?.url) {
+    manifest.entrypoint.url = rewriteLocalDevEntrypoint(manifest.entrypoint.url);
+  }
+  const install = raw?.install && typeof raw.install === "object" ? raw.install : {};
+  return {
+    appId: sanitizeText(raw?.app_id || manifest?.app_id, 120),
+    title: sanitizeText(manifest?.name || raw?.title || raw?.app_id, 120),
+    summary: sanitizeText(manifest?.metadata?.summary || raw?.summary || "", 220),
+    sourceType: sanitizeText(raw?.source_type, 40) || "external",
+    version: sanitizeText(raw?.version || manifest?.version, 40),
+    publishedAt: sanitizeText(raw?.published_at, 80),
+    reviewStatus: sanitizeText(raw?.review_status, 40) || "approved",
+    latestApprovedVersion: sanitizeText(raw?.latest_approved_version, 40),
+    latestVersion: sanitizeText(raw?.latest_version, 40),
+    updateAvailable: Boolean(raw?.update_available),
+    updateRequiresConsent: Boolean(raw?.update_requires_consent),
+    installState: sanitizeText(raw?.install_state, 60),
+    permissionDelta: {
+      added: Array.isArray(raw?.permission_delta?.added) ? raw.permission_delta.added.map((value) => sanitizeText(value, 120)).filter(Boolean) : [],
+      removed: Array.isArray(raw?.permission_delta?.removed) ? raw.permission_delta.removed.map((value) => sanitizeText(value, 120)).filter(Boolean) : [],
+    },
+    manifest,
+    install: {
+      installed: Boolean(install?.installed),
+      installedVersion: sanitizeText(install?.installed_version, 40),
+      autoUpdate: Boolean(install?.auto_update),
+      enabled: install?.enabled !== false,
+    },
+  };
 }
 
 function normalizeMiniappSessionState(raw) {
@@ -1907,6 +2111,62 @@ function normalizeMiniappSessionState(raw) {
   };
 }
 
+function miniappConsentKey(manifest) {
+  if (!manifest?.app_id || !manifest?.version) return "";
+  return `${MINIAPP_CONSENT_STORAGE_PREFIX}.${manifest.app_id}.${manifest.version}`;
+}
+
+function hasMiniappConsent(manifest) {
+  const key = miniappConsentKey(manifest);
+  return Boolean(key) && window.localStorage.getItem(key) === "granted";
+}
+
+function grantMiniappConsent(manifest) {
+  const key = miniappConsentKey(manifest);
+  if (key) {
+    window.localStorage.setItem(key, "granted");
+  }
+}
+
+function consentCopyForMiniapp(manifest, entry) {
+  const permissions = Array.isArray(manifest?.permissions) ? manifest.permissions : [];
+  const lines = [`${manifest?.name || entry?.title || "This app"} needs approval before it can run in this conversation.`];
+  if (permissions.length) {
+    lines.push("");
+    lines.push("Permissions:");
+    for (const permission of permissions) {
+      lines.push(`- ${permission}`);
+    }
+  }
+  if (entry?.updateRequiresConsent && entry.permissionDelta.added.length) {
+    lines.push("");
+    lines.push("New permissions in this update:");
+    for (const permission of entry.permissionDelta.added) {
+      lines.push(`- ${permission}`);
+    }
+  }
+  lines.push("");
+  lines.push("Continue?");
+  return lines.join("\n");
+}
+
+async function ensureMiniappConsent(manifest, entry) {
+  if (!manifest) throw new Error("Manifest is required before launch.");
+  const permissions = Array.isArray(manifest.permissions) ? manifest.permissions : [];
+  if (!permissions.length && !entry?.updateRequiresConsent) {
+    return true;
+  }
+  if (hasMiniappConsent(manifest)) {
+    return true;
+  }
+  const approved = window.confirm(consentCopyForMiniapp(manifest, entry));
+  if (!approved) {
+    throw new Error("Mini-app launch cancelled because permissions were not approved.");
+  }
+  grantMiniappConsent(manifest);
+  return true;
+}
+
 async function fetchMiniappManifest(manifestUrl) {
   const response = await fetch(manifestUrl, { cache: "no-store" });
   if (!response.ok) throw new Error(`Manifest request failed with ${response.status}`);
@@ -1916,22 +2176,73 @@ async function fetchMiniappManifest(manifestUrl) {
   return manifest;
 }
 
+async function bootstrapBuiltinMiniappCatalog() {
+  if (!state.auth || !shouldBootstrapBuiltinMiniapps()) return;
+  for (const entry of BUILTIN_DEV_MINIAPP_CATALOG) {
+    try {
+      const manifest = await fetchMiniappManifest(entry.manifestUrl);
+      await ensureMiniappManifestRegistered(manifest);
+    } catch (error) {
+      console.error(error);
+    }
+  }
+}
+
 async function ensureMiniappManifestRegistered(manifest) {
-  try {
-    return await apiRequest(`/v1/apps/${encodeURIComponent(manifest.app_id)}`, { method: "GET" });
-  } catch (error) {
-    if (error.status !== 404) throw error;
+  const catalog = await apiRequest("/v1/apps", { method: "GET" });
+  const existing = Array.isArray(catalog?.items)
+    ? catalog.items.find((item) => sanitizeText(item?.manifest?.app_id || item?.app_id, 120) === sanitizeText(manifest?.app_id, 120))
+    : null;
+  if (existing) {
+    return existing;
   }
   await apiRequest("/v1/apps/register", { method: "POST", body: JSON.stringify({ manifest }) });
   return apiRequest(`/v1/apps/${encodeURIComponent(manifest.app_id)}`, { method: "GET" });
 }
 
+async function loadMiniappCatalog(options = {}) {
+  if (!state.auth) return [];
+  if (options.bootstrapDev !== false) {
+    await bootstrapBuiltinMiniappCatalog();
+  }
+  const response = await apiRequest(`/v1/apps${shouldBootstrapBuiltinMiniapps() ? "?developer_mode=1" : ""}`, { method: "GET" });
+  const items = Array.isArray(response?.items)
+    ? response.items
+      .map(normalizeMiniappCatalogEntry)
+      .filter((item) => item.appId)
+      .sort((a, b) => {
+        if (a.install.installed !== b.install.installed) return a.install.installed ? -1 : 1;
+        if (a.updateAvailable !== b.updateAvailable) return a.updateAvailable ? -1 : 1;
+        return a.title.localeCompare(b.title);
+      })
+    : [];
+  state.miniapp.catalog = items;
+  state.miniapp.catalogLoaded = true;
+  if (!state.miniapp.selectedAppId && items.length) {
+    state.miniapp.selectedAppId = items[0].appId;
+  }
+  return items;
+}
+
 async function loadMiniappManifestByAppId(appId) {
-  const response = await apiRequest(`/v1/apps/${encodeURIComponent(appId)}`, { method: "GET" });
+  const response = await apiRequest(`/v1/apps/${encodeURIComponent(appId)}${shouldBootstrapBuiltinMiniapps() ? "?developer_mode=1" : ""}`, { method: "GET" });
   const manifest = response?.manifest;
   if (!manifest?.app_id || !manifest?.entrypoint?.url) throw new Error("invalid_manifest");
   manifest.entrypoint.url = rewriteLocalDevEntrypoint(manifest.entrypoint.url);
   return manifest;
+}
+
+async function ensureMiniappInstalled(appId, options = {}) {
+  if (!appId) return null;
+  const body = options.acceptPermissionChanges ? JSON.stringify({ accept_permission_changes: true }) : undefined;
+  const response = await apiRequest(`/v1/apps/${encodeURIComponent(appId)}/install`, { method: "POST", body });
+  const normalized = normalizeMiniappCatalogEntry(response);
+  const nextCatalog = state.miniapp.catalog.map((item) => (item.appId === normalized.appId ? { ...item, ...normalized } : item));
+  if (!nextCatalog.some((item) => item.appId === normalized.appId)) {
+    nextCatalog.push(normalized);
+  }
+  state.miniapp.catalog = nextCatalog;
+  return normalized;
 }
 
 function buildMiniappViewer(thread) {
@@ -1979,9 +2290,10 @@ async function ensureMiniappSession() {
   if (miniappSupportReason(thread)) throw new Error("Select a saved conversation first.");
   const entry = getMiniappCatalogEntry();
   if (!entry) throw new Error("Select an app first.");
-  const manifest = state.miniapp.manifest || await fetchMiniappManifest(entry.manifestUrl);
+  const manifest = state.miniapp.manifest || entry.manifest || await loadMiniappManifestByAppId(entry.appId);
+  await ensureMiniappConsent(manifest, entry);
+  const install = await ensureMiniappInstalled(entry.appId, { acceptPermissionChanges: entry?.updateRequiresConsent });
   state.miniapp.manifest = manifest;
-  await ensureMiniappManifestRegistered(manifest);
   const record = await apiRequest("/v1/apps/sessions", {
     method: "POST",
     body: JSON.stringify({
@@ -2020,6 +2332,7 @@ async function joinMiniappSession(sessionId) {
 
 async function persistMiniappSession(version, eventName, eventBody) {
   if (!state.miniapp.launchContext?.app_session_id) return 0;
+  const nextVersion = Math.max(1, Number(version || 0) + 1);
   const payload = await apiRequest(`/v1/apps/sessions/${encodeURIComponent(state.miniapp.launchContext.app_session_id)}/snapshot`, {
     method: "POST",
     body: JSON.stringify({
@@ -2029,7 +2342,7 @@ async function persistMiniappSession(version, eventName, eventBody) {
         shared_conversation_storage: cloneJson(state.miniapp.sessionState?.sharedConversationStorage || {}),
         projected_messages: cloneJson(state.miniapp.sessionState?.transcript || []),
       },
-      state_version: version,
+      state_version: nextVersion,
       capabilities_granted: Array.from(state.miniapp.grantedPermissions),
     }),
   });
@@ -2039,7 +2352,7 @@ async function persistMiniappSession(version, eventName, eventBody) {
       body: JSON.stringify({ event_name: eventName, body: eventBody || {} }),
     });
   }
-  return Number(payload?.state_version || version || 1);
+  return Number(payload?.state_version || nextVersion || 1);
 }
 
 async function shareMiniappToConversation() {
@@ -2052,7 +2365,9 @@ async function shareMiniappToConversation() {
   }
   const entry = getMiniappCatalogEntry();
   if (!entry) return;
-  const manifest = state.miniapp.manifest || await fetchMiniappManifest(entry.manifestUrl);
+  const manifest = state.miniapp.manifest || entry.manifest || await loadMiniappManifestByAppId(entry.appId);
+  await ensureMiniappConsent(manifest, entry);
+  const install = await ensureMiniappInstalled(entry.appId, { acceptPermissionChanges: entry?.updateRequiresConsent });
   state.miniapp.manifest = manifest;
   state.miniapp.lastShareError = "";
   let payload;
@@ -2126,6 +2441,26 @@ function buildMiniappFrameURL() {
   return url.toString();
 }
 
+function clearMiniappLoadTimeout() {
+  if (state.miniapp.loadTimer) {
+    window.clearTimeout(state.miniapp.loadTimer);
+    state.miniapp.loadTimer = 0;
+  }
+  state.miniapp.loading = false;
+}
+
+function startMiniappLoadTimeout() {
+  clearMiniappLoadTimeout();
+  state.miniapp.loading = true;
+  state.miniapp.loadTimer = window.setTimeout(() => {
+    state.miniapp.loadTimer = 0;
+    if (!state.miniapp.popupOpen) return;
+    state.miniapp.loading = false;
+    state.miniapp.lastShareError = "The mini-app runtime timed out while loading. Retry or close the app window.";
+    renderAll();
+  }, 10000);
+}
+
 function summarizeMiniappMessage(params) {
   const explicit = sanitizeText(params?.text, 220);
   if (explicit) return explicit;
@@ -2146,6 +2481,12 @@ async function handleMiniappBridgeCall(message) {
   switch (method) {
     case "host.getLaunchContext":
       return cloneJson(state.miniapp.launchContext);
+    case "host.getRuntimeConfig":
+      return {
+        asset_version: window.OHMF_RUNTIME_CONFIG?.asset_version || "dev",
+        api_base_url: window.OHMF_WEB_CONFIG?.api_base_url || API_BASE_URL || "http://localhost:18080",
+        developer_mode: window.OHMF_WEB_CONFIG?.developer_mode || false,
+      };
     case "conversation.readContext":
       requireMiniappPermission("conversation.read_context");
       return {
@@ -2284,6 +2625,10 @@ function mapConversation(item) {
     externalPhones: Array.isArray(item.external_phones) ? item.external_phones.map((v) => sanitizeText(v, 32)) : [],
     previewText: sanitizeText(item.last_message_preview, 180),
     unreadCount: Number(item.unread_count || 0),
+    deliveredThroughServerOrder: 0,
+    deliveredStatusUpdatedAt: "",
+    readThroughServerOrder: 0,
+    readStatusUpdatedAt: "",
     messages: [],
     loadedMessages: false,
   };
@@ -2300,6 +2645,13 @@ function mapMessage(item) {
   );
   const contentType = sanitizeText(item?.content_type, 40) || CONTENT_TYPE_TEXT;
   const content = item?.content && typeof item.content === "object" ? item.content : {};
+  const encryptedEnvelopeFingerprintValue = contentType === CONTENT_TYPE_ENCRYPTED
+    ? encryptedEnvelopeFingerprint({
+      id: sanitizeText(item?.message_id, 80),
+      contentType,
+      content,
+    })
+    : "";
   const deleted = Boolean(item?.deleted) || Boolean(item?.deleted_at) || sanitizeText(item?.visibility_state, 40) === "SOFT_DELETED";
   const fallbackText = deleted
     ? "Message deleted"
@@ -2327,12 +2679,19 @@ function mapMessage(item) {
     deletedAt: item.deleted_at || "",
     contentType,
     content,
+    encryptedEnvelopeFingerprint: encryptedEnvelopeFingerprintValue,
+    decryptStatus: "",
   };
 }
 
-async function materializeMessage(item) {
+async function materializeMessage(item, existingMessage = null) {
   const mapped = mapMessage(item);
   if (mapped.contentType !== CONTENT_TYPE_ENCRYPTED) return mapped;
+  if (canReuseDecryptedMessage(existingMessage, mapped)) {
+    return applyDecryptedMessageView(mapped, existingMessage);
+  }
+  const cached = cachedDecryptedMessage(mapped);
+  if (cached) return applyDecryptedMessageView(mapped, cached);
   return decryptConversationContent(mapped);
 }
 
@@ -2684,7 +3043,11 @@ async function loadMessagesForThread(threadId) {
   if (!thread || thread.kind === "draft_phone") return;
   const payload = await apiRequest(`/v1/conversations/${encodeURIComponent(threadId)}/messages`, { method: "GET" });
   const items = Array.isArray(payload?.items) ? payload.items : [];
-  const messages = await Promise.all(items.map(materializeMessage));
+  const existingMessages = new Map((thread.messages || []).map((message) => [message.id, message]));
+  const messages = await Promise.all(items.map((item) => materializeMessage(
+    item,
+    existingMessages.get(sanitizeText(item?.message_id, 80)) || null
+  )));
   upsertThread({
     ...thread,
     messages,
@@ -2786,25 +3149,67 @@ function applyConversationStateUpdate(payload) {
 function applyReceiptCheckpoint(kind, conversationId, throughServerOrder, updatedAt) {
   const thread = getThreadById(conversationId);
   if (!thread) return;
+  const checkpointAt = updatedAt || nowISO();
   const nextMessages = (thread.messages || []).map((message) => {
     if (message.direction !== "out" || Number(message.serverOrder || 0) > throughServerOrder) return message;
     if (kind === "READ") {
       return {
         ...message,
         status: OHMF_DELIVERY_STATUSES.READ,
-        readAt: updatedAt,
-        statusUpdatedAt: updatedAt,
+        readAt: checkpointAt,
+        statusUpdatedAt: checkpointAt,
       };
     }
     if (normalizeDeliveryStatus(message.transport, message.status) === OHMF_DELIVERY_STATUSES.READ) return message;
     return {
       ...message,
       status: OHMF_DELIVERY_STATUSES.DELIVERED,
-      deliveredAt: updatedAt,
-      statusUpdatedAt: updatedAt,
+      deliveredAt: checkpointAt,
+      statusUpdatedAt: checkpointAt,
     };
   });
-  upsertThread({ ...thread, messages: nextMessages, updatedAt: updatedAt || thread.updatedAt });
+  const nextThread = {
+    ...thread,
+    messages: nextMessages,
+    updatedAt: checkpointAt || thread.updatedAt,
+    deliveredThroughServerOrder: Math.max(Number(thread.deliveredThroughServerOrder || 0), throughServerOrder),
+    deliveredStatusUpdatedAt: checkpointAt,
+  };
+  if (kind === "READ") {
+    nextThread.readThroughServerOrder = Math.max(Number(thread.readThroughServerOrder || 0), throughServerOrder);
+    nextThread.readStatusUpdatedAt = checkpointAt;
+  }
+  upsertThread(nextThread);
+  saveConversationStore();
+  renderAll();
+}
+
+function applyStoredReceiptCheckpoint(thread, message) {
+  if (!thread || !message || message.direction !== "out") return message;
+  const serverOrder = Number(message.serverOrder || 0);
+  if (!serverOrder) return message;
+  const readThrough = Number(thread.readThroughServerOrder || 0);
+  const deliveredThrough = Number(thread.deliveredThroughServerOrder || 0);
+  if (readThrough && serverOrder <= readThrough) {
+    const readAt = thread.readStatusUpdatedAt || message.readAt || message.statusUpdatedAt || nowISO();
+    return {
+      ...message,
+      status: OHMF_DELIVERY_STATUSES.READ,
+      readAt,
+      statusUpdatedAt: readAt,
+    };
+  }
+  if (deliveredThrough && serverOrder <= deliveredThrough) {
+    if (normalizeDeliveryStatus(message.transport, message.status) === OHMF_DELIVERY_STATUSES.READ) return message;
+    const deliveredAt = thread.deliveredStatusUpdatedAt || message.deliveredAt || message.statusUpdatedAt || nowISO();
+    return {
+      ...message,
+      status: OHMF_DELIVERY_STATUSES.DELIVERED,
+      deliveredAt,
+      statusUpdatedAt: deliveredAt,
+    };
+  }
+  return message;
 }
 
 function applyMessageDeleted(payload) {
@@ -2861,7 +3266,8 @@ async function applyMessageEdited(payload) {
   if (!messageId) return;
 
   const editedAt = messagePayload?.edited_at || payload?.edited_at || nowISO();
-  const updatedMessage = await materializeMessage(messagePayload);
+  const existingMessage = thread.messages?.find((message) => message.id === messageId) || null;
+  const updatedMessage = await materializeMessage(messagePayload, existingMessage);
   updatedMessage.editedAt = editedAt;
 
   let found = false;
@@ -2901,7 +3307,9 @@ async function applyUserEvent(event) {
   if (eventType === "conversation_message_appended") {
     const thread = ensureThreadFromEvent(payload);
     if (!thread) return;
-    const nextMessage = await materializeMessage(payload?.message || {});
+    const messagePayload = payload?.message || {};
+    const existingMessage = thread.messages?.find((message) => message.id === sanitizeText(messagePayload?.message_id, 80)) || null;
+    const nextMessage = await materializeMessage(messagePayload, existingMessage);
     upsertThreadMessage(thread.id, nextMessage);
     if (!state.activeThreadId) {
       state.activeThreadId = thread.id;
@@ -3214,11 +3622,12 @@ function handleRealtimeEvent(eventName, payload) {
 async function applyIncomingMessage(payload) {
   const conversationId = sanitizeText(payload?.conversation_id, 80);
   if (!conversationId) return;
-  const nextMessage = await materializeMessage(payload);
+  const existingThread = getThreadById(conversationId);
+  const existingMessage = existingThread?.messages?.find((message) => message.id === sanitizeText(payload?.message_id, 80)) || null;
+  const nextMessage = await materializeMessage(payload, existingMessage);
   if (nextMessage.direction === "in") {
     setRemoteTyping(conversationId, sanitizeText(payload?.sender_user_id, 80), false);
   }
-  const existingThread = getThreadById(conversationId);
   if (existingThread) {
     upsertThreadMessage(conversationId, nextMessage);
     if (state.activeThreadId === conversationId) {
@@ -3594,6 +4003,7 @@ async function closeMiniappWindow() {
       state.miniapp.lastShareError = sanitizeText(error.message || "Unable to save app state.", 180);
     }
   }
+  clearMiniappLoadTimeout();
   state.miniapp.popupOpen = false;
   state.miniapp.frameWindow = null;
   el.miniappFrame.src = "about:blank";
@@ -3603,9 +4013,55 @@ function renderMiniappWindow() {
   const thread = getActiveThread();
   el.miniappWindow.classList.toggle("hidden", !state.miniapp.popupOpen);
   el.miniappWindowTitle.textContent = state.miniapp.manifest?.name || "Mini-App";
-  el.miniappWindowSubtitle.textContent = thread
-    ? `Running in ${thread.title}. Close the window to save the latest state.`
-    : "Close the window to save the latest state.";
+  el.miniappWindowSubtitle.textContent = state.miniapp.loading
+    ? "Loading mini-app runtime…"
+    : (thread
+      ? `Running in ${thread.title}. Close the window to save the latest state.`
+      : "Close the window to save the latest state.");
+}
+
+function renderMiniappCatalog() {
+  el.miniappCatalogCards.replaceChildren();
+  for (const entry of state.miniapp.catalog) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "miniapp-card";
+    button.dataset.appId = entry.appId;
+    if (state.miniapp.selectedAppId === entry.appId) {
+      button.classList.add("active");
+    }
+
+    const icon = document.createElement("span");
+    icon.className = "miniapp-card-icon";
+    icon.textContent = sanitizeText(entry.title.slice(0, 1), 1).toUpperCase() || "?";
+
+    const copy = document.createElement("span");
+    copy.className = "miniapp-card-copy";
+
+    const title = document.createElement("strong");
+    title.textContent = entry.title || entry.appId;
+
+    const summary = document.createElement("span");
+    const tags = [];
+    if (entry.install?.installed) {
+      tags.push(`Installed ${entry.install.installedVersion || entry.version || ""}`.trim());
+    }
+    if (entry.reviewStatus && entry.reviewStatus !== "approved") {
+      tags.push(`Review: ${entry.reviewStatus}`);
+    }
+    tags.push(entry.sourceType === "dev" ? "Developer app" : "Published app");
+    if (entry.updateAvailable && entry.latestApprovedVersion) {
+      tags.push(`Update ${entry.latestApprovedVersion}`);
+    }
+    if (entry.updateRequiresConsent) {
+      tags.push("Consent needed");
+    }
+    summary.textContent = [sanitizeText(entry.summary, 120), ...tags].filter(Boolean).join(" | ");
+
+    copy.append(title, summary);
+    button.append(icon, copy);
+    el.miniappCatalogCards.append(button);
+  }
 }
 
 function renderMiniappLauncher() {
@@ -3613,11 +4069,14 @@ function renderMiniappLauncher() {
   const supportReason = miniappSupportReason(thread);
   const supported = !supportReason;
   const joinable = state.miniapp.launchContext?.joinable !== false;
+  const entry = getMiniappCatalogEntry();
+  const installable = !entry || entry.reviewStatus === "approved" || entry.sourceType === "dev";
+  const installed = Boolean(entry?.install?.installed);
   el.attachBtn.disabled = false;
   el.attachBtn.title = supported ? "Open apps and attachments" : supportReason;
   el.miniappLauncher.classList.toggle("hidden", !state.miniapp.drawerOpen);
   el.miniappStage.classList.toggle("hidden", !state.miniapp.selectedAppId);
-  el.miniappCounterCard.classList.toggle("active", state.miniapp.selectedAppId === "app.ohmf.counter-lab");
+  renderMiniappCatalog();
 
   if (!state.miniapp.drawerOpen) {
     el.miniappContextCopy.textContent = supported
@@ -3637,20 +4096,30 @@ function renderMiniappLauncher() {
     : "Choose launch settings, then open the app.";
   el.miniappLaunchMode.textContent = state.miniapp.launchContext?.app_session_id
     ? (!joinable ? "Session ended" : (state.miniapp.consentRequired ? "Consent required" : "Attached to thread"))
-    : "Needs launch";
+    : (!installable ? `Blocked: ${entry?.reviewStatus || "unavailable"}` : (entry?.updateRequiresConsent ? "Update needs consent" : (entry?.updateAvailable ? "Update available" : "Needs launch")));
   el.miniappContextCopy.textContent = state.miniapp.lastShareError || (supported
-    ? `App sessions attach to ${thread.title}. Permissions can be adjusted before launch.`
+    ? (!installable
+        ? `This app is ${entry?.reviewStatus || "unavailable"} and cannot be launched for normal users yet.`
+        : (entry?.updateRequiresConsent
+            ? `This update expands the app's permissions. Review and approve the new access before opening it in ${thread.title}.`
+            : `App sessions attach to ${thread.title}. Permissions can be adjusted before launch.`))
     : supportReason);
 
   el.miniappPermissions.replaceChildren();
   const permissions = Array.isArray(manifest?.permissions) ? manifest.permissions : [];
+  if (!permissions.length) {
+    const empty = document.createElement("p");
+    empty.className = "miniapp-config-copy";
+    empty.textContent = "This app does not request host permissions.";
+    el.miniappPermissions.append(empty);
+  }
   for (const permission of permissions) {
     const item = document.createElement("label");
     item.className = "miniapp-permission";
     const input = document.createElement("input");
     input.type = "checkbox";
     input.checked = state.miniapp.grantedPermissions.has(permission);
-    input.disabled = !supported || !joinable;
+    input.disabled = !supported || !joinable || !installable;
     input.addEventListener("change", () => {
       if (input.checked) state.miniapp.grantedPermissions.add(permission);
       else state.miniapp.grantedPermissions.delete(permission);
@@ -3660,10 +4129,12 @@ function renderMiniappLauncher() {
     item.append(input, copy);
     el.miniappPermissions.append(item);
   }
-  el.miniappShareBtn.disabled = !supported || !manifest || !joinable;
-  el.miniappShareBtn.textContent = "Send";
-  el.miniappOpenBtn.disabled = !supported || !manifest || !joinable;
-  el.miniappOpenBtn.textContent = !joinable ? "Session Ended" : (state.miniapp.consentRequired ? "Join & Open" : "Open App");
+  el.miniappShareBtn.disabled = !supported || !manifest || !joinable || !installable;
+  el.miniappShareBtn.textContent = installed ? (entry?.updateRequiresConsent ? "Review & Send" : "Send") : "Install & Send";
+  el.miniappOpenBtn.disabled = !supported || !manifest || !joinable || !installable;
+  el.miniappOpenBtn.textContent = !installable
+    ? "Pending Review"
+    : (!joinable ? "Session Ended" : (installed ? (entry?.updateRequiresConsent ? "Review & Open" : (state.miniapp.consentRequired ? "Join & Open" : "Open App")) : "Install & Open"));
   el.miniappResetBtn.disabled = !state.miniapp.launchContext?.app_session_id;
 }
 
@@ -3738,7 +4209,7 @@ function buildExpandedAppCardBubble(message, joinable, previewLabel) {
       iframe.loading = "lazy";
       iframe.referrerPolicy = "no-referrer";
       iframe.title = preview.altText || previewLabel;
-      iframe.setAttribute("sandbox", "allow-scripts allow-same-origin");
+      iframe.setAttribute("sandbox", "allow-scripts");
       iframe.setAttribute("tabindex", "-1");
       previewFrame.appendChild(iframe);
     } else {
@@ -4110,12 +4581,16 @@ function patchMessage(threadId, messageId, patch) {
     if (message.id !== messageId) return message;
     const merged = { ...message, ...patch };
     const transport = normalizeTransport(merged.transport);
-    return {
+    const encryptedEnvelopeFingerprintValue = sanitizeText(merged.contentType, 40) === CONTENT_TYPE_ENCRYPTED
+      ? encryptedEnvelopeFingerprint(merged)
+      : "";
+    return applyStoredReceiptCheckpoint(thread, {
       ...merged,
       transport,
       status: normalizeDeliveryStatus(transport, merged.status),
       statusUpdatedAt: patch.status ? (patch.statusUpdatedAt || nowISO()) : merged.statusUpdatedAt,
-    };
+      encryptedEnvelopeFingerprint: encryptedEnvelopeFingerprintValue,
+    });
   });
   const dedupedMessages = patch.id
     ? nextMessages.filter((message, index, items) => index === items.findIndex((candidate) => candidate.id === message.id))
@@ -4246,6 +4721,9 @@ async function sendInConversation(thread, content) {
   try {
     const payload = await sendOTT(thread.id, encryptedEnvelope || content, effectiveContentType);
     const finalMessageId = sanitizeText(payload.message_id, 80) || pendingId;
+    if (encryptedEnvelope) {
+      cacheEncryptedMessagePlaintext(finalMessageId, encryptedEnvelope, CONTENT_TYPE_TEXT, content, sanitizeText(content?.text, 1000));
+    }
     patchMessage(thread.id, pendingId, {
       id: finalMessageId,
       serverOrder: Number(payload.server_order || 0),
@@ -4309,6 +4787,15 @@ async function sendAttachmentInConversation(thread, attachment) {
       encryptedEnvelope || content,
       encryptedEnvelope ? CONTENT_TYPE_ENCRYPTED : CONTENT_TYPE_ATTACHMENT
     );
+    if (encryptedEnvelope) {
+      cacheEncryptedMessagePlaintext(
+        sanitizeText(payload.message_id, 80) || pendingId,
+        encryptedEnvelope,
+        CONTENT_TYPE_ATTACHMENT,
+        content,
+        sanitizeText(attachment.file_name || "Attachment", 140)
+      );
+    }
     await apiRequest("/v1/media/attachments", {
       method: "POST",
       body: JSON.stringify({
@@ -4472,7 +4959,9 @@ async function bootAfterAuth() {
   state.threads = [];
   state.profiles = {};
   state.selfProfile = null;
-  state.crypto = { device: null, published: false, bundleCache: {} };
+  state.miniapp.catalog = [];
+  state.miniapp.catalogLoaded = false;
+  state.crypto = { device: null, published: false, bundleCache: {}, decryptedMessageCache: {} };
   eventStreamDisabled = false;
   ensureSyncDeviceId();
   loadConversationStore();
@@ -4481,6 +4970,9 @@ async function bootAfterAuth() {
   renderAll();
   try {
     await loadSelfProfile();
+    await loadMiniappCatalog().catch((error) => {
+      console.error(error);
+    });
     await publishCryptoBundle().catch((error) => {
       console.error(error);
     });
@@ -4515,9 +5007,10 @@ async function selectMiniapp(appId) {
   state.miniapp.frameWindow = null;
   state.miniapp.consentRequired = false;
   state.miniapp.lastShareError = "";
+  clearMiniappLoadTimeout();
   el.miniappFrame.src = "about:blank";
   try {
-    const manifest = await fetchMiniappManifest(entry.manifestUrl);
+    const manifest = entry.manifest || await loadMiniappManifestByAppId(entry.appId);
     state.miniapp.manifest = manifest;
     state.miniapp.grantedPermissions = new Set(Array.isArray(manifest.permissions) ? manifest.permissions : []);
   } catch (error) {
@@ -4541,11 +5034,13 @@ async function openEmbeddedMiniapp() {
       await ensureMiniappSession();
     }
     state.miniapp.popupOpen = true;
-    el.miniappFrame.setAttribute("sandbox", "allow-scripts allow-same-origin");
+    startMiniappLoadTimeout();
+    el.miniappFrame.setAttribute("sandbox", "allow-scripts");
     el.miniappFrame.src = buildMiniappFrameURL();
     renderAll();
   } catch (error) {
     console.error(error);
+    clearMiniappLoadTimeout();
     state.miniapp.lastShareError = sanitizeText(error.message || "Unable to open app.", 180);
     renderAll();
   }
@@ -4558,6 +5053,7 @@ async function resetEmbeddedMiniappSession() {
   } catch (error) {
     console.error(error);
   }
+  clearMiniappLoadTimeout();
   state.miniapp.popupOpen = false;
   state.miniapp.launchContext = null;
   state.miniapp.sessionState = normalizeMiniappSessionState(null);
@@ -4584,16 +5080,19 @@ function logout() {
   state.miniapp.drawerOpen = false;
   state.miniapp.popupOpen = false;
   state.miniapp.selectedAppId = "";
+  state.miniapp.catalog = [];
+  state.miniapp.catalogLoaded = false;
   state.miniapp.manifest = null;
   state.miniapp.launchContext = null;
   state.miniapp.sessionState = null;
   state.miniapp.frameWindow = null;
   state.miniapp.consentRequired = false;
   state.miniapp.lastShareError = "";
+  clearMiniappLoadTimeout();
   state.sync.lastUserCursor = 0;
   state.profiles = {};
   state.selfProfile = null;
-  state.crypto = { device: null, published: false, bundleCache: {} };
+  state.crypto = { device: null, published: false, bundleCache: {}, decryptedMessageCache: {} };
   showAuthShell();
   setAuthMessage("Signed out.");
   renderAll();
@@ -4622,8 +5121,13 @@ el.searchInput.addEventListener("input", (event) => {
 
 el.attachBtn.addEventListener("click", async () => {
   state.miniapp.drawerOpen = !state.miniapp.drawerOpen;
-  if (state.miniapp.drawerOpen && !state.miniapp.selectedAppId) {
-    await selectMiniapp("app.ohmf.counter-lab");
+  if (state.miniapp.drawerOpen && !state.miniapp.catalogLoaded) {
+    await loadMiniappCatalog().catch((error) => {
+      console.error(error);
+    });
+  }
+  if (state.miniapp.drawerOpen && !state.miniapp.selectedAppId && state.miniapp.catalog[0]?.appId) {
+    await selectMiniapp(state.miniapp.catalog[0].appId);
   }
   renderMiniappLauncher();
 });
@@ -4643,8 +5147,12 @@ el.miniappWindowCloseBtn.addEventListener("click", async () => {
   renderAll();
 });
 
-el.miniappCounterCard.addEventListener("click", async () => {
-  await selectMiniapp("app.ohmf.counter-lab");
+el.miniappCatalogCards.addEventListener("click", async (event) => {
+  const target = event.target;
+  if (!(target instanceof Element)) return;
+  const card = target.closest("[data-app-id]");
+  if (!card) return;
+  await selectMiniapp(sanitizeText(card.getAttribute("data-app-id"), 120));
 });
 
 el.miniappUploadCard.addEventListener("click", () => {
@@ -4857,6 +5365,7 @@ window.addEventListener("message", async (event) => {
 
   const message = event.data;
   if (!message || typeof message !== "object" || message.channel !== state.miniapp.channelId) return;
+  clearMiniappLoadTimeout();
   state.miniapp.frameWindow = event.source;
   const requestId = sanitizeText(message.request_id, 80);
   if (!requestId) return;
@@ -4870,6 +5379,13 @@ window.addEventListener("message", async (event) => {
       message: sanitizeText(error.message || "Bridge call failed", 220),
     });
   }
+});
+
+el.miniappFrame.addEventListener("load", () => {
+  if (!state.miniapp.popupOpen) return;
+  if (el.miniappFrame.src === "about:blank") return;
+  clearMiniappLoadTimeout();
+  renderMiniappWindow();
 });
 
 if ("serviceWorker" in navigator) {

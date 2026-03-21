@@ -1,6 +1,7 @@
 {
-  "app_id": "com.example.eightball",
-  "name": "EightBall",
+  "manifest_version": "1.0",
+  "app_id": "app.ohmf.eightball",
+  "name": "Mystic 8-Ball",
   "version": "1.0.0",
   "entrypoint": {
     "type": "url",
@@ -13,13 +14,23 @@
   "message_preview": {
     "type": "static_image",
     "url": "https://example.com/miniapps/eightball/preview-square.png",
-    "alt_text": "EightBall conversation preview",
+    "alt_text": "Mystic 8-Ball conversation preview",
     "fit_mode": "scale"
   },
-  "permissions": ["network","vibrate"],
+  "permissions": [
+    "conversation.read_context",
+    "conversation.send_message",
+    "storage.session",
+    "realtime.session"
+  ],
   "capabilities": {
-    "ui": { "dialogs": true },
-    "storage": { "quota": "5MB" }
+    "turn_based": true,
+    "offline_resume": true,
+    "host_message_projection": true
+  },
+  "metadata": {
+    "category": "games",
+    "summary": "Ask the shared 8-ball a question and project the answer into the thread."
   },
   "signature": {
     "alg": "RS256",

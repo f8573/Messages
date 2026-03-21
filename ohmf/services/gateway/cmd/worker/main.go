@@ -7,11 +7,14 @@ import (
 	"syscall"
 	"time"
 
+	"crypto/sha256"
 	"ohmf/services/gateway/internal/config"
 	"ohmf/services/gateway/internal/db"
+	"ohmf/services/gateway/internal/deviceattestation"
 	"ohmf/services/gateway/internal/devices"
 	"ohmf/services/gateway/internal/notification"
 	"ohmf/services/gateway/internal/observability"
+	"ohmf/services/gateway/internal/push"
 	"ohmf/services/gateway/internal/replication"
 	wk "ohmf/services/gateway/internal/worker"
 
@@ -39,13 +42,51 @@ func main() {
 	defer rdb.Close()
 
 	replicationStore := replication.NewStore(pool, rdb)
-	deviceSvc := devices.NewService(pool, cfg)
-	notificationSvc := notification.NewService(pool, deviceSvc, cfg)
+	attestationVerifier := deviceattestation.NewVerifier(deviceattestation.Config{
+		Secret:       cfg.DeviceAttestationSecret,
+		AndroidAppID: cfg.AttestationAndroidAppID,
+		IOSAppID:     cfg.AttestationIOSAppID,
+		WebAppID:     cfg.AttestationWebAppID,
+	})
+	deviceSvc := devices.NewService(pool, func() []byte { sum := sha256.Sum256([]byte(cfg.PushSubscriptionKey)); return sum[:] }(), attestationVerifier, cfg.AttestationChallengeTTL)
+	notificationHandler := notification.NewHandler(pool, deviceSvc, cfg)
+
+	// Initialize push providers
+	if cfg.FirebaseCredentialsPath != "" {
+		fcmProv, err := push.NewFCMProvider(ctx, cfg.FirebaseCredentialsPath)
+		if err != nil {
+			logger.Warn().Err(err).Msg("failed to initialize FCM provider")
+		} else {
+			notificationHandler.WithFCMProvider(fcmProv)
+			defer fcmProv.Close()
+		}
+	}
+
+	// Try token-based APNs first, fall back to certificate if needed
+	if cfg.APNsKeyPath != "" && cfg.APNsKeyID != "" && cfg.APNsTeamID != "" {
+		apnsProv, err := push.NewAPNsProviderWithToken(ctx, cfg.APNsKeyPath, cfg.APNsKeyID, cfg.APNsTeamID, cfg.APNsBundleID)
+		if err != nil {
+			logger.Warn().Err(err).Msg("failed to initialize APNs token provider, trying certificate")
+			// Fall back to certificate-based auth
+			if cfg.APNsCertPath != "" && cfg.APNsKeyPath != "" {
+				apnsProv, err = push.NewAPNsProvider(ctx, cfg.APNsCertPath, cfg.APNsKeyPath, cfg.APNsBundleID)
+				if err != nil {
+					logger.Warn().Err(err).Msg("failed to initialize APNs certificate provider")
+				} else {
+					notificationHandler.WithAPNsProvider(apnsProv)
+					defer apnsProv.Close()
+				}
+			}
+		} else {
+			notificationHandler.WithAPNsProvider(apnsProv)
+			defer apnsProv.Close()
+		}
+	}
 
 	// create runner and workers
 	runner := wk.NewRunner()
 	runner.Add(wk.NewMediaWorker(pool))
-	runner.Add(wk.NewNotificationWorker(notificationSvc))
+	runner.Add(wk.NewNotificationWorker(notificationHandler))
 	runner.Add(wk.NewAbuseAggregatorWorker(pool))
 	runner.Add(wk.NewRelayRetryWorker(pool))
 	runner.Add(wk.NewSyncFanoutWorker(replicationStore))

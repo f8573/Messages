@@ -23,6 +23,7 @@ import (
 	"ohmf/services/gateway/internal/config"
 	"ohmf/services/gateway/internal/conversations"
 	"ohmf/services/gateway/internal/db"
+	"ohmf/services/gateway/internal/deviceattestation"
 	"ohmf/services/gateway/internal/devicekeys"
 	"ohmf/services/gateway/internal/devices"
 	"ohmf/services/gateway/internal/discovery"
@@ -36,7 +37,7 @@ import (
 	"ohmf/services/gateway/internal/observability"
 	openapipkg "ohmf/services/gateway/internal/openapi"
 	"ohmf/services/gateway/internal/otp"
-	// removed: presence import - package deleted
+	"ohmf/services/gateway/internal/presence"
 	"ohmf/services/gateway/internal/realtime"
 	"ohmf/services/gateway/internal/relay"
 	"ohmf/services/gateway/internal/replication"
@@ -176,19 +177,26 @@ func main() {
 	if err != nil {
 		logger.Fatal().Err(err).Msg("otp provider init failed")
 	}
-	authSvc := auth.NewService(pool, rdb, tokens, otpProvider, cfg.AccessTTL, cfg.RefreshTTL, cfg)
+
 	usersSvc := users.NewService(pool, replicationStore)
-	discoverySvc := discovery.NewService(pool, cfg.DiscoveryPepper)
+
 	convSvc := conversations.NewService(pool, replicationStore)
 	// removed: derive subscription key from config for AES-GCM encryption
-	subscriptionKeyBytes := sha256.Sum256([]byte(cfg.PushSubscriptionKey))[:]
-	devSvc := devices.NewService(pool, subscriptionKeyBytes)
+	sum := sha256.Sum256([]byte(cfg.PushSubscriptionKey))
+	subscriptionKeyBytes := sum[:]
+	attestationVerifier := deviceattestation.NewVerifier(deviceattestation.Config{
+		Secret:       cfg.DeviceAttestationSecret,
+		AndroidAppID: cfg.AttestationAndroidAppID,
+		IOSAppID:     cfg.AttestationIOSAppID,
+		WebAppID:     cfg.AttestationWebAppID,
+	})
+	devSvc := devices.NewService(pool, subscriptionKeyBytes, attestationVerifier, cfg.AttestationChallengeTTL)
 	mediaSvc := media.NewService(pool, cfg)
-	carrierSvc := carrier.NewService(&pgxAdapter{p: pool})
-	// removed: presence service - unused routes
-	notificationSvc := notification.NewService(pool, devSvc, cfg)
+
+	presenceSvc := presence.NewService(pool, rdb)
+
 	abuseSvc := abuse.NewService(pool)
-	relayHandler := relay.NewHandlerWithOptions(&pgxAdapter{p: pool}, relay.Options{RequireAttestation: cfg.RequireRelayAttestation})
+	relayHandler := relay.NewHandler(&relayPgxAdapter{p: pool}, cfg.RequireRelayAttestation)
 	miniappSvc := miniapp.NewService(pool, cfg, rdb, replicationStore)
 	deviceKeysSvc := devicekeys.NewService(pool)
 	msgSvc := messages.NewService(pool, messages.Options{
@@ -210,22 +218,22 @@ func main() {
 		wsHandler = realtime.NewHandlerReadOnly(tokens, msgSvc, rdb, rateLimiter, replicationStore)
 	}
 
-	authHandler := auth.NewHandler(authSvc)
+	authHandler := auth.NewHandler(pool, rdb, tokens, otpProvider, cfg.AccessTTL, cfg.RefreshTTL, cfg, usersSvc, devSvc)
 	usersHandler := users.NewHandler(usersSvc)
-	discoveryHandler := discovery.NewHandler(discoverySvc)
+	discoveryHandler := discovery.NewHandler(pool, cfg.DiscoveryPepper)
 	convHandler := conversations.NewHandler(convSvc)
 	// removed: trivial constructor wrappers inlined
-	devHandler := &devices.Handler{svc: devSvc}
-	mediaHandler := &media.Handler{svc: mediaSvc}
-	carrierHandler := &carrier.Handler{db: &pgxAdapter{p: pool}}
-	// removed: presence handler - service deleted
-	notificationHandler := notification.NewHandler(notificationSvc)
-	miniappHandler := &miniapp.Handler{svc: miniappSvc}
-	abuseHandler := &abuse.Handler{svc: abuseSvc}
-	deviceKeysHandler := &devicekeys.Handler{db: deviceKeysSvc.DB()}
+	devHandler := devices.NewHandler(devSvc)
+	mediaHandler := media.NewHandler(mediaSvc)
+	carrierHandler := &carrier.Handler{DB: &pgxAdapter{p: pool}}
+	presenceHandler := presence.NewHandler(presenceSvc)
+	notificationHandler := notification.NewHandler(pool, devSvc, cfg)
+	miniappHandler := miniapp.NewHandler(miniappSvc, miniapp.NewRegistryClient(cfg.AppsAddr))
+	abuseHandler := &abuse.Handler{Svc: abuseSvc}
+	deviceKeysHandler := &devicekeys.Handler{DB: deviceKeysSvc.DB()}
 	msgHandler := messages.NewHandler(msgSvc)
 	syncSvc := sync.NewService(pool, replicationStore)
-	syncHandler := &sync.Handler{svc: syncSvc}
+	syncHandler := &sync.Handler{Svc: syncSvc}
 	syncFanoutWorker := wk.NewSyncFanoutWorker(replicationStore)
 	go func() {
 		if err := syncFanoutWorker.Start(ctx); err != nil {
@@ -236,16 +244,21 @@ func main() {
 	// Build a lightweight runtime view of which high-level services are present
 	reg := serviceregistry.New(map[string]bool{
 		"gateway":       true,
-		"auth":          authSvc != nil,
+		"auth":          authHandler != nil,
 		"users":         usersSvc != nil,
 		"conversations": convSvc != nil,
 		"messages":      msgSvc != nil,
-		"notification":  notificationSvc != nil,
+		"notification":  notificationHandler != nil,
 		"miniapp":       miniappSvc != nil,
 		"abuse":         abuseSvc != nil,
 		"relay":         true, // removed: relay service unified with handler
 		"media":         mediaSvc != nil,
 	})
+
+	logger.Info().Str("media_root", cfg.MediaRootDir).Str("miniapp_root", cfg.MiniappRootDir).Msg("storage domains initialized")
+	if cfg.MediaRootDir == cfg.MiniappRootDir && cfg.Env != "dev" {
+		logger.Warn().Msg("storage domains are identical; separate paths recommended for production isolation")
+	}
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
@@ -319,6 +332,8 @@ func main() {
 		v1.Post("/auth/phone/start", authHandler.StartPhone)
 		v1.Post("/auth/phone/verify", authHandler.VerifyPhone)
 		v1.Post("/auth/refresh", authHandler.Refresh)
+		v1.Post("/auth/recovery-code", authHandler.UseRecoveryCode)
+		v1.Post("/auth/pairing/complete", authHandler.CompletePairing)
 		v1.Get("/ws", wsHandler.ServeHTTP)
 		v1.Put("/media/uploads/{token}", mediaHandler.UploadObject)
 		v1.Get("/media/downloads/{token}", mediaHandler.DownloadObject)
@@ -326,8 +341,17 @@ func main() {
 		v1.Group(func(protected chi.Router) {
 			protected.Use(appmw.RequireAuth(tokens))
 			protected.Post("/auth/logout", authHandler.Logout)
+			protected.Post("/auth/pairing/start", authHandler.StartPairing)
+			protected.Get("/account/recovery-codes", authHandler.GetRecoveryCodes)
+			protected.Post("/account/2fa/setup", authHandler.Setup2FA)
+			protected.Post("/account/2fa/verify", authHandler.Verify2FA)
+			protected.Get("/account/2fa/methods", authHandler.List2FAMethods)
 			protected.Post("/account/export", usersHandler.ExportAccount)
+			protected.Post("/account/exports", usersHandler.CreateExportArtifact)
+			protected.Get("/account/exports", usersHandler.ListExportArtifacts)
+			protected.Get("/account/exports/{id}", usersHandler.GetExportArtifact)
 			protected.Post("/account/delete", usersHandler.DeleteAccount)
+			protected.Post("/account/delete/finalize", usersHandler.FinalizeDeletion)
 			protected.Get("/me", usersHandler.GetMe)
 			protected.Patch("/me", usersHandler.UpdateMe)
 			protected.Post("/users/resolve", usersHandler.ResolveProfiles)
@@ -339,11 +363,20 @@ func main() {
 			protected.Get("/devices", devHandler.List)
 			protected.Patch("/devices/{id}", devHandler.Update)
 			protected.Delete("/devices/{id}", devHandler.Revoke)
+			protected.Post("/devices/{id}/attestation/challenge", devHandler.CreateAttestationChallenge)
+			protected.Post("/devices/{id}/attestation/verify", devHandler.VerifyAttestation)
+			protected.Post("/devices/{id}/push-token", devHandler.RegisterPushToken)
+			protected.Get("/presence/{userID}", presenceHandler.GetUser)
+			protected.Get("/conversations/{id}/presence", presenceHandler.GetConversation)
+			protected.Get("/device-keys/backups", deviceKeysHandler.ListBackups)
+			protected.Put("/device-keys/backups/{name}", deviceKeysHandler.UpsertBackup)
+			protected.Get("/device-keys/backups/{name}", deviceKeysHandler.GetBackup)
+			protected.Post("/device-keys/backups/{name}/restore", deviceKeysHandler.RestoreBackup)
+			protected.Delete("/device-keys/backups/{name}", deviceKeysHandler.DeleteBackup)
 			protected.Put("/device-keys/{deviceID}", deviceKeysHandler.Publish)
 			protected.Post("/device-keys/{deviceID}/prekeys", deviceKeysHandler.AddPrekeys)
 			protected.Get("/device-keys/{userID}", deviceKeysHandler.ListForUser)
 			protected.Post("/device-keys/{userID}/claim", deviceKeysHandler.ClaimForUser)
-			// removed: presence routes - service deleted
 			protected.Post("/media/attachments", mediaHandler.Register)
 			protected.Get("/media/attachments/{id}/download", mediaHandler.CreateDownload)
 			protected.Delete("/media/attachments/{id}", mediaHandler.Purge)
@@ -372,7 +405,30 @@ func main() {
 			protected.Post("/apps/sessions/{id}/snapshot", miniappHandler.Snapshot)
 			protected.Post("/apps/shares", miniappHandler.Share)
 			protected.Get("/apps", miniappHandler.ListApps)
+			protected.Get("/apps/installed", miniappHandler.ListInstalledApps)
 			protected.Get("/apps/{appID}", miniappHandler.GetApp)
+			protected.Post("/apps/{appID}/install", miniappHandler.InstallApp)
+			protected.Delete("/apps/{appID}/install", miniappHandler.UninstallApp)
+			protected.Get("/apps/{appID}/updates", miniappHandler.CheckForUpdates)
+			protected.Post("/publisher/apps", miniappHandler.RegistryPassthrough("/v1/publisher/apps", http.MethodPost))
+			protected.Post("/publisher/apps/{appID}/releases", func(w http.ResponseWriter, r *http.Request) {
+				miniappHandler.RegistryPassthrough("/v1/publisher/apps/"+chi.URLParam(r, "appID")+"/releases", http.MethodPost)(w, r)
+			})
+			protected.Get("/publisher/apps/{appID}/releases", func(w http.ResponseWriter, r *http.Request) {
+				miniappHandler.RegistryPassthrough("/v1/publisher/apps/"+chi.URLParam(r, "appID")+"/releases", http.MethodGet)(w, r)
+			})
+			protected.Post("/publisher/apps/{appID}/releases/{version}/submit", func(w http.ResponseWriter, r *http.Request) {
+				miniappHandler.RegistryPassthrough("/v1/publisher/apps/"+chi.URLParam(r, "appID")+"/releases/"+chi.URLParam(r, "version")+"/submit", http.MethodPost)(w, r)
+			})
+			protected.Post("/publisher/apps/{appID}/releases/{version}/revoke", func(w http.ResponseWriter, r *http.Request) {
+				miniappHandler.RegistryPassthrough("/v1/publisher/apps/"+chi.URLParam(r, "appID")+"/releases/"+chi.URLParam(r, "version")+"/revoke", http.MethodPost)(w, r)
+			})
+			protected.Post("/admin/apps/{appID}/releases/{version}/approve", func(w http.ResponseWriter, r *http.Request) {
+				miniappHandler.RegistryPassthrough("/v1/admin/apps/"+chi.URLParam(r, "appID")+"/releases/"+chi.URLParam(r, "version")+"/approve", http.MethodPost)(w, r)
+			})
+			protected.Post("/admin/apps/{appID}/releases/{version}/reject", func(w http.ResponseWriter, r *http.Request) {
+				miniappHandler.RegistryPassthrough("/v1/admin/apps/"+chi.URLParam(r, "appID")+"/releases/"+chi.URLParam(r, "version")+"/reject", http.MethodPost)(w, r)
+			})
 
 			protected.Post("/notifications/send", notificationHandler.Send)
 			protected.Get("/notifications/preferences", notificationHandler.GetPreferences)
@@ -394,21 +450,39 @@ func main() {
 			protected.Get("/conversations/{id}", convHandler.Get)
 			protected.Patch("/conversations/{id}", convHandler.UpdatePolicy)
 			protected.Patch("/conversations/{id}/metadata", convHandler.UpdateMetadata)
+			protected.Patch("/conversations/{id}/settings", convHandler.UpdateSettings)
 			protected.Patch("/conversations/{id}/preferences", convHandler.UpdatePreferences)
+			protected.Put("/conversations/{id}/effect-policy", convHandler.UpdateEffectPolicy)
 			protected.Post("/conversations/{id}/members", convHandler.AddMembers)
 			protected.Delete("/conversations/{id}/members/{userID}", convHandler.RemoveMember)
+			protected.Put("/conversations/{id}/members/{userID}/role", convHandler.UpdateMemberRole)
+			protected.Post("/conversations/{id}/invites", convHandler.CreateInvite)
+			protected.Get("/conversations/{id}/invites", convHandler.ListInvites)
+			protected.Post("/conversations/invites/redeem", convHandler.RedeemInvite)
+			protected.Post("/conversations/{id}/bans", convHandler.BanMember)
+			protected.Delete("/conversations/{id}/bans/{userID}", convHandler.UnbanMember)
 			protected.Post("/conversations/{id}/thread_keys", convHandler.SetThreadKeys)
 			protected.With(appmw.ValidateJSONMiddleware("send-message-request")).Post("/messages", msgHandler.Send)
 			protected.With(appmw.ValidateJSONMiddleware("send-phone-message-request")).Post("/messages/phone", msgHandler.SendToPhone)
 			protected.Post("/messages/{id}/reactions", msgHandler.AddReaction)
 			protected.Delete("/messages/{id}/reactions", msgHandler.RemoveReaction)
+			protected.Get("/messages/{id}/reactions", msgHandler.ListReactionsAggregated)
+			protected.Post("/messages/{id}/pin", msgHandler.Pin)
+			protected.Delete("/messages/{id}/pin", msgHandler.Unpin)
+			protected.Get("/messages/{id}/replies", msgHandler.GetReplies)
+			protected.Post("/messages/{id}/forward", msgHandler.Forward)
+			protected.Post("/messages/{id}/effects", msgHandler.TriggerEffect)
 			protected.Post("/messages/{id}/deliveries", msgHandler.RecordDelivery)
 			protected.Get("/conversations/{id}/messages", msgHandler.List)
+			protected.Get("/conversations/{id}/pins", msgHandler.ListPinned)
 			protected.Get("/conversations/{id}/timeline", msgHandler.Timeline)
+			protected.Get("/conversations/{id}/search", msgHandler.Search)
 			protected.Patch("/messages/{id}", msgHandler.Edit)
 			protected.Delete("/messages/{id}", msgHandler.Delete)
 			protected.Get("/messages/{id}/deliveries", msgHandler.ListDeliveries)
+			protected.Get("/messages/{id}/edits", msgHandler.GetEditHistory)
 			protected.Post("/conversations/{id}/read", msgHandler.MarkRead)
+			protected.Get("/conversations/{id}/read-status", msgHandler.GetReadStatus)
 			protected.Post("/messages/{id}/redact", msgHandler.Redact)
 			protected.Get("/events/stream", eventsHandler.Stream)
 			protected.Get("/sync", syncHandler.Incremental)
@@ -433,6 +507,20 @@ func main() {
 }
 
 // pgxAdapter adapts a *pgxpool.Pool to the package-local `carrier.DB` interface.
+type relayPgxAdapter struct{ p *pgxpool.Pool }
+
+func (a *relayPgxAdapter) QueryRow(ctx context.Context, sql string, args ...any) relay.RowScanner {
+	return a.p.QueryRow(ctx, sql, args...)
+}
+
+func (a *relayPgxAdapter) Query(ctx context.Context, sql string, args ...any) (relay.Rows, error) {
+	return a.p.Query(ctx, sql, args...)
+}
+
+func (a *relayPgxAdapter) Exec(ctx context.Context, sql string, args ...any) (any, error) {
+	return a.p.Exec(ctx, sql, args...)
+}
+
 type pgxAdapter struct{ p *pgxpool.Pool }
 
 func (a *pgxAdapter) QueryRow(ctx context.Context, sql string, args ...any) carrier.RowScanner {

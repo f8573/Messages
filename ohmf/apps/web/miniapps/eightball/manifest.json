@@ -1,0 +1,39 @@
+{
+  "app_id": "app.ohmf.eightball",
+  "name": "Mystic 8-Ball",
+  "manifest_version": "1.0",
+  "version": "1.0.0",
+  "entrypoint": {
+    "type": "url",
+    "url": "http://localhost:5174/miniapps/eightball/index.html",
+    "mime_type": "text/html"
+  },
+  "permissions": [
+    "conversation.read_context",
+    "conversation.send_message",
+    "storage.session",
+    "realtime.session"
+  ],
+  "capabilities": {
+    "turn_based": true,
+    "offline_resume": true,
+    "host_message_projection": true
+  },
+  "message_preview": {
+    "type": "static_image",
+    "url": "http://localhost:5174/miniapps/eightball/preview.svg",
+    "fit_mode": "scale"
+  },
+  "metadata": {
+    "category": "games",
+    "summary": "Ask the shared 8-ball a question and project the answer into the thread.",
+    "declared_origins": [
+      "http://localhost:5174"
+    ]
+  },
+  "signature": {
+    "alg": "RS256",
+    "kid": "dev-registry-key",
+    "sig": "DEV_SIGNATURE_PLACEHOLDER"
+  }
+}

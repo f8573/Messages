@@ -36,6 +36,61 @@ func (h *Handler) ExportAccount(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, result)
 }
 
+func (h *Handler) CreateExportArtifact(w http.ResponseWriter, r *http.Request) {
+	userID, ok := middleware.UserIDFromContext(r.Context())
+	if !ok {
+		httpx.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing auth", nil)
+		return
+	}
+	result, err := h.svc.CreateExportArtifact(r.Context(), userID)
+	if err != nil {
+		httpx.WriteError(w, r, http.StatusInternalServerError, "export_create_failed", err.Error(), nil)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusCreated, result)
+}
+
+func (h *Handler) ListExportArtifacts(w http.ResponseWriter, r *http.Request) {
+	userID, ok := middleware.UserIDFromContext(r.Context())
+	if !ok {
+		httpx.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing auth", nil)
+		return
+	}
+	items, err := h.svc.ListExportArtifacts(r.Context(), userID)
+	if err != nil {
+		httpx.WriteError(w, r, http.StatusInternalServerError, "export_list_failed", err.Error(), nil)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (h *Handler) GetExportArtifact(w http.ResponseWriter, r *http.Request) {
+	userID, ok := middleware.UserIDFromContext(r.Context())
+	if !ok {
+		httpx.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing auth", nil)
+		return
+	}
+	exportID := chi.URLParam(r, "id")
+	if exportID == "" {
+		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "missing export id", nil)
+		return
+	}
+	item, err := h.svc.GetExportArtifact(r.Context(), userID, exportID)
+	if err != nil {
+		if err.Error() == "export_expired" {
+			httpx.WriteError(w, r, http.StatusGone, "expired", "export expired", nil)
+			return
+		}
+		if errors.Is(err, pgx.ErrNoRows) {
+			httpx.WriteError(w, r, http.StatusNotFound, "not_found", "export not found", nil)
+			return
+		}
+		httpx.WriteError(w, r, http.StatusInternalServerError, "export_get_failed", err.Error(), nil)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, item)
+}
+
 // DeleteAccount deletes all user account data
 func (h *Handler) DeleteAccount(w http.ResponseWriter, r *http.Request) {
 	userID, ok := middleware.UserIDFromContext(r.Context())
@@ -45,6 +100,27 @@ func (h *Handler) DeleteAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.svc.DeleteAccount(r.Context(), userID); err != nil {
 		httpx.WriteError(w, r, http.StatusInternalServerError, "delete_failed", err.Error(), nil)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) FinalizeDeletion(w http.ResponseWriter, r *http.Request) {
+	userID, ok := middleware.UserIDFromContext(r.Context())
+	if !ok {
+		httpx.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing auth", nil)
+		return
+	}
+	if err := h.svc.FinalizeDeletion(r.Context(), userID); err != nil {
+		switch err.Error() {
+		case "deletion_not_pending":
+			httpx.WriteError(w, r, http.StatusConflict, "deletion_not_pending", err.Error(), nil)
+			return
+		case "deletion_not_effective":
+			httpx.WriteError(w, r, http.StatusConflict, "deletion_not_effective", err.Error(), nil)
+			return
+		}
+		httpx.WriteError(w, r, http.StatusInternalServerError, "delete_finalize_failed", err.Error(), nil)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

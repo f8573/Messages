@@ -9,7 +9,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -18,16 +17,21 @@ const (
 	DomainEventMessageEdited              = "message_edited"
 	DomainEventMessageDeleted             = "message_deleted"
 	DomainEventMessageReactionsUpdated    = "message_reactions_updated"
+	DomainEventMessageEffectTriggered     = "message_effect_triggered"
 	DomainEventReadCheckpointAdvanced     = "read_checkpoint_advanced"
 	DomainEventDeliveryCheckpointAdvanced = "delivery_checkpoint_advanced"
+	DomainEventTypingStarted              = "typing_started"
+	DomainEventTypingStopped              = "typing_stopped"
 
 	UserEventConversationMessageAppended         = "conversation_message_appended"
 	UserEventConversationMessageEdited           = "conversation_message_edited"
 	UserEventConversationMessageDeleted          = "conversation_message_deleted"
 	UserEventConversationMessageReactionsUpdated = "conversation_message_reactions_updated"
+	UserEventConversationMessageEffectTriggered  = "conversation_message_effect_triggered"
 	UserEventConversationReceiptUpdated          = "conversation_receipt_updated"
 	UserEventConversationPreviewUpdated          = "conversation_preview_updated"
 	UserEventConversationStateUpdated            = "conversation_state_updated"
+	UserEventConversationTypingUpdated           = "conversation_typing_updated"
 
 	userEventChannelPrefix = "user-event:user:"
 )
@@ -38,8 +42,13 @@ type DBTX interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
+type DB interface {
+	DBTX
+	BeginTx(ctx context.Context, txOptions pgx.TxOptions) (pgx.Tx, error)
+}
+
 type Store struct {
-	db    *pgxpool.Pool
+	db    DB
 	redis *redis.Client
 }
 
@@ -116,6 +125,22 @@ type MessageReactionsPayload struct {
 	ActedAt          string           `json:"acted_at"`
 }
 
+type MessageEffectPayload struct {
+	MessageID         string `json:"message_id"`
+	ConversationID    string `json:"conversation_id"`
+	EffectType        string `json:"effect_type"`
+	TriggeredByUserID string `json:"triggered_by_user_id"`
+	TriggeredAtMS     int64  `json:"triggered_at_ms"`
+}
+
+type TypingPayload struct {
+	ConversationID string `json:"conversation_id"`
+	UserID         string `json:"user_id"`
+	DeviceID       string `json:"device_id,omitempty"`
+	State          string `json:"state"`
+	StartedAtMS    int64  `json:"started_at_ms"`
+}
+
 type ReadCheckpointPayload struct {
 	ConversationID     string `json:"conversation_id"`
 	ReaderUserID       string `json:"reader_user_id"`
@@ -136,7 +161,7 @@ type ConversationMeta struct {
 	ExternalPhones []string
 }
 
-func NewStore(db *pgxpool.Pool, redisClient *redis.Client) *Store {
+func NewStore(db DB, redisClient *redis.Client) *Store {
 	return &Store{db: db, redis: redisClient}
 }
 
@@ -342,12 +367,20 @@ func (s *Store) ProcessBatch(ctx context.Context, batchSize int) (int, error) {
 			if err := s.processMessageReactionsUpdated(ctx, tx, evt, deliveries); err != nil {
 				return 0, err
 			}
+		case DomainEventMessageEffectTriggered:
+			if err := s.processMessageEffectTriggered(ctx, tx, evt, deliveries); err != nil {
+				return 0, err
+			}
 		case DomainEventReadCheckpointAdvanced:
 			if err := s.processReadCheckpoint(ctx, tx, evt, deliveries); err != nil {
 				return 0, err
 			}
 		case DomainEventDeliveryCheckpointAdvanced:
 			if err := s.processDeliveryCheckpoint(ctx, tx, evt, deliveries); err != nil {
+				return 0, err
+			}
+		case DomainEventTypingStarted, DomainEventTypingStopped:
+			if err := s.processTypingEvent(ctx, tx, evt, deliveries); err != nil {
 				return 0, err
 			}
 		}
@@ -486,6 +519,30 @@ func (s *Store) AdvanceDeliveredCheckpoint(ctx context.Context, userID, deviceID
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+func (s *Store) AppendMessageEffectEvent(ctx context.Context, q DBTX, conversationID, actorUserID, messageID, effectType string, triggeredAt time.Time) error {
+	return s.AppendDomainEvent(ctx, q, conversationID, actorUserID, DomainEventMessageEffectTriggered, MessageEffectPayload{
+		MessageID:         messageID,
+		ConversationID:    conversationID,
+		EffectType:        effectType,
+		TriggeredByUserID: actorUserID,
+		TriggeredAtMS:     triggeredAt.UTC().UnixMilli(),
+	})
+}
+
+func (s *Store) AppendTypingEvent(ctx context.Context, conversationID, actorUserID, deviceID, state string, startedAt time.Time) error {
+	eventType := DomainEventTypingStopped
+	if strings.EqualFold(state, "typing_started") {
+		eventType = DomainEventTypingStarted
+	}
+	return s.AppendDomainEvent(ctx, s.db, conversationID, actorUserID, eventType, TypingPayload{
+		ConversationID: conversationID,
+		UserID:         actorUserID,
+		DeviceID:       deviceID,
+		State:          state,
+		StartedAtMS:    startedAt.UTC().UnixMilli(),
+	})
 }
 
 func (s *Store) processMessageCreated(ctx context.Context, tx pgx.Tx, evt pendingEvent, deliveries map[string][]Event) error {
@@ -632,6 +689,59 @@ func (s *Store) processMessageReactionsUpdated(ctx context.Context, tx pgx.Tx, e
 			"acted_at":          payload.ActedAt,
 		}
 		userEvent, err := s.insertUserEventTx(ctx, tx, userID, payload.ConversationID, UserEventConversationMessageReactionsUpdated, messagePayload)
+		if err != nil {
+			return err
+		}
+		deliveries[userID] = append(deliveries[userID], userEvent)
+	}
+	return nil
+}
+
+func (s *Store) processMessageEffectTriggered(ctx context.Context, tx pgx.Tx, evt pendingEvent, deliveries map[string][]Event) error {
+	var payload MessageEffectPayload
+	if err := json.Unmarshal(evt.Payload, &payload); err != nil {
+		return err
+	}
+	meta, err := s.LoadConversationMeta(ctx, tx, payload.ConversationID)
+	if err != nil {
+		return err
+	}
+	for _, userID := range meta.Participants {
+		userEvent, err := s.insertUserEventTx(ctx, tx, userID, payload.ConversationID, UserEventConversationMessageEffectTriggered, map[string]any{
+			"conversation_id":      payload.ConversationID,
+			"message_id":           payload.MessageID,
+			"effect_type":          payload.EffectType,
+			"triggered_by_user_id": payload.TriggeredByUserID,
+			"triggered_at_ms":      payload.TriggeredAtMS,
+		})
+		if err != nil {
+			return err
+		}
+		deliveries[userID] = append(deliveries[userID], userEvent)
+	}
+	return nil
+}
+
+func (s *Store) processTypingEvent(ctx context.Context, tx pgx.Tx, evt pendingEvent, deliveries map[string][]Event) error {
+	var payload TypingPayload
+	if err := json.Unmarshal(evt.Payload, &payload); err != nil {
+		return err
+	}
+	meta, err := s.LoadConversationMeta(ctx, tx, payload.ConversationID)
+	if err != nil {
+		return err
+	}
+	for _, userID := range meta.Participants {
+		if userID == payload.UserID {
+			continue
+		}
+		userEvent, err := s.insertUserEventTx(ctx, tx, userID, payload.ConversationID, UserEventConversationTypingUpdated, map[string]any{
+			"conversation_id": payload.ConversationID,
+			"user_id":         payload.UserID,
+			"device_id":       payload.DeviceID,
+			"state":           payload.State,
+			"started_at_ms":   payload.StartedAtMS,
+		})
 		if err != nil {
 			return err
 		}
@@ -846,7 +956,8 @@ func (s *Store) advanceDeliveredCheckpointTx(ctx context.Context, tx pgx.Tx, use
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE conversation_members
-		SET last_delivered_server_order = GREATEST(last_delivered_server_order, $3)
+		SET last_delivered_server_order = GREATEST(last_delivered_server_order, $3),
+		    delivery_at = now()
 		WHERE conversation_id = $1::uuid AND user_id = $2::uuid
 	`, conversationID, userID, throughServerOrder); err != nil {
 		return err

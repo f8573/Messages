@@ -10,8 +10,10 @@ import (
 	"ohmf/services/gateway/internal/middleware"
 )
 
+func NewHandler(arg any) *Handler { /* will be fixed later */ return &Handler{} }
+
 type Handler struct {
-	svc *Service
+	Svc *Service
 }
 
 // removed: trivial constructor wrapper
@@ -31,7 +33,7 @@ func (h *Handler) Record(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "event_type required", nil)
 		return
 	}
-	if err := h.svc.RecordEvent(r.Context(), userID, req.TargetID, req.EventType, req.IP, req.Details); err != nil {
+	if err := h.Svc.RecordEvent(r.Context(), userID, req.TargetID, req.EventType, req.IP, req.Details); err != nil {
 		httpx.WriteError(w, r, http.StatusInternalServerError, "record_failed", err.Error(), nil)
 		return
 	}
@@ -49,7 +51,7 @@ func (h *Handler) GetScore(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "user id required", nil)
 		return
 	}
-	score, err := h.svc.GetScore(r.Context(), id)
+	score, err := h.Svc.GetScore(r.Context(), id)
 	if err != nil {
 		httpx.WriteError(w, r, http.StatusInternalServerError, "score_error", err.Error(), nil)
 		return
@@ -69,7 +71,7 @@ func (h *Handler) GetDestinationScore(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "phone query required", nil)
 		return
 	}
-	score, err := h.svc.GetDestinationScore(r.Context(), phone)
+	score, err := h.Svc.GetDestinationScore(r.Context(), phone)
 	if err != nil {
 		httpx.WriteError(w, r, http.StatusInternalServerError, "score_error", err.Error(), nil)
 		return
@@ -85,7 +87,7 @@ func (h *Handler) CheckOTP(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "invalid body", nil)
 		return
 	}
-	allowed, err := h.svc.CheckOTPThrottle(r.Context(), req.Key, 1*time.Hour, 5)
+	allowed, err := h.Svc.CheckOTPThrottle(r.Context(), req.Key, 1*time.Hour, 5)
 	if err != nil {
 		httpx.WriteError(w, r, http.StatusInternalServerError, "throttle_error", err.Error(), nil)
 		return

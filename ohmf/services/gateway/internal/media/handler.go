@@ -13,8 +13,12 @@ import (
 	"ohmf/services/gateway/internal/middleware"
 )
 
+func NewHandler(svc *Service) *Handler {
+	return &Handler{Svc: svc}
+}
+
 type Handler struct {
-	svc *Service
+	Svc *Service
 }
 
 // removed: trivial constructor wrapper
@@ -37,7 +41,7 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "attachment_id and message_id are required", nil)
 		return
 	}
-	if err := h.svc.AssociateAttachment(r.Context(), req.AttachmentID, req.MessageID, req.FileName); err != nil {
+	if err := h.Svc.AssociateAttachment(r.Context(), req.AttachmentID, req.MessageID, req.FileName); err != nil {
 		httpx.WriteError(w, r, http.StatusInternalServerError, "register_failed", err.Error(), nil)
 		return
 	}
@@ -55,7 +59,7 @@ func (h *Handler) Purge(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "attachment id required", nil)
 		return
 	}
-	if _, err := h.svc.PurgeAttachment(r.Context(), id); err != nil {
+	if _, err := h.Svc.PurgeAttachment(r.Context(), id); err != nil {
 		httpx.WriteError(w, r, http.StatusInternalServerError, "purge_failed", err.Error(), nil)
 		return
 	}
@@ -88,7 +92,7 @@ func (h *Handler) CreateUploadToken(w http.ResponseWriter, r *http.Request) {
 	if req.TTLSeconds > 0 {
 		ttl = time.Duration(req.TTLSeconds) * time.Second
 	}
-	upload, err := h.svc.CreateUploadToken(r.Context(), req.AttachmentID, req.MimeType, req.FileName, req.ChecksumSHA256, req.Size, ttl)
+	upload, err := h.Svc.CreateUploadToken(r.Context(), req.AttachmentID, req.MimeType, req.FileName, req.ChecksumSHA256, req.Size, ttl)
 	if err != nil {
 		httpx.WriteError(w, r, http.StatusInternalServerError, "token_failed", err.Error(), nil)
 		return
@@ -103,7 +107,7 @@ func (h *Handler) UploadObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
-	upload, err := h.svc.UploadObject(r.Context(), token, io.LimitReader(r.Body, 100<<20))
+	upload, err := h.Svc.UploadObject(r.Context(), token, io.LimitReader(r.Body, 100<<20))
 	if err != nil {
 		status := http.StatusInternalServerError
 		code := "upload_failed"
@@ -135,7 +139,7 @@ func (h *Handler) CompleteUpload(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "token required", nil)
 		return
 	}
-	attachmentID, err := h.svc.CompleteUpload(r.Context(), token)
+	attachmentID, err := h.Svc.CompleteUpload(r.Context(), token)
 	if err != nil {
 		status := http.StatusInternalServerError
 		code := "complete_failed"
@@ -167,7 +171,7 @@ func (h *Handler) CreateDownload(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "attachment id required", nil)
 		return
 	}
-	download, err := h.svc.CreateDownload(r.Context(), userID, attachmentID, 10*time.Minute)
+	download, err := h.Svc.CreateDownload(r.Context(), userID, attachmentID, 10*time.Minute)
 	if err != nil {
 		status := http.StatusInternalServerError
 		code := "download_failed"
@@ -187,7 +191,7 @@ func (h *Handler) DownloadObject(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "download token required", nil)
 		return
 	}
-	reader, fileName, mimeType, sizeBytes, err := h.svc.OpenDownload(r.Context(), token)
+	reader, fileName, mimeType, sizeBytes, err := h.Svc.OpenDownload(r.Context(), token)
 	if err != nil {
 		status := http.StatusInternalServerError
 		code := "download_failed"

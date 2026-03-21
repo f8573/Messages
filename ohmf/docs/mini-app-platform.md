@@ -42,3 +42,4 @@ Testing notes
 References
 - Manifest schema: `packages/protocol/schemas/miniapp_manifest.schema.json`
 - Example mini-app: `packages/miniapp/examples/eightball/manifest.json`
+- **Ownership Boundaries:** `docs/miniapp/ownership-boundaries.md` (gateway vs apps service responsibility)
