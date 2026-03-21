@@ -16,7 +16,8 @@
   </style>
 </head>
 <body>
-  <iframe id="miniapp-frame" sandbox="allow-scripts allow-same-origin"></iframe>
+  <!-- P3.2: Isolated runtime origins. Removed 'allow-same-origin' to enforce origin isolation. -->
+  <iframe id="miniapp-frame" sandbox="allow-scripts"></iframe>
   <script src="miniapp_host_shell.js"></script>
 </body>
 </html>
