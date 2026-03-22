@@ -3,9 +3,11 @@ package e2ee
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/binary"
 	"fmt"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	// This import will be available after: go get github.com/signal-golang/libsignal-go
 	// signal "github.com/signal-golang/libsignal-go/signal"
@@ -29,11 +31,11 @@ import (
 //
 // Stores Signal protocol sessions (one per sender-recipient device pair)
 type PostgresSessionStore struct {
-	db *sql.DB
+	db *pgxpool.Pool
 }
 
 // NewPostgresSessionStore creates a new session store backed by PostgreSQL
-func NewPostgresSessionStore(db *sql.DB) *PostgresSessionStore {
+func NewPostgresSessionStore(db *pgxpool.Pool) *PostgresSessionStore {
 	return &PostgresSessionStore{db: db}
 }
 
@@ -54,12 +56,12 @@ func (s *PostgresSessionStore) LoadSession(ctx context.Context, name string, dev
 	`
 
 	var sessionBytes []byte
-	err := s.db.QueryRowContext(ctx, query, name, deviceID).Scan(&sessionBytes)
-	if err == sql.ErrNoRows {
-		// No session yet - libsignal will create one
-		return nil, nil
-	}
+	err := s.db.QueryRow(ctx, query, name, deviceID).Scan(&sessionBytes)
 	if err != nil {
+		if err == pgx.ErrNoRows {
+			// No session yet - libsignal will create one
+			return nil, nil
+		}
 		return nil, fmt.Errorf("load session failed: %w", err)
 	}
 
@@ -80,7 +82,7 @@ func (s *PostgresSessionStore) StoreSession(ctx context.Context, name string, de
 			updated_at = NOW()
 	`
 
-	_, err := s.db.ExecContext(ctx, query, name, deviceID, sessionBytes)
+	_, err := s.db.Exec(ctx, query, name, deviceID, sessionBytes)
 	if err != nil {
 		return fmt.Errorf("store session failed: %w", err)
 	}
@@ -100,7 +102,7 @@ func (s *PostgresSessionStore) HasSession(ctx context.Context, name string, devi
 	`
 
 	var exists bool
-	err := s.db.QueryRowContext(ctx, query, name, deviceID).Scan(&exists)
+	err := s.db.QueryRow(ctx, query, name, deviceID).Scan(&exists)
 	if err != nil {
 		return false, fmt.Errorf("has session check failed: %w", err)
 	}
@@ -117,7 +119,7 @@ func (s *PostgresSessionStore) DeleteSession(ctx context.Context, name string, d
 		WHERE contact_user_id = $1::uuid AND contact_device_id = $2
 	`
 
-	_, err := s.db.ExecContext(ctx, query, name, deviceID)
+	_, err := s.db.Exec(ctx, query, name, deviceID)
 	if err != nil {
 		return fmt.Errorf("delete session failed: %w", err)
 	}
@@ -134,7 +136,7 @@ func (s *PostgresSessionStore) DeleteAllSessions(ctx context.Context, name strin
 		WHERE contact_user_id = $1::uuid
 	`
 
-	_, err := s.db.ExecContext(ctx, query, name)
+	_, err := s.db.Exec(ctx, query, name)
 	if err != nil {
 		return fmt.Errorf("delete all sessions failed: %w", err)
 	}
@@ -146,11 +148,11 @@ func (s *PostgresSessionStore) DeleteAllSessions(ctx context.Context, name strin
 //
 // Stores identity keys and manages trust state
 type PostgresIdentityKeyStore struct {
-	db *sql.DB
+	db *pgxpool.Pool
 }
 
 // NewPostgresIdentityKeyStore creates a new identity key store
-func NewPostgresIdentityKeyStore(db *sql.DB) *PostgresIdentityKeyStore {
+func NewPostgresIdentityKeyStore(db *pgxpool.Pool) *PostgresIdentityKeyStore {
 	return &PostgresIdentityKeyStore{db: db}
 }
 
@@ -169,7 +171,7 @@ func (s *PostgresIdentityKeyStore) GetIdentityKeyPair(ctx context.Context) ([]by
 	`
 
 	var privKeyBytes []byte
-	err := s.db.QueryRowContext(ctx, query).Scan(&privKeyBytes)
+	err := s.db.QueryRow(ctx, query).Scan(&privKeyBytes)
 	if err != nil {
 		return nil, fmt.Errorf("get identity keypair failed: %w", err)
 	}
@@ -194,7 +196,7 @@ func (s *PostgresIdentityKeyStore) GetLocalRegistrationID(ctx context.Context) (
 	`
 
 	var regID int32
-	err := s.db.QueryRowContext(ctx, query).Scan(&regID)
+	err := s.db.QueryRow(ctx, query).Scan(&regID)
 	if err != nil {
 		return 0, fmt.Errorf("get registration ID failed: %w", err)
 	}
@@ -216,12 +218,12 @@ func (s *PostgresIdentityKeyStore) IsTrustedIdentity(ctx context.Context, name s
 	`
 
 	var trustState string
-	err := s.db.QueryRowContext(ctx, query, name, deviceID).Scan(&trustState)
-	if err == sql.ErrNoRows {
-		// No trust record yet - TOFU model accepts first key
-		return true, nil
-	}
+	err := s.db.QueryRow(ctx, query, name, deviceID).Scan(&trustState)
 	if err != nil {
+		if err == pgx.ErrNoRows {
+			// No trust record yet - TOFU model accepts first key
+			return true, nil
+		}
 		return false, fmt.Errorf("trust check failed: %w", err)
 	}
 
@@ -247,12 +249,12 @@ func (s *PostgresIdentityKeyStore) SaveIdentity(ctx context.Context, name string
 	`
 
 	var result int
-	err := s.db.QueryRowContext(ctx, query, name, deviceID, fingerprint).Scan(&result)
-	if err == sql.ErrNoRows {
-		// Conflict - key already existed (not new)
-		return false, nil
-	}
+	err := s.db.QueryRow(ctx, query, name, deviceID, fingerprint).Scan(&result)
 	if err != nil {
+		if err == pgx.ErrNoRows {
+			// Conflict - key already existed (not new)
+			return false, nil
+		}
 		return false, fmt.Errorf("save identity failed: %w", err)
 	}
 
@@ -263,11 +265,11 @@ func (s *PostgresIdentityKeyStore) SaveIdentity(ctx context.Context, name string
 //
 // Manages one-time prekeys (ephemeral)
 type PostgresPreKeyStore struct {
-	db *sql.DB
+	db *pgxpool.Pool
 }
 
 // NewPostgresPreKeyStore creates a new prekey store
-func NewPostgresPreKeyStore(db *sql.DB) *PostgresPreKeyStore {
+func NewPostgresPreKeyStore(db *pgxpool.Pool) *PostgresPreKeyStore {
 	return &PostgresPreKeyStore{db: db}
 }
 
@@ -285,11 +287,11 @@ func (s *PostgresPreKeyStore) LoadPreKey(ctx context.Context, prekeyID uint32) (
 	`
 
 	var pubKey, privKey string
-	err := s.db.QueryRowContext(ctx, query, prekeyID).Scan(&pubKey, &privKey)
-	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("prekey not found: %d", prekeyID)
-	}
+	err := s.db.QueryRow(ctx, query, prekeyID).Scan(&pubKey, &privKey)
 	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, fmt.Errorf("prekey not found: %d", prekeyID)
+		}
 		return nil, fmt.Errorf("load prekey failed: %w", err)
 	}
 
@@ -300,14 +302,6 @@ func (s *PostgresPreKeyStore) LoadPreKey(ctx context.Context, prekeyID uint32) (
 	copy(recordBytes[len(pubKey):], []byte(privKey))
 
 	return recordBytes, nil
-}
-
-// StorePreKey saves a prekey
-// Implements: signal.PreKeyStore.StorePreKey(ctx, preKeyID, record)
-func (s *PostgresPreKeyStore) StorePreKey(ctx context.Context, prekeyID uint32, prekeyBytes []byte) error {
-	// Prekeys are normally generated client-side, not stored in this pattern
-	// This is here for completeness but typically prekeys come from client bundles
-	return fmt.Errorf("StorePreKey called server-side - prekeys should come from client bundles")
 }
 
 // ContainsPreKey checks if a prekey exists
@@ -322,7 +316,7 @@ func (s *PostgresPreKeyStore) ContainsPreKey(ctx context.Context, prekeyID uint3
 	`
 
 	var exists bool
-	err := s.db.QueryRowContext(ctx, query, prekeyID).Scan(&exists)
+	err := s.db.QueryRow(ctx, query, prekeyID).Scan(&exists)
 	if err != nil {
 		return false, fmt.Errorf("contains prekey check failed: %w", err)
 	}
@@ -340,7 +334,7 @@ func (s *PostgresPreKeyStore) RemovePreKey(ctx context.Context, prekeyID uint32)
 		WHERE user_id = CURRENT_USER_UUID() AND prekey_id = $1
 	`
 
-	_, err := s.db.ExecContext(ctx, query, prekeyID)
+	_, err := s.db.Exec(ctx, query, prekeyID)
 	if err != nil {
 		return fmt.Errorf("remove prekey failed: %w", err)
 	}
@@ -352,11 +346,11 @@ func (s *PostgresPreKeyStore) RemovePreKey(ctx context.Context, prekeyID uint32)
 //
 // Manages signed prekeys (medium-lived, rotated monthly)
 type PostgresSignedPreKeyStore struct {
-	db *sql.DB
+	db *pgxpool.Pool
 }
 
 // NewPostgresSignedPreKeyStore creates a new signed prekey store
-func NewPostgresSignedPreKeyStore(db *sql.DB) *PostgresSignedPreKeyStore {
+func NewPostgresSignedPreKeyStore(db *pgxpool.Pool) *PostgresSignedPreKeyStore {
 	return &PostgresSignedPreKeyStore{db: db}
 }
 
@@ -376,11 +370,11 @@ func (s *PostgresSignedPreKeyStore) LoadSignedPreKey(ctx context.Context, signed
 	`
 
 	var pubKey, privKey, sig string
-	err := s.db.QueryRowContext(ctx, query, signedPreKeyID).Scan(&pubKey, &privKey, &sig)
-	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("signed prekey not found: %d", signedPreKeyID)
-	}
+	err := s.db.QueryRow(ctx, query, signedPreKeyID).Scan(&pubKey, &privKey, &sig)
 	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, fmt.Errorf("signed prekey not found: %d", signedPreKeyID)
+		}
 		return nil, fmt.Errorf("load signed prekey failed: %w", err)
 	}
 
@@ -405,14 +399,6 @@ func (s *PostgresSignedPreKeyStore) LoadSignedPreKey(ctx context.Context, signed
 	return recordBytes, nil
 }
 
-// StoreSignedPreKey saves a signed prekey (typically on account creation or rotation)
-// Implements: signal.SignedPreKeyStore.StoreSignedPreKey(ctx, signedPreKeyID, record)
-func (s *PostgresSignedPreKeyStore) StoreSignedPreKey(ctx context.Context, signedPreKeyID uint32, signedPreKeyBytes []byte) error {
-	// Signed prekeys are typically received from client bundles, not generated server-side
-	// This is here for completeness
-	return fmt.Errorf("StoreSignedPreKey called server-side - signed prekeys come from client")
-}
-
 // ContainsSignedPreKey checks if a signed prekey exists
 // Implements: signal.SignedPreKeyStore.ContainsSignedPreKey(ctx, signedPreKeyID) (bool, error)
 func (s *PostgresSignedPreKeyStore) ContainsSignedPreKey(ctx context.Context, signedPreKeyID uint32) (bool, error) {
@@ -426,7 +412,7 @@ func (s *PostgresSignedPreKeyStore) ContainsSignedPreKey(ctx context.Context, si
 	`
 
 	var exists bool
-	err := s.db.QueryRowContext(ctx, query, signedPreKeyID).Scan(&exists)
+	err := s.db.QueryRow(ctx, query, signedPreKeyID).Scan(&exists)
 	if err != nil {
 		return false, fmt.Errorf("contains signed prekey check failed: %w", err)
 	}

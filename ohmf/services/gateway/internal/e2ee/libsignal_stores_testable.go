@@ -3,9 +3,11 @@ package e2ee
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/binary"
 	"fmt"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // SessionStoreWithUser wraps SessionStore with an authenticated user context
@@ -16,7 +18,7 @@ type SessionStoreWithUser struct {
 }
 
 // NewSessionStoreWithUser creates a store bound to a specific user
-func NewSessionStoreWithUser(db *sql.DB, userID string, deviceID int64) *SessionStoreWithUser {
+func NewSessionStoreWithUser(db *pgxpool.Pool, userID string, deviceID int64) *SessionStoreWithUser {
 	return &SessionStoreWithUser{
 		store:    NewPostgresSessionStore(db),
 		userID:   userID,
@@ -34,11 +36,11 @@ func (s *SessionStoreWithUser) LoadSession(ctx context.Context, contactUserID st
 	`
 
 	var sessionBytes []byte
-	err := s.store.db.QueryRowContext(ctx, query, s.userID, contactUserID, contactDeviceID).Scan(&sessionBytes)
-	if err == sql.ErrNoRows {
-		return nil, nil // No session yet
-	}
+	err := s.store.db.QueryRow(ctx, query, s.userID, contactUserID, contactDeviceID).Scan(&sessionBytes)
 	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, nil // No session yet
+		}
 		return nil, fmt.Errorf("load session failed: %w", err)
 	}
 
@@ -55,7 +57,7 @@ func (s *SessionStoreWithUser) StoreSession(ctx context.Context, contactUserID s
 			updated_at = NOW()
 	`
 
-	_, err := s.store.db.ExecContext(ctx, query, s.userID, contactUserID, contactDeviceID, sessionBytes)
+	_, err := s.store.db.Exec(ctx, query, s.userID, contactUserID, contactDeviceID, sessionBytes)
 	if err != nil {
 		return fmt.Errorf("store session failed: %w", err)
 	}
@@ -74,7 +76,7 @@ func (s *SessionStoreWithUser) HasSession(ctx context.Context, contactUserID str
 	`
 
 	var exists bool
-	err := s.store.db.QueryRowContext(ctx, query, s.userID, contactUserID, contactDeviceID).Scan(&exists)
+	err := s.store.db.QueryRow(ctx, query, s.userID, contactUserID, contactDeviceID).Scan(&exists)
 	if err != nil {
 		return false, fmt.Errorf("has session check failed: %w", err)
 	}
@@ -89,7 +91,7 @@ func (s *SessionStoreWithUser) DeleteSession(ctx context.Context, contactUserID 
 		WHERE user_id = $1::uuid AND contact_user_id = $2::uuid AND contact_device_id = $3
 	`
 
-	_, err := s.store.db.ExecContext(ctx, query, s.userID, contactUserID, contactDeviceID)
+	_, err := s.store.db.Exec(ctx, query, s.userID, contactUserID, contactDeviceID)
 	if err != nil {
 		return fmt.Errorf("delete session failed: %w", err)
 	}
@@ -104,7 +106,7 @@ func (s *SessionStoreWithUser) DeleteAllSessions(ctx context.Context, contactUse
 		WHERE user_id = $1::uuid AND contact_user_id = $2::uuid
 	`
 
-	_, err := s.store.db.ExecContext(ctx, query, s.userID, contactUserID)
+	_, err := s.store.db.Exec(ctx, query, s.userID, contactUserID)
 	if err != nil {
 		return fmt.Errorf("delete all sessions failed: %w", err)
 	}
@@ -120,7 +122,7 @@ type IdentityStoreWithUser struct {
 }
 
 // NewIdentityStoreWithUser creates an identity store bound to a specific user
-func NewIdentityStoreWithUser(db *sql.DB, userID string) *IdentityStoreWithUser {
+func NewIdentityStoreWithUser(db *pgxpool.Pool, userID string) *IdentityStoreWithUser {
 	return &IdentityStoreWithUser{
 		store:  NewPostgresIdentityKeyStore(db),
 		userID: userID,
@@ -137,12 +139,12 @@ func (s *IdentityStoreWithUser) IsTrustedIdentity(ctx context.Context, contactUs
 	`
 
 	var trustState string
-	err := s.store.db.QueryRowContext(ctx, query, s.userID, contactUserID, contactDeviceID).Scan(&trustState)
-	if err == sql.ErrNoRows {
-		// No trust record yet - TOFU model accepts first key
-		return true, nil
-	}
+	err := s.store.db.QueryRow(ctx, query, s.userID, contactUserID, contactDeviceID).Scan(&trustState)
 	if err != nil {
+		if err == pgx.ErrNoRows {
+			// No trust record yet - TOFU model accepts first key
+			return true, nil
+		}
 		return false, fmt.Errorf("trust check failed: %w", err)
 	}
 
@@ -164,12 +166,12 @@ func (s *IdentityStoreWithUser) SaveIdentity(ctx context.Context, contactUserID 
 	`
 
 	var result int
-	err := s.store.db.QueryRowContext(ctx, query, s.userID, contactUserID, contactDeviceID, fingerprint).Scan(&result)
-	if err == sql.ErrNoRows {
-		// Conflict - key already existed (not new)
-		return false, nil
-	}
+	err := s.store.db.QueryRow(ctx, query, s.userID, contactUserID, contactDeviceID, fingerprint).Scan(&result)
 	if err != nil {
+		if err == pgx.ErrNoRows {
+			// Conflict - key already existed (not new)
+			return false, nil
+		}
 		return false, fmt.Errorf("save identity failed: %w", err)
 	}
 
@@ -184,7 +186,7 @@ type PreKeyStoreWithUser struct {
 }
 
 // NewPreKeyStoreWithUser creates a prekey store for a user
-func NewPreKeyStoreWithUser(db *sql.DB, userID string) *PreKeyStoreWithUser {
+func NewPreKeyStoreWithUser(db *pgxpool.Pool, userID string) *PreKeyStoreWithUser {
 	return &PreKeyStoreWithUser{
 		store:  NewPostgresPreKeyStore(db),
 		userID: userID,
@@ -201,11 +203,11 @@ func (s *PreKeyStoreWithUser) LoadPreKey(ctx context.Context, prekeyID uint32) (
 	`
 
 	var pubKey, privKey string
-	err := s.store.db.QueryRowContext(ctx, query, s.userID, prekeyID).Scan(&pubKey, &privKey)
-	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("prekey not found: %d", prekeyID)
-	}
+	err := s.store.db.QueryRow(ctx, query, s.userID, prekeyID).Scan(&pubKey, &privKey)
 	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, fmt.Errorf("prekey not found: %d", prekeyID)
+		}
 		return nil, fmt.Errorf("load prekey failed: %w", err)
 	}
 
@@ -228,7 +230,7 @@ func (s *PreKeyStoreWithUser) ContainsPreKey(ctx context.Context, prekeyID uint3
 	`
 
 	var exists bool
-	err := s.store.db.QueryRowContext(ctx, query, s.userID, prekeyID).Scan(&exists)
+	err := s.store.db.QueryRow(ctx, query, s.userID, prekeyID).Scan(&exists)
 	if err != nil {
 		return false, fmt.Errorf("contains prekey check failed: %w", err)
 	}
@@ -244,7 +246,7 @@ func (s *PreKeyStoreWithUser) RemovePreKey(ctx context.Context, prekeyID uint32)
 		WHERE user_id = $1::uuid AND prekey_id = $2
 	`
 
-	_, err := s.store.db.ExecContext(ctx, query, s.userID, prekeyID)
+	_, err := s.store.db.Exec(ctx, query, s.userID, prekeyID)
 	if err != nil {
 		return fmt.Errorf("remove prekey failed: %w", err)
 	}
@@ -260,7 +262,7 @@ type SignedPreKeyStoreWithUser struct {
 }
 
 // NewSignedPreKeyStoreWithUser creates a signed prekey store for a user
-func NewSignedPreKeyStoreWithUser(db *sql.DB, userID string) *SignedPreKeyStoreWithUser {
+func NewSignedPreKeyStoreWithUser(db *pgxpool.Pool, userID string) *SignedPreKeyStoreWithUser {
 	return &SignedPreKeyStoreWithUser{
 		store:  NewPostgresSignedPreKeyStore(db),
 		userID: userID,
@@ -278,11 +280,11 @@ func (s *SignedPreKeyStoreWithUser) LoadSignedPreKey(ctx context.Context, signed
 	`
 
 	var pubKey, privKey, sig string
-	err := s.store.db.QueryRowContext(ctx, query, s.userID, signedPreKeyID).Scan(&pubKey, &privKey, &sig)
-	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("signed prekey not found: %d", signedPreKeyID)
-	}
+	err := s.store.db.QueryRow(ctx, query, s.userID, signedPreKeyID).Scan(&pubKey, &privKey, &sig)
 	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, fmt.Errorf("signed prekey not found: %d", signedPreKeyID)
+		}
 		return nil, fmt.Errorf("load signed prekey failed: %w", err)
 	}
 
@@ -316,7 +318,7 @@ func (s *SignedPreKeyStoreWithUser) ContainsSignedPreKey(ctx context.Context, si
 	`
 
 	var exists bool
-	err := s.store.db.QueryRowContext(ctx, query, s.userID, signedPreKeyID).Scan(&exists)
+	err := s.store.db.QueryRow(ctx, query, s.userID, signedPreKeyID).Scan(&exists)
 	if err != nil {
 		return false, fmt.Errorf("contains signed prekey check failed: %w", err)
 	}

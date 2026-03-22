@@ -1,7 +1,6 @@
 package e2ee
 
 import (
-	"database/sql"
 	"net/http"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -15,10 +14,10 @@ type Handler struct {
 }
 
 // NewHandler creates a new E2EE handler
-func NewHandler(db *sql.DB, pgxPool *pgxpool.Pool) *Handler {
+func NewHandler(pool *pgxpool.Pool) *Handler {
 	return &Handler{
-		pool: pgxPool,
-		sm:   NewSessionManager(db),
+		pool: pool,
+		sm:   NewSessionManager(pool),
 	}
 }
 
