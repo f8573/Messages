@@ -28,6 +28,8 @@ const state = {
   sessionMode: "local",
   appOrigin: null, // P3.2: Isolated runtime origin (e.g., "a7f3e1c5.miniapp.local")
   logEntries: [],
+  ws: null, // P4.3: WebSocket v2 connection for real-time session events
+  activeSessionSubscriptions: new Set(), // P4.3: Track active session subscriptions for reconnection
 };
 
 const el = {
@@ -488,6 +490,16 @@ async function ensureGatewaySession() {
     },
   });
   applySessionRecord(record, "gateway");
+
+  // P4.3: Subscribe to session events via WebSocket v2 if session established
+  if (state.launchContext?.app_session_id && state.ws && state.ws.readyState === WebSocket.OPEN) {
+    subscribeToSessionEvents(state.launchContext.app_session_id);
+  } else if (state.launchContext?.app_session_id) {
+    // Queue subscription for after WebSocket connects
+    addLog("debug", "runtime.session_created_queued_for_subscription", {
+      app_session_id: state.launchContext.app_session_id,
+    });
+  }
 }
 
 async function initializeSession() {
@@ -499,6 +511,8 @@ async function initializeSession() {
         app_session_id: state.launchContext?.app_session_id,
         conversation_id: state.launchContext?.conversation_id,
       });
+      // P4.3: Establish WebSocket v2 connection for real-time session events
+      await ensureWebSocketConnected();
       return;
     } catch (error) {
       addLog("error", "runtime.gateway_session_failed", { message: error.message || String(error), code: error.code });
@@ -509,6 +523,187 @@ async function initializeSession() {
     app_session_id: state.launchContext?.app_session_id,
     conversation_id: state.launchContext?.conversation_id,
   });
+}
+
+// P4.3: WebSocket v2 Session Subscription Implementation
+function ensureWebSocketConnected() {
+  return new Promise((resolve) => {
+    // If WebSocket is already connected, resolve immediately
+    if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+      resolve();
+      return;
+    }
+
+    // If WebSocket is connecting, wait for it
+    if (state.ws && (state.ws.readyState === WebSocket.CONNECTING)) {
+      const checkInterval = setInterval(() => {
+        if (state.ws.readyState === WebSocket.OPEN) {
+          clearInterval(checkInterval);
+          resolve();
+        }
+      }, 100);
+      return;
+    }
+
+    // Create new WebSocket connection
+    startWebSocketConnection().then(resolve);
+  });
+}
+
+function startWebSocketConnection() {
+  return new Promise((resolve) => {
+    state.auth = loadRuntimeAuth();
+    if (!state.auth?.accessToken) {
+      addLog("warn", "runtime.websocket_skipped", { reason: "no_auth_token" });
+      resolve();
+      return;
+    }
+
+    const wsURL = new URL(state.apiBaseUrl.replace(/^http/i, "ws") + "/v2/ws");
+    wsURL.searchParams.set("access_token", state.auth.accessToken);
+    const socket = new WebSocket(wsURL.toString());
+    state.ws = socket;
+
+    socket.addEventListener("open", () => {
+      addLog("ok", "runtime.websocket_connected", {});
+      // Send hello handshake
+      socket.send(JSON.stringify({
+        event: "hello",
+        data: { device_id: randomId("dev") },
+      }));
+      // Resubscribe to active sessions after reconnection
+      handleReconnect();
+      resolve();
+    });
+
+    socket.addEventListener("message", (event) => {
+      try {
+        const message = JSON.parse(event.data);
+        const eventName = message?.event;
+        switch (eventName) {
+          case "hello_ack":
+            addLog("ok", "runtime.websocket_hello_ack", {});
+            break;
+          case "subscribe_session_ack":
+            // Subscription successful
+            addLog("ok", "runtime.session_subscribed", { session_id: message.data?.session_id });
+            break;
+          case "session_event":
+            // P4.3: Handle real-time session events
+            handleSessionEvent(message.data);
+            break;
+          case "error":
+            if (message.data?.code === "too_many_subscriptions") {
+              addLog("warn", "runtime.too_many_subscriptions", { detail: message.data });
+            } else {
+              addLog("error", "runtime.websocket_error", { code: message.data?.code, detail: message.data });
+            }
+            break;
+          default:
+            addLog("debug", `runtime.websocket_message:${eventName}`, message.data);
+        }
+      } catch (error) {
+        addLog("error", "runtime.websocket_parse_error", { message: error.message });
+      }
+    });
+
+    socket.addEventListener("close", () => {
+      if (state.ws === socket) {
+        state.ws = null;
+        addLog("warn", "runtime.websocket_closed", {});
+      }
+    });
+
+    socket.addEventListener("error", (error) => {
+      addLog("error", "runtime.websocket_error", { message: error.message || "WebSocket error" });
+      socket.close();
+    });
+  });
+}
+
+function subscribeToSessionEvents(sessionID) {
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+    addLog("warn", "runtime.session_subscribe_skipped", { session_id: sessionID, reason: "websocket_not_ready" });
+    return;
+  }
+
+  state.ws.send(JSON.stringify({
+    event: "subscribe_session",
+    data: { session_id: sessionID },
+  }));
+
+  // Track subscription for reconnection
+  state.activeSessionSubscriptions.add(sessionID);
+  addLog("debug", "runtime.session_subscribed_request_sent", { session_id: sessionID });
+}
+
+function handleSessionEvent(evt) {
+  // Extract event details
+  const { event_seq, event_type, actor_id, body, created_at } = evt;
+
+  // Update local app state based on event_type
+  switch (event_type) {
+    case "session_created":
+      // Emit event for mini-app to react to
+      window.postMessage({
+        type: "SESSION_EVENT",
+        payload: { event_type: "session_created", data: body },
+      }, state.appOrigin || "*");
+      addLog("ok", "runtime.session_event:session_created", { event_seq, body });
+      break;
+
+    case "storage_updated":
+      // Update local session storage state from event
+      if (body && typeof body === "object") {
+        state.sessionState.storage = { ...state.sessionState.storage, ...body };
+        saveSession();
+      }
+      window.postMessage({
+        type: "SESSION_EVENT",
+        payload: { event_type: "storage_updated", data: body },
+      }, state.appOrigin || "*");
+      addLog("ok", "runtime.session_event:storage_updated", { event_seq, body });
+      break;
+
+    case "snapshot_written":
+      // Update local snapshot state from event
+      if (body && typeof body === "object") {
+        state.sessionState.stateSnapshot = body;
+        state.launchContext.state_snapshot = cloneJson(body);
+        saveSession();
+      }
+      window.postMessage({
+        type: "SESSION_EVENT",
+        payload: { event_type: "snapshot_written", data: body },
+      }, state.appOrigin || "*");
+      addLog("ok", "runtime.session_event:snapshot_written", { event_seq, body });
+      break;
+
+    case "message_projected":
+      // Handle message event
+      if (body && typeof body === "object") {
+        appendProjectedMessage(body.text || "(message event)", body.content_type || "app_event", body.content || null);
+      }
+      window.postMessage({
+        type: "SESSION_EVENT",
+        payload: { event_type: "message_projected", data: body },
+      }, state.appOrigin || "*");
+      addLog("ok", "runtime.session_event:message_projected", { event_seq, body });
+      break;
+
+    default:
+      addLog("debug", `runtime.session_event:${event_type}`, { event_seq, body });
+  }
+}
+
+function handleReconnect() {
+  // Resubscribe to all active sessions after reconnection
+  if (state.activeSessionSubscriptions && state.activeSessionSubscriptions.size > 0) {
+    addLog("debug", "runtime.reconnect_resubscribing", { count: state.activeSessionSubscriptions.size });
+    for (const sessionID of state.activeSessionSubscriptions) {
+      subscribeToSessionEvents(sessionID);
+    }
+  }
 }
 
 function buildFrameUrl() {
@@ -898,6 +1093,8 @@ el.clearSessionBtn.addEventListener("click", async () => {
   }
   try {
     if (state.sessionMode === "gateway" && state.launchContext?.app_session_id) {
+      // P4.3: Remove session subscription before deleting
+      state.activeSessionSubscriptions.delete(state.launchContext.app_session_id);
       await gatewayRequest(`/v1/apps/sessions/${encodeURIComponent(state.launchContext.app_session_id)}`, { method: "DELETE" });
     }
   } catch (error) {
