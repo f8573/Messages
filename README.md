@@ -1,6 +1,6 @@
 # Messages Local Development
 
-This repository contains the OHMF services and local infrastructure for development.
+This repository contains the OHMF services and associated local infrastructure for development.
 
 This guide explains how to:
 - Set up your local environment
