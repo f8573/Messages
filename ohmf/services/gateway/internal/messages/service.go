@@ -2414,15 +2414,14 @@ func (s *Service) sendSyncWithEndpoint(ctx context.Context, userID, senderDevice
 	// Process encrypted messages and validate signature
 	var isEncrypted bool
 	var encryptionScheme string
-	// Encrypted message processing disabled pending pgx integration
-	// if strings.EqualFold(contentType, "encrypted") {
-	// 	encryptedMetadata, err := ProcessEncryptedMessage(ctx, s.db, userID, senderDeviceID, contentForStorage)
-	// 	if err != nil {
-	// 		return Message{}, err
-	// 	}
-	// 	isEncrypted = true
-	// 	encryptionScheme = encryptedMetadata.Scheme
-	// }
+	if strings.EqualFold(contentType, "encrypted") {
+		encryptedMetadata, err := ProcessEncryptedMessage(ctx, s.db, userID, senderDeviceID, contentForStorage)
+		if err != nil {
+			return Message{}, err
+		}
+		isEncrypted = true
+		encryptionScheme = encryptedMetadata.Scheme
+	}
 
 	var msgID string
 	var created time.Time
