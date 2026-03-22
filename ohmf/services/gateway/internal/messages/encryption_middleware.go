@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/jackc/pgx/v5"
 	"ohmf/services/gateway/internal/e2ee"
 )
 
@@ -32,7 +33,7 @@ type RecipientKeyInfo struct {
 
 // EncryptedMessageQuerier defines the database interface needed for encrypted message processing
 type EncryptedMessageQuerier interface {
-	QueryRow(ctx context.Context, sql string, args ...any) interface{ Scan(...any) error }
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
 // ProcessEncryptedMessage validates and extracts metadata from encrypted message content

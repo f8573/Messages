@@ -47,7 +47,7 @@ func TestUpdatePreferencesPersistsAndPublishesStateEvent(t *testing.T) {
 	defer rdb.Close()
 
 	store := replication.NewStore(pool, rdb)
-	svc := NewService(pool, store)
+	svc := NewService(pool, store, nil)
 
 	actorID := insertTestUser(t, ctx, pool)
 	targetID := insertTestUser(t, ctx, pool)
@@ -128,7 +128,7 @@ func TestUpdateMetadataPersistsDescriptionAndPreservesEffectPolicy(t *testing.T)
 		t.Fatalf("insert member: %v", err)
 	}
 
-	svc := NewService(pool, nil)
+	svc := NewService(pool, nil, nil)
 	h := NewHandler(svc)
 
 	body := `{"description":"Launch coordination thread"}`
@@ -185,7 +185,7 @@ func TestBlockUserPublishesCrossDeviceConversationState(t *testing.T) {
 	defer rdb.Close()
 
 	store := replication.NewStore(pool, rdb)
-	convSvc := NewService(pool, store)
+	convSvc := NewService(pool, store, nil)
 	userSvc := users.NewService(pool, store)
 
 	actorID := insertTestUser(t, ctx, pool)

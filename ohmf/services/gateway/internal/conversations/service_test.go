@@ -15,7 +15,7 @@ func TestUpdateEffectPolicyOwnerCanToggleEffects(t *testing.T) {
 	}
 	defer mock.Close()
 
-	svc := NewService(mock, nil)
+	svc := NewService(mock, nil, nil)
 
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT cm.role, c.type FROM conversation_members cm JOIN conversations c ON c.id = cm.conversation_id WHERE cm.conversation_id = \$1::uuid AND cm.user_id = \$2::uuid`).
@@ -42,7 +42,7 @@ func TestUpdateEffectPolicyRejectsNonOwner(t *testing.T) {
 	}
 	defer mock.Close()
 
-	svc := NewService(mock, nil)
+	svc := NewService(mock, nil, nil)
 
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT cm.role, c.type FROM conversation_members cm JOIN conversations c ON c.id = cm.conversation_id WHERE cm.conversation_id = \$1::uuid AND cm.user_id = \$2::uuid`).
@@ -67,7 +67,7 @@ func TestUpdateEffectPolicyAllowsAdmin(t *testing.T) {
 	}
 	defer mock.Close()
 
-	svc := NewService(mock, nil)
+	svc := NewService(mock, nil, nil)
 
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT cm.role, c.type FROM conversation_members cm JOIN conversations c ON c.id = cm.conversation_id WHERE cm.conversation_id = \$1::uuid AND cm.user_id = \$2::uuid`).
@@ -94,7 +94,7 @@ func TestUpdateMemberRoleRejectsDemotingLastOwner(t *testing.T) {
 	}
 	defer mock.Close()
 
-	svc := NewService(mock, nil)
+	svc := NewService(mock, nil, nil)
 
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT cm.role, c.type FROM conversation_members cm JOIN conversations c ON c.id = cm.conversation_id WHERE cm.conversation_id = \$1::uuid AND cm.user_id = \$2::uuid`).
@@ -125,7 +125,7 @@ func TestCreateInviteCreatesActiveCode(t *testing.T) {
 	}
 	defer mock.Close()
 
-	svc := NewService(mock, nil)
+	svc := NewService(mock, nil, nil)
 	now := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)
 	expires := now.Add(time.Hour)
 
