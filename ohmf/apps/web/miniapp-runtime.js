@@ -534,14 +534,13 @@ function ensureWebSocketConnected() {
       return;
     }
 
-    // If WebSocket is connecting, wait for it
-    if (state.ws && (state.ws.readyState === WebSocket.CONNECTING)) {
-      const checkInterval = setInterval(() => {
-        if (state.ws.readyState === WebSocket.OPEN) {
-          clearInterval(checkInterval);
-          resolve();
-        }
-      }, 100);
+    // If WebSocket is connecting, wait for it using event-based listener
+    if (state.ws && state.ws.readyState === WebSocket.CONNECTING) {
+      const onOpen = () => {
+        state.ws.removeEventListener("open", onOpen);
+        resolve();
+      };
+      state.ws.addEventListener("open", onOpen);
       return;
     }
 
@@ -624,6 +623,11 @@ function startWebSocketConnection() {
 function subscribeToSessionEvents(sessionID) {
   if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
     addLog("warn", "runtime.session_subscribe_skipped", { session_id: sessionID, reason: "websocket_not_ready" });
+    return;
+  }
+
+  // Skip redundant subscriptions
+  if (state.activeSessionSubscriptions.has(sessionID)) {
     return;
   }
 
@@ -843,19 +847,19 @@ async function persistSessionState(version, eventName, eventBody) {
 
 async function applyStateUpdate(params) {
   requirePermission("realtime.session");
-  const requested = params && typeof params === "object" ? cloneJson(params) : {};
+  const requested = params && typeof params === "object" ? params : {}; // removed: deep clone not needed, spread will copy
   if ("counter" in requested) {
     requested.counter = Math.max(0, Math.min(9999, Number(requested.counter) || 0));
   }
 
   state.sessionState.stateSnapshot = {
-    ...cloneJson(state.sessionState.stateSnapshot || {}),
+    ...(state.sessionState.stateSnapshot || {}), // removed: deep clone, shallow spread suffices
     ...requested,
     updated_by: state.launchContext?.viewer?.display_name || state.launchContext?.viewer?.user_id || "app",
     updated_at: new Date().toISOString(),
   };
   state.sessionState.stateVersion += 1;
-  state.launchContext.state_snapshot = cloneJson(state.sessionState.stateSnapshot);
+  state.launchContext.state_snapshot = state.sessionState.stateSnapshot; // removed: redundant clone of newly created object
   state.launchContext.state_version = state.sessionState.stateVersion;
 
   const persistedVersion = await persistSessionState(state.sessionState.stateVersion, "STATE_UPDATED", {

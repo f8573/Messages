@@ -25,6 +25,7 @@ import (
 // TestSingleClientRealtimeEventDelivery tests that a single client receives real-time events
 // within the expected latency when subscribed to a session.
 func TestSingleClientRealtimeEventDelivery(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
@@ -91,7 +92,7 @@ func TestSingleClientRealtimeEventDelivery(t *testing.T) {
 	require.NoError(t, err)
 
 	// Receive subscribe_session_ack
-	ack := waitForMessage(t, conn, 2*time.Second)
+	ack := waitForMessageNonBlocking(t, conn, 2*time.Second)
 	require.Equal(t, "subscribe_session_ack", ack["event"])
 
 	// Trigger event
@@ -101,7 +102,7 @@ func TestSingleClientRealtimeEventDelivery(t *testing.T) {
 	require.Greater(t, seq, int64(0))
 
 	// Wait for session_event within latency window
-	eventMsg := waitForMessage(t, conn, 100*time.Millisecond)
+	eventMsg := waitForMessageNonBlocking(t, conn, 100*time.Millisecond)
 	require.NotNil(t, eventMsg)
 	require.Equal(t, "session_event", eventMsg["event"])
 
@@ -117,6 +118,7 @@ func TestSingleClientRealtimeEventDelivery(t *testing.T) {
 // TestMultipleClientsReceiveEvent tests that multiple clients subscribed to the same session
 // both receive identical event payloads.
 func TestMultipleClientsReceiveEvent(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
@@ -188,11 +190,11 @@ func TestMultipleClientsReceiveEvent(t *testing.T) {
 	// Both clients subscribe to session
 	err = subscribeSession(t, conn1, sessionID)
 	require.NoError(t, err)
-	waitForMessage(t, conn1, 2*time.Second) // consume ack
+	waitForMessageNonBlocking(t, conn1, 2*time.Second) // consume ack
 
 	err = subscribeSession(t, conn2, sessionID)
 	require.NoError(t, err)
-	waitForMessage(t, conn2, 2*time.Second) // consume ack
+	waitForMessageNonBlocking(t, conn2, 2*time.Second) // consume ack
 
 	// Trigger event from client 1
 	eventBody := map[string]any{"type": "state_change", "data": "shared"}
@@ -200,11 +202,11 @@ func TestMultipleClientsReceiveEvent(t *testing.T) {
 	require.NoError(t, err)
 
 	// Both clients should receive identical events
-	event1 := waitForMessage(t, conn1, 100*time.Millisecond)
+	event1 := waitForMessageNonBlocking(t, conn1, 100*time.Millisecond)
 	require.NotNil(t, event1)
 	require.Equal(t, "session_event", event1["event"])
 
-	event2 := waitForMessage(t, conn2, 100*time.Millisecond)
+	event2 := waitForMessageNonBlocking(t, conn2, 100*time.Millisecond)
 	require.NotNil(t, event2)
 	require.Equal(t, "session_event", event2["event"])
 
@@ -220,6 +222,7 @@ func TestMultipleClientsReceiveEvent(t *testing.T) {
 // TestReconnectWithCursorResume tests that a client can reconnect and retrieve missed events
 // using polling with a cursor-based resume token.
 func TestReconnectWithCursorResume(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
@@ -302,6 +305,7 @@ func TestReconnectWithCursorResume(t *testing.T) {
 // TestUnsubscribeStopsEventDelivery tests that unsubscribing from a session stops event delivery.
 // If unsubscribe is not implemented, closing the connection should stop events.
 func TestUnsubscribeStopsEventDelivery(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
@@ -364,13 +368,13 @@ func TestUnsubscribeStopsEventDelivery(t *testing.T) {
 	// Subscribe to session
 	err = subscribeSession(t, conn, sessionID)
 	require.NoError(t, err)
-	waitForMessage(t, conn, 2*time.Second) // consume ack
+	waitForMessageNonBlocking(t, conn, 2*time.Second) // consume ack
 
 	// Trigger first event and verify receipt
 	seq1, err := miniappSvc.AppendEvent(ctx, sessionID, userID, EventTypeStorageUpdated, "event1", map[string]any{})
 	require.NoError(t, err)
 
-	event1 := waitForMessage(t, conn, 100*time.Millisecond)
+	event1 := waitForMessageNonBlocking(t, conn, 100*time.Millisecond)
 	require.NotNil(t, event1)
 	data1 := event1["data"].(map[string]any)
 	assert.Equal(t, float64(seq1), data1["event_seq"])
@@ -396,6 +400,7 @@ func TestUnsubscribeStopsEventDelivery(t *testing.T) {
 // TestSubscriptionPersistencyAcrossStateUpdates tests that subscriptions remain active
 // and all events are delivered in order even when state changes occur.
 func TestSubscriptionPersistencyAcrossStateUpdates(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
@@ -459,7 +464,7 @@ func TestSubscriptionPersistencyAcrossStateUpdates(t *testing.T) {
 	// Subscribe to session
 	err = subscribeSession(t, conn, sessionID)
 	require.NoError(t, err)
-	waitForMessage(t, conn, 2*time.Second) // consume ack
+	waitForMessageNonBlocking(t, conn, 2*time.Second) // consume ack
 
 	// Append event 1
 	seq1, err := miniappSvc.AppendEvent(ctx, sessionID, userID, EventTypeStorageUpdated, "event1", map[string]any{"v": 1})
@@ -585,47 +590,6 @@ func subscribeSession(t *testing.T, conn *websocket.Conn, sessionID string) erro
 	}
 
 	return conn.WriteMessage(websocket.TextMessage, body)
-}
-
-// waitForMessage blocks until a WebSocket message is received or timeout occurs.
-func waitForMessage(t *testing.T, conn *websocket.Conn, timeout time.Duration) map[string]any {
-	t.Helper()
-
-	done := make(chan map[string]any, 1)
-	go func() {
-		for {
-			_, payload, err := conn.ReadMessage()
-			if err != nil {
-				return
-			}
-
-			var envelope struct {
-				Event string          `json:"event"`
-				Data  json.RawMessage `json:"data"`
-			}
-			if err := json.Unmarshal(payload, &envelope); err != nil {
-				continue
-			}
-
-			var data map[string]any
-			if err := json.Unmarshal(envelope.Data, &data); err != nil {
-				data = map[string]any{}
-			}
-
-			done <- map[string]any{
-				"event": envelope.Event,
-				"data":  data,
-			}
-			return
-		}
-	}()
-
-	select {
-	case msg := <-done:
-		return msg
-	case <-time.After(timeout):
-		return nil
-	}
 }
 
 // waitForMessageNonBlocking attempts to read a message with a timeout without blocking the caller.
