@@ -24,15 +24,23 @@ import (
 )
 
 const presenceTTL = 90 * time.Second
+const sessionEventChannelPrefix = "miniapp:session:"
+
+// miniappServiceInterface defines the minimal interface needed for session event subscriptions.
+// This avoids circular import by not importing the miniapp package directly.
+type miniappServiceInterface interface {
+	GetSessionForUser(ctx context.Context, userID, sessionID string) (map[string]any, error)
+}
 
 type Handler struct {
-	tokens      *token.Service
-	messages    *messages.Service
-	redis       *redis.Client
-	limiter     *limit.TokenBucket
-	enableSend  bool
-	replication *replication.Store
-	upgrader    websocket.Upgrader
+	tokens           *token.Service
+	messages         *messages.Service
+	miniappService   any // P4.3: Mini-app service for session validation (avoids circular import)
+	redis            *redis.Client
+	limiter          *limit.TokenBucket
+	enableSend       bool
+	replication      *replication.Store
+	upgrader         websocket.Upgrader
 
 	mu      sync.RWMutex
 	clients map[string]map[*client]struct{}
@@ -46,6 +54,9 @@ type client struct {
 	sessionID           string
 	v2                  bool
 	typingConversations map[string]struct{}
+
+	// P4.3: Mini-app session subscriptions (maps session_id -> cancel func)
+	sessionSubscriptions map[string]context.CancelFunc
 
 	sendMu sync.RWMutex
 	closed bool
@@ -87,22 +98,23 @@ type resyncPayload struct {
 }
 
 // removed: enableSend boolean parameter - replaced with named constructors
-func NewHandlerWithSend(tokens *token.Service, messageService *messages.Service, redisClient *redis.Client, limiter *limit.TokenBucket, store *replication.Store) *Handler {
-	return newHandlerInternal(tokens, messageService, redisClient, limiter, true, store)
+func NewHandlerWithSend(tokens *token.Service, messageService *messages.Service, redisClient *redis.Client, limiter *limit.TokenBucket, store *replication.Store, miniappService any) *Handler {
+	return newHandlerInternal(tokens, messageService, redisClient, limiter, true, store, miniappService)
 }
 
-func NewHandlerReadOnly(tokens *token.Service, messageService *messages.Service, redisClient *redis.Client, limiter *limit.TokenBucket, store *replication.Store) *Handler {
-	return newHandlerInternal(tokens, messageService, redisClient, limiter, false, store)
+func NewHandlerReadOnly(tokens *token.Service, messageService *messages.Service, redisClient *redis.Client, limiter *limit.TokenBucket, store *replication.Store, miniappService any) *Handler {
+	return newHandlerInternal(tokens, messageService, redisClient, limiter, false, store, miniappService)
 }
 
-func newHandlerInternal(tokens *token.Service, messageService *messages.Service, redisClient *redis.Client, limiter *limit.TokenBucket, enableSend bool, store *replication.Store) *Handler {
+func newHandlerInternal(tokens *token.Service, messageService *messages.Service, redisClient *redis.Client, limiter *limit.TokenBucket, enableSend bool, store *replication.Store, miniappService any) *Handler {
 	return &Handler{
-		tokens:      tokens,
-		messages:    messageService,
-		redis:       redisClient,
-		limiter:     limiter,
-		enableSend:  enableSend,
-		replication: store,
+		tokens:           tokens,
+		messages:         messageService,
+		miniappService:   miniappService,
+		redis:            redisClient,
+		limiter:          limiter,
+		enableSend:       enableSend,
+		replication:      store,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(_ *http.Request) bool { return true },
 		},
@@ -135,10 +147,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	c := &client{
-		userID:    userID,
-		conn:      conn,
-		send:      make(chan []byte, 128),
-		sessionID: "wsv1:" + uuid.NewString(),
+		userID:               userID,
+		conn:                 conn,
+		send:                 make(chan []byte, 128),
+		sessionID:            "wsv1:" + uuid.NewString(),
+		sessionSubscriptions: make(map[string]context.CancelFunc),
 	}
 	h.register(c)
 	h.touchConnection(ctx, c)
@@ -176,11 +189,12 @@ func (h *Handler) ServeV2(w http.ResponseWriter, r *http.Request) {
 	}
 
 	c := &client{
-		userID:    userID,
-		conn:      conn,
-		send:      make(chan []byte, 128),
-		v2:        true,
-		sessionID: "wsv2:" + uuid.NewString(),
+		userID:               userID,
+		conn:                 conn,
+		send:                 make(chan []byte, 128),
+		v2:                   true,
+		sessionID:            "wsv2:" + uuid.NewString(),
+		sessionSubscriptions: make(map[string]context.CancelFunc),
 	}
 	h.register(c)
 	h.touchConnection(ctx, c)
@@ -425,13 +439,17 @@ func (h *Handler) unregister(c *client) {
 	}
 	h.cleanupTypingState(context.Background(), c)
 	h.unregisterSession(context.Background(), c)
-	observability.DecWSConnection()
+	// P4.3: Cancel all active session subscriptions on disconnect, then mark closed
 	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	for _, cancel := range c.sessionSubscriptions {
+		cancel()
+	}
+	observability.DecWSConnection()
 	if !c.closed {
 		c.closed = true
 		close(c.send)
 	}
-	c.sendMu.Unlock()
 	if c.conn != nil {
 		_ = c.conn.Close()
 	}
@@ -529,6 +547,34 @@ func (h *Handler) subscribeUserEvents(ctx context.Context, c *client) {
 		}
 		eventName := h.userEventTypeName(evt.Type)
 		h.sendJSON(c, eventName, evt.Payload)
+	}
+}
+
+// subscribeSessionEvents subscribes to mini-app session events via Redis pub/sub.
+// P4.3: Real-time fanout for session events.
+func (h *Handler) subscribeSessionEvents(ctx context.Context, c *client, sessionID string) {
+	if h.redis == nil {
+		return
+	}
+	channel := sessionEventChannelPrefix + sessionID + ":events"
+	pubsub := h.redis.Subscribe(ctx, channel)
+	defer pubsub.Close()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg := <-pubsub.Channel():
+			if msg == nil {
+				return
+			}
+			var evt map[string]any
+			if err := json.Unmarshal([]byte(msg.Payload), &evt); err != nil {
+				observability.RecordWSMessage("session_event_unmarshal_error", "")
+				continue
+			}
+			h.sendJSON(c, "session_event", evt)
+		}
 	}
 }
 
@@ -659,6 +705,56 @@ func (h *Handler) readLoopV2(c *client, ip string) {
 				"queued":          result.Queued,
 				"ack_timeout_ms":  result.AckTimeoutMS,
 			})
+			h.touchConnection(context.Background(), c)
+		case "subscribe_session":
+			var req struct {
+				SessionID string `json:"session_id"`
+			}
+			if err := json.Unmarshal(env.Data, &req); err != nil {
+				h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": "invalid subscribe_session payload"})
+				continue
+			}
+			sessionID := strings.TrimSpace(req.SessionID)
+			if sessionID == "" {
+				h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": "session_id is required"})
+				continue
+			}
+			// Validate user has access to this session (use request context with timeout)
+			miniappSvc, ok := h.miniappService.(miniappServiceInterface)
+			if !ok || miniappSvc == nil {
+				h.sendJSON(c, "error", map[string]any{"code": "unavailable", "message": "miniapp service unavailable"})
+				continue
+			}
+			if _, err := miniappSvc.GetSessionForUser(r.Context(), c.userID, sessionID); err != nil {
+				h.sendJSON(c, "error", map[string]any{"code": "unauthorized", "message": "access denied"})
+				continue
+			}
+			// P4.3: Check subscription limit and atomically add if not exists
+			const maxSessionSubscriptionsPerConnection = 100
+			c.sendMu.Lock()
+			if len(c.sessionSubscriptions) >= maxSessionSubscriptionsPerConnection {
+				c.sendMu.Unlock()
+				h.sendJSON(c, "error", map[string]any{"code": "too_many_subscriptions", "message": "subscription limit exceeded"})
+				continue
+			}
+			if _, exists := c.sessionSubscriptions[sessionID]; exists {
+				c.sendMu.Unlock()
+				h.sendJSON(c, "error", map[string]any{"code": "already_subscribed", "message": "already subscribed to this session"})
+				continue
+			}
+			// Create context for this subscription with timeout
+			ctx, cancel := context.WithTimeout(context.Background(), 24*time.Hour)
+			c.sessionSubscriptions[sessionID] = cancel
+			c.sendMu.Unlock()
+			// Launch subscription in goroutine
+			go func() {
+				h.subscribeSessionEvents(ctx, c, sessionID)
+				// Clean up on subscription end
+				c.sendMu.Lock()
+				delete(c.sessionSubscriptions, sessionID)
+				c.sendMu.Unlock()
+			}()
+			h.sendJSON(c, "subscribe_session_ack", map[string]any{"status": "ok", "session_id": sessionID})
 			h.touchConnection(context.Background(), c)
 		case "typing.started", "typing.stopped", "presence_subscribe", "subscribe", "auth", "resync":
 			h.handleLegacyCompatibleEvent(c, env, ip)
