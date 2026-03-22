@@ -27,6 +27,7 @@ import (
 	"ohmf/services/gateway/internal/devicekeys"
 	"ohmf/services/gateway/internal/devices"
 	"ohmf/services/gateway/internal/discovery"
+	"ohmf/services/gateway/internal/e2ee"
 	"ohmf/services/gateway/internal/events"
 	"ohmf/services/gateway/internal/limit"
 	"ohmf/services/gateway/internal/media"
@@ -231,6 +232,7 @@ func main() {
 	miniappHandler := miniapp.NewHandler(miniappSvc, miniapp.NewRegistryClient(cfg.AppsAddr))
 	abuseHandler := &abuse.Handler{Svc: abuseSvc}
 	deviceKeysHandler := &devicekeys.Handler{DB: deviceKeysSvc.DB()}
+	e2eeHandler := e2ee.NewHandler(pool, pool)
 	msgHandler := messages.NewHandler(msgSvc)
 	syncSvc := sync.NewService(pool, replicationStore)
 	syncHandler := &sync.Handler{Svc: syncSvc}
@@ -377,6 +379,11 @@ func main() {
 			protected.Post("/device-keys/{deviceID}/prekeys", deviceKeysHandler.AddPrekeys)
 			protected.Get("/device-keys/{userID}", deviceKeysHandler.ListForUser)
 			protected.Post("/device-keys/{userID}/claim", deviceKeysHandler.ClaimForUser)
+			// E2EE endpoints
+			protected.Get("/device-keys/{userID}/{deviceID}/bundle", e2eeHandler.GetDeviceKeyBundle)
+			protected.Post("/device-keys/{deviceID}/claim-otp", e2eeHandler.ClaimOneTimePrekey)
+			protected.Post("/e2ee/session/verify", e2eeHandler.VerifyDeviceFingerprint)
+			protected.Get("/e2ee/session/trust-state", e2eeHandler.GetTrustState)
 			protected.Post("/media/attachments", mediaHandler.Register)
 			protected.Get("/media/attachments/{id}/download", mediaHandler.CreateDownload)
 			protected.Delete("/media/attachments/{id}", mediaHandler.Purge)
