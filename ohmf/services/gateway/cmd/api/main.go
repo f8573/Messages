@@ -181,7 +181,9 @@ func main() {
 
 	usersSvc := users.NewService(pool, replicationStore)
 
-	convSvc := conversations.NewService(pool, replicationStore)
+	// Create MLS session store for group E2EE
+	mlsStore := e2ee.NewMLSSessionStore(pool)
+	convSvc := conversations.NewService(pool, replicationStore, mlsStore)
 	// removed: derive subscription key from config for AES-GCM encryption
 	sum := sha256.Sum256([]byte(cfg.PushSubscriptionKey))
 	subscriptionKeyBytes := sum[:]

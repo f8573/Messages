@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"ohmf/services/gateway/internal/devicekeys"
+	"ohmf/services/gateway/internal/e2ee"
 	"ohmf/services/gateway/internal/phone"
 	"ohmf/services/gateway/internal/replication"
 )
@@ -76,6 +77,7 @@ var ErrEncryptedConversationNotReady = errors.New("encrypted_conversation_not_re
 
 type Service struct {
 	db          DB
+	mls         *e2ee.MLSSessionStore
 	replication *replication.Store
 }
 
@@ -86,8 +88,8 @@ type DB interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
-func NewService(db DB, store *replication.Store) *Service {
-	return &Service{db: db, replication: store}
+func NewService(db DB, store *replication.Store, mlsStore *e2ee.MLSSessionStore) *Service {
+	return &Service{db: db, mls: mlsStore, replication: store}
 }
 
 func (s *Service) CreateConversation(ctx context.Context, actor string, req CreateRequest) (Conversation, error) {
@@ -934,6 +936,71 @@ func (s *Service) AddMembers(ctx context.Context, actor, conversationID string, 
 	if err := tx.Commit(ctx); err != nil {
 		return Conversation{}, err
 	}
+
+	// Update MLS tree for encrypted groups
+	if s.mls != nil {
+		var isMLSEncrypted bool
+		err := s.db.QueryRow(ctx, `
+			SELECT is_mls_encrypted FROM conversations WHERE id = $1::uuid
+		`, conversationID).Scan(&isMLSEncrypted)
+		if err == nil && isMLSEncrypted {
+			// Load current tree
+			tree, err := s.mls.LoadRatchetTree(ctx, conversationID)
+			if err != nil && err.Error() != "no rows in result set" {
+				return Conversation{}, err
+			}
+
+			if tree == nil {
+				// Initialize tree if not exists
+				tree = e2ee.NewMLSRatchetTree(conversationID)
+			}
+
+			// Get devices for newly added members
+			newMemberDevices := make(map[string][]string)
+			for _, userID := range dedupeUsers(userIDs) {
+				deviceRows, err := s.db.Query(ctx, "SELECT id FROM devices WHERE user_id = $1::uuid", userID)
+				if err != nil {
+					return Conversation{}, err
+				}
+				for deviceRows.Next() {
+					var deviceID string
+					if err := deviceRows.Scan(&deviceID); err != nil {
+						return Conversation{}, err
+					}
+					newMemberDevices[userID] = append(newMemberDevices[userID], deviceID)
+				}
+				deviceRows.Close()
+			}
+
+			// Add new members to tree and bump epoch
+			for userID, devices := range newMemberDevices {
+				for _, deviceID := range devices {
+					leaf := e2ee.TreeLeaf{
+						UserID:   userID,
+						DeviceID: deviceID,
+					}
+					if _, err := tree.AddMember(leaf); err != nil {
+						return Conversation{}, err
+					}
+				}
+			}
+
+			tree.Epoch++  // Force rekey for all existing members
+
+			// Persist updated tree
+			if err := s.mls.SaveRatchetTree(ctx, tree); err != nil {
+				return Conversation{}, err
+			}
+
+			// Record membership changes
+			for userID := range newMemberDevices {
+				if err := s.mls.RecordMembershipChange(ctx, conversationID, actor, userID, "MEMBER_ADDED", tree.Epoch); err != nil {
+					return Conversation{}, err
+				}
+			}
+		}
+	}
+
 	return s.Get(ctx, actor, conversationID)
 }
 
@@ -1039,13 +1106,151 @@ func (s *Service) RemoveMember(ctx context.Context, actor, conversationID, targe
 	if err := tx.Commit(ctx); err != nil {
 		return Conversation{}, err
 	}
+
+	// Update MLS tree for encrypted groups
+	if s.mls != nil {
+		var isMLSEncrypted bool
+		err := s.db.QueryRow(ctx, `
+			SELECT is_mls_encrypted FROM conversations WHERE id = $1::uuid
+		`, conversationID).Scan(&isMLSEncrypted)
+		if err == nil && isMLSEncrypted {
+			// Load current tree
+			tree, err := s.mls.LoadRatchetTree(ctx, conversationID)
+			if err == nil && tree != nil {
+				// Get all devices for the removed member
+				deviceRows, err := s.db.Query(ctx, "SELECT id FROM devices WHERE user_id = $1::uuid", targetUserID)
+				if err == nil {
+					for deviceRows.Next() {
+						var deviceID string
+						if err := deviceRows.Scan(&deviceID); err != nil {
+							return Conversation{}, err
+						}
+						if err := tree.RemoveMember(targetUserID, deviceID); err != nil {
+							// Log but don't fail if device not in tree
+							_ = err
+						}
+					}
+					deviceRows.Close()
+				}
+
+				// Persist updated tree (epoch incremented by RemoveMember)
+				if err := s.mls.SaveRatchetTree(ctx, tree); err != nil {
+					return Conversation{}, err
+				}
+
+				// Record membership change
+				if err := s.mls.RecordMembershipChange(ctx, conversationID, actor, targetUserID, "MEMBER_REMOVED", tree.Epoch); err != nil {
+					return Conversation{}, err
+				}
+			}
+		}
+	}
+
 	if targetUserID == actor {
 		return Conversation{ConversationID: conversationID, Type: conversationType}, nil
 	}
 	return s.Get(ctx, actor, conversationID)
 }
 
-func (s *Service) UpdateTransportPolicy(ctx context.Context, actor, conversationID, policy string) (Conversation, error) {
+// GetGroupMembersWithDevices retrieves all members and their devices for a group
+// Used for MLS tree operations and multi-recipient encryption
+func (s *Service) GetGroupMembersWithDevices(ctx context.Context, conversationID string) ([]struct {
+	UserID  string
+	Devices []string
+}, error) {
+	query := `
+		SELECT DISTINCT cm.user_id, d.id as device_id
+		FROM conversation_members cm
+		JOIN devices d ON d.user_id = cm.user_id
+		WHERE cm.conversation_id = $1::uuid
+		ORDER BY cm.user_id, d.id
+	`
+	rows, err := s.db.Query(ctx, query, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	// Map user_id to devices
+	userDevices := make(map[string][]string)
+	for rows.Next() {
+		var userID, deviceID string
+		if err := rows.Scan(&userID, &deviceID); err != nil {
+			return nil, err
+		}
+		userDevices[userID] = append(userDevices[userID], deviceID)
+	}
+
+	// Convert to result format
+	result := make([]struct {
+		UserID  string
+		Devices []string
+	}, 0, len(userDevices))
+
+	for userID, devices := range userDevices {
+		result = append(result, struct {
+			UserID  string
+			Devices []string
+		}{UserID: userID, Devices: devices})
+	}
+
+	return result, rows.Err()
+}
+
+// InitializeGroupMLS creates initial ratchet tree for group when encryption enabled
+func (s *Service) InitializeGroupMLS(ctx context.Context, conversationID string) error {
+	if s.mls == nil {
+		return fmt.Errorf("MLS store not initialized")
+	}
+
+	// Get current members and their devices
+	members, err := s.GetGroupMembersWithDevices(ctx, conversationID)
+	if err != nil {
+		return err
+	}
+
+	// Create new tree
+	tree := e2ee.NewMLSRatchetTree(conversationID)
+
+	// Add each device as a leaf
+	for _, member := range members {
+		for _, deviceID := range member.Devices {
+			leaf := e2ee.TreeLeaf{
+				UserID:   member.UserID,
+				DeviceID: deviceID,
+			}
+			if _, err := tree.AddMember(leaf); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Persist tree
+	if err := s.mls.SaveRatchetTree(ctx, tree); err != nil {
+		return err
+	}
+
+	// Save member-to-leaf mappings
+	members2, _ := s.GetGroupMembersWithDevices(ctx, conversationID)
+	var leaves []e2ee.TreeLeaf
+	for _, member := range members2 {
+		for i, deviceID := range member.Devices {
+			leaves = append(leaves, e2ee.TreeLeaf{
+				Index:    i,
+				UserID:   member.UserID,
+				DeviceID: deviceID,
+			})
+		}
+	}
+
+	if err := s.mls.SaveMemberLeaves(ctx, conversationID, leaves, tree.Generation); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// UpdateTransportPolicy
 	// validate policy
 	switch policy {
 	case "AUTO", "FORCE_OTT", "FORCE_SMS", "FORCE_MMS", "BLOCK_CARRIER_RELAY":
