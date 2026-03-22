@@ -16,6 +16,28 @@ const PERMISSION_DESCRIPTIONS = Object.freeze({
   "notifications.in_app": "Display host-mediated in-app prompts and status badges.",
 });
 
+// P4.3: WebSocket v2 protocol event types
+const WS_V2_EVENTS = Object.freeze({
+  HELLO: "hello",
+  HELLO_ACK: "hello_ack",
+  SUBSCRIBE_SESSION: "subscribe_session",
+  SUBSCRIBE_SESSION_ACK: "subscribe_session_ack",
+  SESSION_EVENT: "session_event",
+  ERROR: "error",
+});
+
+// P4.3: Session event types
+const SESSION_EVENT_TYPES = Object.freeze({
+  SESSION_CREATED: "session_created",
+  STORAGE_UPDATED: "storage_updated",
+  SNAPSHOT_WRITTEN: "snapshot_written",
+  MESSAGE_PROJECTED: "message_projected",
+});
+
+// P4.3: Module-scope WebSocket lifecycle (not application state)
+let ws = null;
+const activeSessionSubscriptions = new Set();
+
 const state = {
   manifest: null,
   auth: null,
@@ -28,8 +50,6 @@ const state = {
   sessionMode: "local",
   appOrigin: null, // P3.2: Isolated runtime origin (e.g., "a7f3e1c5.miniapp.local")
   logEntries: [],
-  ws: null, // P4.3: WebSocket v2 connection for real-time session events
-  activeSessionSubscriptions: new Set(), // P4.3: Track active session subscriptions for reconnection
 };
 
 const el = {
@@ -492,7 +512,7 @@ async function ensureGatewaySession() {
   applySessionRecord(record, "gateway");
 
   // P4.3: Subscribe to session events via WebSocket v2 if session established
-  if (state.launchContext?.app_session_id && state.ws && state.ws.readyState === WebSocket.OPEN) {
+  if (state.launchContext?.app_session_id && ws && ws.readyState === WebSocket.OPEN) {
     subscribeToSessionEvents(state.launchContext.app_session_id);
   } else if (state.launchContext?.app_session_id) {
     // Queue subscription for after WebSocket connects
@@ -529,18 +549,18 @@ async function initializeSession() {
 function ensureWebSocketConnected() {
   return new Promise((resolve) => {
     // If WebSocket is already connected, resolve immediately
-    if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
       resolve();
       return;
     }
 
     // If WebSocket is connecting, wait for it using event-based listener
-    if (state.ws && state.ws.readyState === WebSocket.CONNECTING) {
+    if (ws && ws.readyState === WebSocket.CONNECTING) {
       const onOpen = () => {
-        state.ws.removeEventListener("open", onOpen);
+        ws.removeEventListener("open", onOpen);
         resolve();
       };
-      state.ws.addEventListener("open", onOpen);
+      ws.addEventListener("open", onOpen);
       return;
     }
 
@@ -561,13 +581,13 @@ function startWebSocketConnection() {
     const wsURL = new URL(state.apiBaseUrl.replace(/^http/i, "ws") + "/v2/ws");
     wsURL.searchParams.set("access_token", state.auth.accessToken);
     const socket = new WebSocket(wsURL.toString());
-    state.ws = socket;
+    ws = socket;
 
     socket.addEventListener("open", () => {
       addLog("ok", "runtime.websocket_connected", {});
       // Send hello handshake
       socket.send(JSON.stringify({
-        event: "hello",
+        event: WS_V2_EVENTS.HELLO,
         data: { device_id: randomId("dev") },
       }));
       // Resubscribe to active sessions after reconnection
@@ -580,18 +600,18 @@ function startWebSocketConnection() {
         const message = JSON.parse(event.data);
         const eventName = message?.event;
         switch (eventName) {
-          case "hello_ack":
+          case WS_V2_EVENTS.HELLO_ACK:
             addLog("ok", "runtime.websocket_hello_ack", {});
             break;
-          case "subscribe_session_ack":
+          case WS_V2_EVENTS.SUBSCRIBE_SESSION_ACK:
             // Subscription successful
             addLog("ok", "runtime.session_subscribed", { session_id: message.data?.session_id });
             break;
-          case "session_event":
+          case WS_V2_EVENTS.SESSION_EVENT:
             // P4.3: Handle real-time session events
             handleSessionEvent(message.data);
             break;
-          case "error":
+          case WS_V2_EVENTS.ERROR:
             if (message.data?.code === "too_many_subscriptions") {
               addLog("warn", "runtime.too_many_subscriptions", { detail: message.data });
             } else {
@@ -607,8 +627,8 @@ function startWebSocketConnection() {
     });
 
     socket.addEventListener("close", () => {
-      if (state.ws === socket) {
-        state.ws = null;
+      if (ws === socket) {
+        ws = null;
         addLog("warn", "runtime.websocket_closed", {});
       }
     });
@@ -621,24 +641,31 @@ function startWebSocketConnection() {
 }
 
 function subscribeToSessionEvents(sessionID) {
-  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
     addLog("warn", "runtime.session_subscribe_skipped", { session_id: sessionID, reason: "websocket_not_ready" });
     return;
   }
 
   // Skip redundant subscriptions
-  if (state.activeSessionSubscriptions.has(sessionID)) {
+  if (activeSessionSubscriptions.has(sessionID)) {
     return;
   }
 
-  state.ws.send(JSON.stringify({
-    event: "subscribe_session",
+  ws.send(JSON.stringify({
+    event: WS_V2_EVENTS.SUBSCRIBE_SESSION,
     data: { session_id: sessionID },
   }));
 
   // Track subscription for reconnection
-  state.activeSessionSubscriptions.add(sessionID);
+  activeSessionSubscriptions.add(sessionID);
   addLog("debug", "runtime.session_subscribed_request_sent", { session_id: sessionID });
+}
+
+function emitSessionEvent(eventType, data) {
+  window.postMessage({
+    type: WS_V2_EVENTS.SESSION_EVENT,
+    payload: { event_type: eventType, data },
+  }, state.appOrigin || "*");
 }
 
 function handleSessionEvent(evt) {
@@ -647,51 +674,39 @@ function handleSessionEvent(evt) {
 
   // Update local app state based on event_type
   switch (event_type) {
-    case "session_created":
+    case SESSION_EVENT_TYPES.SESSION_CREATED:
       // Emit event for mini-app to react to
-      window.postMessage({
-        type: "SESSION_EVENT",
-        payload: { event_type: "session_created", data: body },
-      }, state.appOrigin || "*");
+      emitSessionEvent(SESSION_EVENT_TYPES.SESSION_CREATED, body);
       addLog("ok", "runtime.session_event:session_created", { event_seq, body });
       break;
 
-    case "storage_updated":
+    case SESSION_EVENT_TYPES.STORAGE_UPDATED:
       // Update local session storage state from event
       if (body && typeof body === "object") {
         state.sessionState.storage = { ...state.sessionState.storage, ...body };
         saveSession();
       }
-      window.postMessage({
-        type: "SESSION_EVENT",
-        payload: { event_type: "storage_updated", data: body },
-      }, state.appOrigin || "*");
+      emitSessionEvent(SESSION_EVENT_TYPES.STORAGE_UPDATED, body);
       addLog("ok", "runtime.session_event:storage_updated", { event_seq, body });
       break;
 
-    case "snapshot_written":
+    case SESSION_EVENT_TYPES.SNAPSHOT_WRITTEN:
       // Update local snapshot state from event
       if (body && typeof body === "object") {
         state.sessionState.stateSnapshot = body;
         state.launchContext.state_snapshot = cloneJson(body);
         saveSession();
       }
-      window.postMessage({
-        type: "SESSION_EVENT",
-        payload: { event_type: "snapshot_written", data: body },
-      }, state.appOrigin || "*");
+      emitSessionEvent(SESSION_EVENT_TYPES.SNAPSHOT_WRITTEN, body);
       addLog("ok", "runtime.session_event:snapshot_written", { event_seq, body });
       break;
 
-    case "message_projected":
+    case SESSION_EVENT_TYPES.MESSAGE_PROJECTED:
       // Handle message event
       if (body && typeof body === "object") {
         appendProjectedMessage(body.text || "(message event)", body.content_type || "app_event", body.content || null);
       }
-      window.postMessage({
-        type: "SESSION_EVENT",
-        payload: { event_type: "message_projected", data: body },
-      }, state.appOrigin || "*");
+      emitSessionEvent(SESSION_EVENT_TYPES.MESSAGE_PROJECTED, body);
       addLog("ok", "runtime.session_event:message_projected", { event_seq, body });
       break;
 
@@ -701,10 +716,10 @@ function handleSessionEvent(evt) {
 }
 
 function handleReconnect() {
-  // Resubscribe to all active sessions after reconnection
-  if (state.activeSessionSubscriptions && state.activeSessionSubscriptions.size > 0) {
-    addLog("debug", "runtime.reconnect_resubscribing", { count: state.activeSessionSubscriptions.size });
-    for (const sessionID of state.activeSessionSubscriptions) {
+  // Resubscribe to all active sessions after reconnection (removed: redundant null/size checks)
+  if (activeSessionSubscriptions.size > 0) {
+    addLog("debug", "runtime.reconnect_resubscribing", { count: activeSessionSubscriptions.size });
+    for (const sessionID of activeSessionSubscriptions) {
       subscribeToSessionEvents(sessionID);
     }
   }
@@ -1098,7 +1113,7 @@ el.clearSessionBtn.addEventListener("click", async () => {
   try {
     if (state.sessionMode === "gateway" && state.launchContext?.app_session_id) {
       // P4.3: Remove session subscription before deleting
-      state.activeSessionSubscriptions.delete(state.launchContext.app_session_id);
+      activeSessionSubscriptions.delete(state.launchContext.app_session_id);
       await gatewayRequest(`/v1/apps/sessions/${encodeURIComponent(state.launchContext.app_session_id)}`, { method: "DELETE" });
     }
   } catch (error) {
