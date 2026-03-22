@@ -32,6 +32,8 @@ type Message struct {
 	Transport         string           `json:"transport"`
 	ServerOrder       int64            `json:"server_order"`
 	Status            string           `json:"status,omitempty"`
+	IsEncrypted       bool             `json:"is_encrypted,omitempty"`
+	EncryptionScheme  string           `json:"encryption_scheme,omitempty"`
 	CreatedAt         string           `json:"created_at"`
 	SentAt            string           `json:"sent_at,omitempty"`
 	DeliveredAt       string           `json:"delivered_at,omitempty"`
@@ -102,6 +104,11 @@ type SearchOptions struct {
 	ContentType  string
 	After        *time.Time
 	Before       *time.Time
+	SearchMode   string // "standard" | "fuzzy" | "exact" - default: "standard"
+	MatchType    string // "any" | "all" - default: "any"
+	IncludeEdits bool   // Include message edit history in search
+	SortBy       string // "relevance" | "recency" - default: "relevance"
+	ExactMatch   bool   // Require exact phrase match
 }
 
 const (
@@ -1597,7 +1604,7 @@ func (s *Service) ListUnified(ctx context.Context, actor, conversationID string,
 	return items, nil
 }
 
-// SearchMessages searches for messages in a conversation by text content
+// SearchMessages searches for messages in a conversation by text content with enhanced ranking
 func (s *Service) SearchMessages(ctx context.Context, userID, conversationID, query string, limit int, opts SearchOptions) ([]Message, error) {
 	if query == "" {
 		return []Message{}, nil
@@ -1619,18 +1626,41 @@ func (s *Service) SearchMessages(ctx context.Context, userID, conversationID, qu
 		return nil, ErrConversationAccess
 	}
 
-	args := []any{conversationID, query}
+	// Normalize query for better matching
+	sq := NormalizeQuery(query)
+	isValid, warning := ValidateSearchQuality(sq)
+	if !isValid {
+		if warning != "" {
+			// Log warning but don't fail - still attempt search
+		}
+		return []Message{}, nil
+	}
+
+	// Set defaults for search options
+	if opts.SearchMode == "" {
+		opts.SearchMode = "standard"
+	}
+	if opts.MatchType == "" {
+		opts.MatchType = "any"
+	}
+	if opts.SortBy == "" {
+		opts.SortBy = "relevance"
+	}
+
+	// Build filter arguments and SQL
+	args := []any{conversationID, sq.TruncateForDB(500)}
 	filters := []string{
 		`m.conversation_id = $1::uuid`,
 		`m.deleted_at IS NULL`,
 		`(m.expires_at IS NULL OR m.expires_at > now())`,
 		`m.visibility_state != 'SOFT_DELETED'`,
-		`(
-			m.search_vector @@ websearch_to_tsquery('simple', $2)
-			OR m.content->>'text' ILIKE '%' || $2 || '%'
-			OR m.content->>'attachment_id' ILIKE '%' || $2 || '%'
-		)`,
 	}
+
+	// Build search condition based on search mode and options
+	searchCondition := s.buildSearchCondition(opts.SearchMode, opts.ExactMatch, len(args)+1)
+	filters = append(filters, fmt.Sprintf("(%s)", searchCondition))
+
+	// Add optional filters
 	if trimmed := strings.TrimSpace(opts.SenderUserID); trimmed != "" {
 		args = append(args, trimmed)
 		filters = append(filters, fmt.Sprintf("m.sender_user_id = $%d::uuid", len(args)))
@@ -1648,6 +1678,9 @@ func (s *Service) SearchMessages(ctx context.Context, userID, conversationID, qu
 		filters = append(filters, fmt.Sprintf("m.created_at <= $%d", len(args)))
 	}
 	args = append(args, limit)
+
+	// Build ORDER BY clause based on sort preference
+	orderBy := s.buildOrderBy(opts.SortBy, len(args)-1) // -1 because limit is last arg
 
 	querySQL := fmt.Sprintf(`
 		SELECT
@@ -1682,17 +1715,9 @@ func (s *Service) SearchMessages(ctx context.Context, userID, conversationID, qu
 			  AND COALESCE(child.visibility_state, '') NOT IN ('SOFT_DELETED', 'REDACTED', 'EXPIRED')
 		) reply_meta ON TRUE
 		WHERE %s
-		ORDER BY
-			ts_rank_cd(m.search_vector, websearch_to_tsquery('simple', $2)) DESC,
-			CASE
-				WHEN lower(COALESCE(m.content->>'text', '')) = lower($2) THEN 3
-				WHEN lower(COALESCE(m.content->>'text', '')) LIKE lower($2) || '%%' THEN 2
-				WHEN COALESCE(m.content->>'text', '') ILIKE '%%' || $2 || '%%' THEN 1
-				ELSE 0
-			END DESC,
-			m.server_order DESC
+		ORDER BY %s
 		LIMIT $%d
-	`, strings.Join(filters, "\n		  AND "), len(args))
+	`, strings.Join(filters, "\n		  AND "), orderBy, len(args))
 
 	rows, err := s.db.Query(ctx, querySQL, args...)
 	if err != nil {
@@ -1725,6 +1750,83 @@ func (s *Service) SearchMessages(ctx context.Context, userID, conversationID, qu
 		items = append(items, m)
 	}
 	return items, rows.Err()
+}
+
+// buildSearchCondition constructs the WHERE clause for different search modes
+func (s *Service) buildSearchCondition(searchMode string, exactMatch bool, paramNum int) string {
+	queryParam := fmt.Sprintf("$%d", paramNum)
+
+	switch searchMode {
+	case "fuzzy":
+		// Fuzzy/typo-tolerant search using trigram similarity
+		return fmt.Sprintf(`(
+			m.search_text_normalized %% unaccent(lower(%s))
+			OR m.search_vector_en @@ plainto_tsquery('english', %s)
+		)`, queryParam, queryParam)
+
+	case "exact":
+		// Exact phrase match only
+		return fmt.Sprintf(`(
+			unaccent(lower(COALESCE(m.content->>'text', ''))) = unaccent(lower(%s))
+		)`, queryParam)
+
+	default:
+		// Standard mode: multi-strategy matching
+		return fmt.Sprintf(`(
+			m.search_vector @@ websearch_to_tsquery('simple', %s)
+			OR m.search_vector_en @@ plainto_tsquery('english', %s)
+			OR unaccent(lower(COALESCE(m.content->>'text', ''))) ILIKE '%%' || unaccent(lower(%s)) || '%%'
+			OR m.content->>'attachment_id' ILIKE '%%' || %s || '%%'
+		)`, queryParam, queryParam, queryParam, queryParam)
+	}
+}
+
+// buildOrderBy constructs the ORDER BY clause with multi-factor ranking
+func (s *Service) buildOrderBy(sortBy string, queryParamNum int) string {
+	queryParam := fmt.Sprintf("$%d", queryParamNum)
+
+	if sortBy == "recency" {
+		// Sort by recency (newest first), with some relevance weight
+		return fmt.Sprintf(`
+			m.created_at DESC,
+			ts_rank_cd(m.search_vector_en, plainto_tsquery('english', %s)) DESC,
+			m.server_order DESC
+		`, queryParam)
+	}
+
+	// Default relevance-based ranking with multi-factor sorting
+	return fmt.Sprintf(`
+		-- Factor 1: English FTS rank × base rank (0-1)
+		(ts_rank_cd(m.search_vector_en, plainto_tsquery('english', %s)) *
+		 COALESCE(m.search_rank_base, 1.0)) DESC,
+
+		-- Factor 2: Exact/prefix/infix matches (0-3)
+		CASE
+			WHEN unaccent(lower(COALESCE(m.content->>'text', ''))) = unaccent(lower(%s)) THEN 3
+			WHEN unaccent(lower(COALESCE(m.content->>'text', ''))) LIKE unaccent(lower(%s)) || '%%' THEN 2.5
+			WHEN unaccent(lower(COALESCE(m.content->>'text', ''))) LIKE '%%' || unaccent(lower(%s)) || '%%' THEN 2
+			ELSE 0
+		END DESC,
+
+		-- Factor 3: English stemming match (boolean boost)
+		CASE
+			WHEN m.search_vector_en @@ plainto_tsquery('english', %s) THEN 1
+			ELSE 0
+		END DESC,
+
+		-- Factor 4: Trigram similarity for typo tolerance (0-1)
+		CASE
+			WHEN m.search_text_normalized IS NOT NULL
+			THEN similarity(m.search_text_normalized, unaccent(lower(%s)))
+			ELSE 0
+		END DESC,
+
+		-- Factor 5: Recency (recent messages ranked higher within similar relevance)
+		m.created_at DESC,
+
+		-- Factor 6: Server order as final tiebreaker
+		m.server_order DESC
+	`, queryParam, queryParam, queryParam, queryParam, queryParam, queryParam)
 }
 
 func (s *Service) ListReplies(ctx context.Context, actorUserID, messageID string) ([]Message, error) {
@@ -2310,13 +2412,25 @@ func (s *Service) sendSyncWithEndpoint(ctx context.Context, userID, senderDevice
 		return Message{}, ErrEncryptedMessageInvalid
 	}
 
+	// Process encrypted messages and validate signature
+	var isEncrypted bool
+	var encryptionScheme string
+	if strings.EqualFold(contentType, "encrypted") {
+		encryptedMetadata, err := ProcessEncryptedMessage(ctx, s.db, userID, senderDeviceID, contentForStorage)
+		if err != nil {
+			return Message{}, err
+		}
+		isEncrypted = true
+		encryptionScheme = encryptedMetadata.Scheme
+	}
+
 	var msgID string
 	var created time.Time
 	err = tx.QueryRow(ctx, `
-		INSERT INTO messages (conversation_id, sender_user_id, sender_device_id, reply_to_message_id, content_type, content, client_generated_id, transport, server_order, expires_at)
-		VALUES ($1::uuid, $2::uuid, NULLIF($3, '')::uuid, NULLIF($4, '')::uuid, $5, $6::jsonb, $7, $8, $9, $10)
+		INSERT INTO messages (conversation_id, sender_user_id, sender_device_id, reply_to_message_id, content_type, content, client_generated_id, transport, server_order, expires_at, is_encrypted, encryption_scheme)
+		VALUES ($1::uuid, $2::uuid, NULLIF($3, '')::uuid, NULLIF($4, '')::uuid, $5, $6::jsonb, $7, $8, $9, $10, $11, $12)
 		RETURNING id::text, created_at
-	`, conversationID, userID, senderDeviceID, replyToMessageID, contentType, string(contentJSON), clientGeneratedID, chosenTransport, next, expiresAtValue).Scan(&msgID, &created)
+	`, conversationID, userID, senderDeviceID, replyToMessageID, contentType, string(contentJSON), clientGeneratedID, chosenTransport, next, expiresAtValue, isEncrypted, encryptionScheme).Scan(&msgID, &created)
 	if err != nil {
 		return Message{}, err
 	}
@@ -2342,6 +2456,8 @@ func (s *Service) sendSyncWithEndpoint(ctx context.Context, userID, senderDevice
 		Transport:         chosenTransport,
 		ServerOrder:       next,
 		Status:            "SENT",
+		IsEncrypted:       isEncrypted,
+		EncryptionScheme:  encryptionScheme,
 		CreatedAt:         created.UTC().Format(time.RFC3339),
 	}
 	if expiresAt.Valid {

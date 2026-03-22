@@ -311,3 +311,136 @@ func decodeJSONMap(raw []byte, target *map[string]any) error {
 	}
 	return json.Unmarshal(raw, target)
 }
+
+// E2EE Device Key Management Methods
+
+// ClaimOneTimePrekey atomically claims the next available one-time prekey for a device
+func (s *Service) ClaimOneTimePrekey(ctx context.Context, userID string, deviceID string) (OneTimePrekey, error) {
+	var prekey OneTimePrekey
+
+	// Find the first unclaimed prekey and mark it as consumed
+	err := s.pool.QueryRow(ctx, `
+		UPDATE device_one_time_prekeys
+		SET consumed_at = now()
+		WHERE device_id = $1::uuid
+		  AND consumed_at IS NULL
+		ORDER BY prekey_id ASC
+		LIMIT 1
+		RETURNING prekey_id, public_key
+	`, deviceID).Scan(&prekey.PrekeyID, &prekey.PublicKey)
+
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return OneTimePrekey{}, errors.New("no_available_prekeys")
+		}
+		return OneTimePrekey{}, err
+	}
+
+	return prekey, nil
+}
+
+// CountAvailableOTPrekeyPool counts available (unclaimed) one-time prekeys
+func (s *Service) CountAvailableOTPrekeyPool(ctx context.Context, deviceID string) (int64, error) {
+	var count int64
+	err := s.pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM device_one_time_prekeys
+		WHERE device_id = $1::uuid
+		  AND consumed_at IS NULL
+	`, deviceID).Scan(&count)
+
+	if err != nil {
+		return 0, err
+	}
+
+	return count, nil
+}
+
+// ReplenishOTPrekeyPool generates new one-time prekeys if needed
+// Ensures at least targetCount available prekeys exist for a device
+func (s *Service) ReplenishOTPrekeyPool(ctx context.Context, userID string, deviceID string, targetCount int64) (int64, error) {
+	// Count current available prekeys
+	available, err := s.CountAvailableOTPrekeyPool(ctx, deviceID)
+	if err != nil {
+		return 0, err
+	}
+
+	// If we already have enough, return
+	if available >= targetCount {
+		return available, nil
+	}
+
+	// Calculate how many to generate
+	toGenerate := targetCount - available
+
+	// Get the max prekey_id to continue sequence
+	var maxPrekeyID int64
+	err = s.pool.QueryRow(ctx, `
+		SELECT COALESCE(MAX(prekey_id), 0)
+		FROM device_one_time_prekeys
+		WHERE device_id = $1::uuid
+	`, deviceID).Scan(&maxPrekeyID)
+
+	if err != nil {
+		return 0, err
+	}
+
+	// Generate new prekeys in a transaction
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+
+	// Insert new prekeys
+	for i := int64(0); i < toGenerate; i++ {
+		newPrekeyID := maxPrekeyID + 1 + i
+		// In real implementation, this would be generated client-side
+		// For now, we just create entries and clients fill in public keys via AddPrekeys endpoint
+		// This is a placeholder showing the structure
+		_, err := tx.Exec(ctx, `
+			INSERT INTO device_one_time_prekeys (device_id, prekey_id, public_key, created_at)
+			VALUES ($1::uuid, $2, '', now())
+			ON CONFLICT DO NOTHING
+		`, deviceID, newPrekeyID)
+
+		if err != nil {
+			return 0, err
+		}
+	}
+
+	if err = tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+
+	return available + toGenerate, nil
+}
+
+// RotateSignedPrekeyAndLog handles signed prekey rotation
+// This is typically called via admin action or scheduled job
+// Note: Actual key rotation happens client-side; this marks the old key as rotated
+func (s *Service) RotateSignedPrekeyAndLog(ctx context.Context, userID string, deviceID string) error {
+	// Update the device_identity_keys table to mark rotation event
+	// The actual new signed prekey is uploaded by the client via PublishBundle
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE device_identity_keys
+		SET updated_at = now()
+		WHERE device_id = $1::uuid
+		  AND user_id = $2::uuid
+	`, deviceID, userID)
+
+	if err != nil {
+		return err
+	}
+
+	if tag.RowsAffected() == 0 {
+		return errors.New("device_not_found")
+	}
+
+	// Log the rotation event for audit
+	_ = securityaudit.Append(ctx, s.pool, userID, userID, "device_signed_prekey_rotated", map[string]any{
+		"device_id": deviceID,
+	})
+
+	return nil
+}

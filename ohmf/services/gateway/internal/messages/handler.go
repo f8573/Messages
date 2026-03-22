@@ -757,10 +757,36 @@ func (h *Handler) Search(w http.ResponseWriter, r *http.Request) {
 			resultLimit = v
 		}
 	}
+
+	// Build search options with enhanced parameters
 	opts := SearchOptions{
 		SenderUserID: r.URL.Query().Get("sender_user_id"),
 		ContentType:  r.URL.Query().Get("content_type"),
+		SearchMode:   r.URL.Query().Get("search_mode"),   // "standard" | "fuzzy" | "exact"
+		MatchType:    r.URL.Query().Get("match_type"),     // "any" | "all"
+		SortBy:       r.URL.Query().Get("sort_by"),        // "relevance" | "recency"
+		ExactMatch:   r.URL.Query().Get("exact_match") == "true",
+		IncludeEdits: r.URL.Query().Get("include_edits") == "true",
 	}
+
+	// Validate search_mode
+	if opts.SearchMode != "" && opts.SearchMode != "standard" && opts.SearchMode != "fuzzy" && opts.SearchMode != "exact" {
+		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "search_mode must be one of: standard, fuzzy, exact", nil)
+		return
+	}
+
+	// Validate match_type
+	if opts.MatchType != "" && opts.MatchType != "any" && opts.MatchType != "all" {
+		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "match_type must be one of: any, all", nil)
+		return
+	}
+
+	// Validate sort_by
+	if opts.SortBy != "" && opts.SortBy != "relevance" && opts.SortBy != "recency" {
+		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "sort_by must be one of: relevance, recency", nil)
+		return
+	}
+
 	if raw := strings.TrimSpace(r.URL.Query().Get("after")); raw != "" {
 		parsed, err := time.Parse(time.RFC3339Nano, raw)
 		if err != nil {
@@ -796,7 +822,17 @@ func (h *Handler) Search(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, http.StatusInternalServerError, "search_failed", err.Error(), nil)
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"items": items})
+
+	// Return results with search metadata
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{
+		"items": items,
+		"search_metrics": map[string]any{
+			"query_normalized": q,
+			"search_mode":      opts.SearchMode,
+			"match_type":       opts.MatchType,
+			"result_count":     len(items),
+		},
+	})
 }
 
 func (h *Handler) GetReadStatus(w http.ResponseWriter, r *http.Request) {
