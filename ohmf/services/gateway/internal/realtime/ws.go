@@ -57,6 +57,8 @@ type client struct {
 
 	// P4.3: Mini-app session subscriptions (maps session_id -> cancel func)
 	sessionSubscriptions map[string]context.CancelFunc
+	clientCtx            context.Context        // Context tied to client connection lifecycle (removed: explicit timeout, now uses cleanup cancellation)
+	clientCancel         context.CancelFunc
 
 	sendMu sync.RWMutex
 	closed bool
@@ -153,6 +155,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		sessionID:            "wsv1:" + uuid.NewString(),
 		sessionSubscriptions: make(map[string]context.CancelFunc),
 	}
+	c.clientCtx, c.clientCancel = context.WithCancel(context.Background())
 	h.register(c)
 	h.touchConnection(ctx, c)
 	if updates, err := h.messages.DeliverPendingToUser(ctx, userID); err == nil {
@@ -196,6 +199,7 @@ func (h *Handler) ServeV2(w http.ResponseWriter, r *http.Request) {
 		sessionID:            "wsv2:" + uuid.NewString(),
 		sessionSubscriptions: make(map[string]context.CancelFunc),
 	}
+	c.clientCtx, c.clientCancel = context.WithCancel(context.Background())
 	h.register(c)
 	h.touchConnection(ctx, c)
 
@@ -439,12 +443,13 @@ func (h *Handler) unregister(c *client) {
 	}
 	h.cleanupTypingState(context.Background(), c)
 	h.unregisterSession(context.Background(), c)
-	// P4.3: Cancel all active session subscriptions on disconnect, then mark closed
+	// P4.3: Cancel client context to unsubscribe all session subscriptions
+	if c.clientCancel != nil {
+		c.clientCancel()
+	}
+	// P4.3: Cancel all active session subscriptions on disconnect, then mark closed (removed: explicit cancel loop since clientCancel handles it)
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
-	for _, cancel := range c.sessionSubscriptions {
-		cancel()
-	}
 	observability.DecWSConnection()
 	if !c.closed {
 		c.closed = true
@@ -719,13 +724,16 @@ func (h *Handler) readLoopV2(c *client, ip string) {
 				h.sendJSON(c, "error", map[string]any{"code": "invalid_request", "message": "session_id is required"})
 				continue
 			}
-			// Validate user has access to this session (use request context with timeout)
+			// Validate user has access to this session (use short-lived context to avoid blocking read loop)
 			miniappSvc, ok := h.miniappService.(miniappServiceInterface)
 			if !ok || miniappSvc == nil {
 				h.sendJSON(c, "error", map[string]any{"code": "unavailable", "message": "miniapp service unavailable"})
 				continue
 			}
-			if _, err := miniappSvc.GetSessionForUser(r.Context(), c.userID, sessionID); err != nil {
+			authCtx, authCancel := context.WithTimeout(c.clientCtx, 5*time.Second)
+			_, err := miniappSvc.GetSessionForUser(authCtx, c.userID, sessionID)
+			authCancel()
+			if err != nil {
 				h.sendJSON(c, "error", map[string]any{"code": "unauthorized", "message": "access denied"})
 				continue
 			}
@@ -742,8 +750,8 @@ func (h *Handler) readLoopV2(c *client, ip string) {
 				h.sendJSON(c, "error", map[string]any{"code": "already_subscribed", "message": "already subscribed to this session"})
 				continue
 			}
-			// Create context for this subscription with timeout
-			ctx, cancel := context.WithTimeout(context.Background(), 24*time.Hour)
+			// Create context for this subscription tied to client connection (cleanup on disconnect)
+			ctx, cancel := context.WithCancel(c.clientCtx)
 			c.sessionSubscriptions[sessionID] = cancel
 			c.sendMu.Unlock()
 			// Launch subscription in goroutine
