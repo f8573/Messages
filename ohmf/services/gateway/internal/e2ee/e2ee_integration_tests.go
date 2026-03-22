@@ -19,10 +19,8 @@ func TestE2EEEncryptionFlow(t *testing.T) {
 
 	// Step 1: Generate test keys
 	senderIdentityPrivateKey := generateTestPrivateKey()
-	senderIdentityPublicKey := derivePublicKey(senderIdentityPrivateKey)
-
-	recipientIdentityPrivateKey := generateTestPrivateKey()
-	recipientIdentityPublicKey := derivePublicKey(recipientIdentityPrivateKey)
+	_ = senderIdentityPrivateKey // Placeholder for future libsignal integration
+	_ = derivePublicKey(senderIdentityPrivateKey)
 
 	// Step 2: Create mock session key (would come from X3DH in production)
 	sessionKey := make([]byte, 32)
@@ -119,7 +117,7 @@ func TestMediaEncryption(t *testing.T) {
 		t.Fatalf("Media decryption failed: %v", err)
 	}
 
-	if string(decrypted) != string(mediaBlob) {
+	if string(decryptedMedia) != string(mediaBlob) {
 		t.Errorf("Decrypted media doesn't match")
 	}
 

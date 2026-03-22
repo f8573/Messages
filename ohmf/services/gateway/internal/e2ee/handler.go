@@ -3,8 +3,6 @@ package e2ee
 import (
 	"database/sql"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"

@@ -2,6 +2,7 @@ package e2ee
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
 	"fmt"
@@ -152,7 +153,6 @@ func (s *IdentityStoreWithUser) IsTrustedIdentity(ctx context.Context, contactUs
 // TESTABLE VERSION: SaveIdentity - Fixed to use user context
 func (s *IdentityStoreWithUser) SaveIdentity(ctx context.Context, contactUserID string, contactDeviceID uint32, identityKey []byte) (bool, error) {
 	// Compute fingerprint: SHA256 of identity key
-	import "crypto/sha256"
 	hash := sha256.Sum256(identityKey)
 	fingerprint := fmt.Sprintf("%x", hash)
 
