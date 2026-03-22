@@ -213,9 +213,9 @@ func main() {
 	// removed: enableSend boolean parameter - using named constructors for clarity
 	var wsHandler *realtime.Handler
 	if cfg.EnableWSSend {
-		wsHandler = realtime.NewHandlerWithSend(tokens, msgSvc, rdb, rateLimiter, replicationStore)
+		wsHandler = realtime.NewHandlerWithSend(tokens, msgSvc, rdb, rateLimiter, replicationStore, miniappSvc)
 	} else {
-		wsHandler = realtime.NewHandlerReadOnly(tokens, msgSvc, rdb, rateLimiter, replicationStore)
+		wsHandler = realtime.NewHandlerReadOnly(tokens, msgSvc, rdb, rateLimiter, replicationStore, miniappSvc)
 	}
 
 	authHandler := auth.NewHandler(pool, rdb, tokens, otpProvider, cfg.AccessTTL, cfg.RefreshTTL, cfg, usersSvc, devSvc)
