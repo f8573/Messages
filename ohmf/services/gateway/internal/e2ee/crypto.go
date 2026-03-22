@@ -96,9 +96,15 @@ type TrustState struct {
 
 // ComputeFingerprint returns SHA256 hash of signing public key as hex string
 func ComputeFingerprint(signingPublicKeyBase64 string) (string, error) {
+	if signingPublicKeyBase64 == "" {
+		return "", fmt.Errorf("signing public key cannot be empty")
+	}
 	data, err := base64.StdEncoding.DecodeString(signingPublicKeyBase64)
 	if err != nil {
 		return "", fmt.Errorf("failed to decode signing public key: %w", err)
+	}
+	if len(data) == 0 {
+		return "", fmt.Errorf("decoded public key is empty")
 	}
 	hash := sha256.Sum256(data)
 	return hex.EncodeToString(hash[:]), nil

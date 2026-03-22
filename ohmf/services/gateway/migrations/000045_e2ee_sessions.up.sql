@@ -11,9 +11,9 @@ CREATE TABLE IF NOT EXISTS e2ee_sessions (
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (user_id, contact_user_id, contact_device_id),
-    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
-    FOREIGN KEY (contact_user_id) REFERENCES users(user_id) ON DELETE CASCADE,
-    FOREIGN KEY (contact_device_id) REFERENCES devices(device_id) ON DELETE CASCADE
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (contact_user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (contact_device_id) REFERENCES devices(id) ON DELETE CASCADE
 );
 
 -- Create index for efficient session lookups
@@ -31,9 +31,9 @@ CREATE TABLE IF NOT EXISTS device_key_trust (
     trust_established_at TIMESTAMPTZ,
     verified_at TIMESTAMPTZ,
     PRIMARY KEY (user_id, contact_user_id, contact_device_id),
-    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
-    FOREIGN KEY (contact_user_id) REFERENCES users(user_id) ON DELETE CASCADE,
-    FOREIGN KEY (contact_device_id) REFERENCES devices(device_id) ON DELETE CASCADE
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (contact_user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (contact_device_id) REFERENCES devices(id) ON DELETE CASCADE
 );
 
 -- Create index for trust lookups
@@ -52,7 +52,7 @@ ALTER TABLE conversations
 
 -- Create index for encryption state queries
 CREATE INDEX IF NOT EXISTS idx_conversations_encryption_state
-  ON conversations(user_id, encryption_state)
+  ON conversations(id, encryption_state)
   WHERE encryption_state != 'PLAINTEXT';
 
 -- Create table to track E2EE initialization attempts (for debugging/analytics)
@@ -66,10 +66,10 @@ CREATE TABLE IF NOT EXISTS e2ee_initialization_log (
     status TEXT,                               -- INITIATED, SESSION_CREATED, FAILED
     error_message TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW(),
-    FOREIGN KEY (initiator_user_id) REFERENCES users(user_id) ON DELETE CASCADE,
-    FOREIGN KEY (initiator_device_id) REFERENCES devices(device_id) ON DELETE CASCADE,
-    FOREIGN KEY (recipient_user_id) REFERENCES users(user_id) ON DELETE CASCADE,
-    FOREIGN KEY (recipient_device_id) REFERENCES devices(device_id) ON DELETE CASCADE,
+    FOREIGN KEY (initiator_user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (initiator_device_id) REFERENCES devices(id) ON DELETE CASCADE,
+    FOREIGN KEY (recipient_user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (recipient_device_id) REFERENCES devices(id) ON DELETE CASCADE,
     FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE SET NULL
 );
 
