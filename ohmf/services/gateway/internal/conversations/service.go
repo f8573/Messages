@@ -1250,7 +1250,7 @@ func (s *Service) InitializeGroupMLS(ctx context.Context, conversationID string)
 	return nil
 }
 
-// UpdateTransportPolicy
+func (s *Service) UpdateTransportPolicy(ctx context.Context, actor, conversationID, policy string) (Conversation, error) {
 	// validate policy
 	switch policy {
 	case "AUTO", "FORCE_OTT", "FORCE_SMS", "FORCE_MMS", "BLOCK_CARRIER_RELAY":

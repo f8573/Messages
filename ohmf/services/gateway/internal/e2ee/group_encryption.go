@@ -172,6 +172,7 @@ func (m *MultiRecipientEncryption) DecryptGroupMessage(
 	// Unwrap session key using recipient's DH secret
 	// In production: X3DH unwrap of wrappedKeyBytes
 	// For now: placeholder (session key = wrapped key)
+	_ = wrappedKeyBytes
 	_ = nonceBytes
 
 	// Decode ciphertext

@@ -1,7 +1,6 @@
 package e2ee
 
 import (
-	"context"
 	"encoding/base64"
 	"testing"
 

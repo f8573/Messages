@@ -1,7 +1,6 @@
 package e2ee
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"time"
@@ -249,8 +248,8 @@ func (h *Handler) GetDeviceKeyBundle(w http.ResponseWriter, r *http.Request) {
 // ClaimOneTimePrekey handles POST /v1/e2ee/claim-prekey
 // Atomically claims the next available one-time prekey for a device
 func (h *Handler) ClaimOneTimePrekey(w http.ResponseWriter, r *http.Request) {
-	userID, ok := middleware.UserIDFromContext(r.Context())
-	if !ok {
+	// Verify user is authenticated
+	if _, ok := middleware.UserIDFromContext(r.Context()); !ok {
 		httpx.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "user context required", nil)
 		return
 	}
