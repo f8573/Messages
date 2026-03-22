@@ -22,6 +22,7 @@
   frame.src = entrypointUrl.toString();
 
   // P3.2: Validate origin if app_origin is provided
+  // P4.3: Handle SESSION_EVENT messages from parent WebSocket v2 connection
   window.addEventListener("message", (event) => {
     if (event.source !== frame.contentWindow) return;
 
@@ -37,6 +38,13 @@
 
     const payload = typeof event.data === "object" ? event.data : null;
     if (!payload || payload.channel !== channel) return;
+
+    // P4.3: Pass SESSION_EVENT messages directly to miniapp
+    if (payload.type === "SESSION_EVENT") {
+      frame.contentWindow.postMessage(payload, "*");
+      return;
+    }
+
     const raw = window.MiniAppHostBridge.handleRequest(JSON.stringify(payload));
     if (!raw) return;
     frame.contentWindow.postMessage(JSON.parse(raw), "*");
