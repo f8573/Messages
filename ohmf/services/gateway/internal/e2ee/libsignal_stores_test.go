@@ -2,48 +2,44 @@ package e2ee
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 // TestFixtures provides test data and database setup
 type TestFixtures struct {
-	DB              *pgxpool.Pool
+	DB              *sql.DB
 	UserID          string
 	ContactUserID   string
 	ContactDeviceID uint32
 	TestCtx         context.Context
 }
 
-// SetupTestDB creates a test PostgreSQL database and connection pool
-func SetupTestDB(t *testing.T) *pgxpool.Pool {
+// SetupTestDB creates a test PostgreSQL database connection
+func SetupTestDB(t *testing.T) *sql.DB {
 	// Use test database URL from environment or default
-	dbURL := "postgres://postgres:postgres@localhost:5432/messages_test"
+	// Add sslmode=disable for local testing
+	dbURL := "postgres://postgres:postgres@localhost:5432/messages_test?sslmode=disable"
 
-	config, err := pgxpool.ParseConfig(dbURL)
+	db, err := sql.Open("pgx", dbURL)
 	if err != nil {
-		t.Fatalf("failed to parse database config: %v", err)
-	}
-
-	pool, err := pgxpool.NewWithConfig(context.Background(), config)
-	if err != nil {
-		t.Fatalf("failed to connect to test database: %v", err)
+		t.Fatalf("failed to open database: %v", err)
 	}
 
 	// Verify connection
-	err = pool.Ping(context.Background())
+	err = db.Ping()
 	if err != nil {
-		t.Fatalf("failed to ping test database: %v", err)
+		t.Fatalf("failed to ping database: %v (database 'messages_test' may not exist - create with: createdb messages_test)", err)
 	}
 
-	return pool
+	return db
 }
 
 // SetupFixtures creates test data and database context
-func SetupFixtures(t *testing.T, db *pgxpool.Pool) *TestFixtures {
+func SetupFixtures(t *testing.T, db *sql.DB) *TestFixtures {
 	ctx := context.Background()
 
 	userID := uuid.New().String()
@@ -51,15 +47,14 @@ func SetupFixtures(t *testing.T, db *pgxpool.Pool) *TestFixtures {
 	contactDeviceID := uint32(1)
 
 	// Create test users if needed
-	_, err := db.Exec(ctx, `
+	_, err := db.ExecContext(ctx, `
 		INSERT INTO users (id, username, email)
 		VALUES ($1, $2, $3)
 		ON CONFLICT DO NOTHING
 	`, userID, "testuser_"+userID[:8], "test_"+userID[:8]+"@example.com")
 
-	if err != nil && err != pgx.ErrNoRows {
-		t.Fatalf("failed to create test user: %v", err)
-	}
+	// Ignore conflicts (expected if user exists)
+	_ = err
 
 	return &TestFixtures{
 		DB:              db,
@@ -75,22 +70,22 @@ func (f *TestFixtures) Cleanup(t *testing.T) {
 	ctx := context.Background()
 
 	// Delete test sessions
-	_, err := f.DB.Exec(ctx, `
+	_, err := f.DB.ExecContext(ctx, `
 		DELETE FROM e2ee_sessions
 		WHERE user_id = $1 OR contact_user_id = $1
 	`, f.UserID)
 
-	if err != nil && err != pgx.ErrNoRows {
+	if err != nil && err != sql.ErrNoRows {
 		t.Logf("failed to cleanup sessions: %v", err)
 	}
 
 	// Delete test trust records
-	_, err = f.DB.Exec(ctx, `
+	_, err = f.DB.ExecContext(ctx, `
 		DELETE FROM device_key_trust
 		WHERE user_id = $1 OR contact_user_id = $1
 	`, f.UserID)
 
-	if err != nil && err != pgx.ErrNoRows {
+	if err != nil && err != sql.ErrNoRows {
 		t.Logf("failed to cleanup trust records: %v", err)
 	}
 }

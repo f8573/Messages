@@ -2,6 +2,7 @@ package e2ee
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
 	"fmt"
@@ -488,5 +489,3 @@ func computeFingerprintFromKey(keyBytes []byte) string {
 //
 //     return plaintext, nil
 // }
-
-import "crypto/sha256"
