@@ -5,22 +5,22 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // SessionManager handles Signal protocol sessions and message encryption/decryption
 type SessionManager struct {
-	db *sql.DB
+	db *pgxpool.Pool
 }
 
 // NewSessionManager creates a new session manager
-func NewSessionManager(db *sql.DB) *SessionManager {
+func NewSessionManager(db *pgxpool.Pool) *SessionManager {
 	return &SessionManager{
 		db: db,
 	}
@@ -179,7 +179,7 @@ func (sm *SessionManager) GetSession(
 	`
 
 	var session Session
-	err := sm.db.QueryRowContext(ctx, query, userID, contactUserID, contactDeviceID).Scan(
+	err := sm.db.QueryRow(ctx, query, userID, contactUserID, contactDeviceID).Scan(
 		&session.UserID,
 		&session.ContactUserID,
 		&session.ContactDeviceID,
@@ -192,11 +192,10 @@ func (sm *SessionManager) GetSession(
 		&session.UpdatedAt,
 	)
 
-	if err == sql.ErrNoRows {
-		return nil, nil // Session doesn't exist yet
-	}
-
 	if err != nil {
+		if err.Error() == "no rows in result set" {
+			return nil, nil // Session doesn't exist yet
+		}
 		return nil, fmt.Errorf("failed to query session: %w", err)
 	}
 
@@ -220,7 +219,7 @@ func (sm *SessionManager) SaveSession(ctx context.Context, session *Session) err
 		  updated_at = EXCLUDED.updated_at
 	`
 
-	_, err := sm.db.ExecContext(ctx, query,
+	_, err := sm.db.Exec(ctx, query,
 		session.UserID,
 		session.ContactUserID,
 		session.ContactDeviceID,
@@ -255,7 +254,7 @@ func (sm *SessionManager) StoreTrustState(ctx context.Context, trust *TrustState
 		  verified_at = EXCLUDED.verified_at
 	`
 
-	_, err := sm.db.ExecContext(ctx, query,
+	_, err := sm.db.Exec(ctx, query,
 		trust.UserID,
 		trust.ContactUserID,
 		trust.ContactDeviceID,
@@ -288,7 +287,7 @@ func (sm *SessionManager) GetTrustState(
 	`
 
 	var trust TrustState
-	err := sm.db.QueryRowContext(ctx, query, userID, contactUserID, contactDeviceID).Scan(
+	err := sm.db.QueryRow(ctx, query, userID, contactUserID, contactDeviceID).Scan(
 		&trust.UserID,
 		&trust.ContactUserID,
 		&trust.ContactDeviceID,
@@ -299,11 +298,10 @@ func (sm *SessionManager) GetTrustState(
 		&trust.VerifiedAt,
 	)
 
-	if err == sql.ErrNoRows {
-		return nil, nil // No trust state recorded yet
-	}
-
 	if err != nil {
+		if err.Error() == "no rows in result set" {
+			return nil, nil // No trust state recorded yet
+		}
 		return nil, fmt.Errorf("failed to query trust state: %w", err)
 	}
 
@@ -350,7 +348,7 @@ func (sm *SessionManager) LogE2EEInitialization(
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
 	`
 
-	_, err := sm.db.ExecContext(ctx, query,
+	_, err := sm.db.Exec(ctx, query,
 		initiatorUserID,
 		initiatorDeviceID,
 		recipientUserID,
