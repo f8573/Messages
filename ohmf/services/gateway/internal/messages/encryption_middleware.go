@@ -30,12 +30,15 @@ type RecipientKeyInfo struct {
 	WrapNonce  string
 }
 
+// EncryptedMessageQuerier defines the database interface needed for encrypted message processing
+type EncryptedMessageQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) interface{ Scan(...any) error }
+}
+
 // ProcessEncryptedMessage validates and extracts metadata from encrypted message content
 func ProcessEncryptedMessage(
 	ctx context.Context,
-	querier interface {
-		QueryRowContext(ctx context.Context, query string, args ...interface{}) interface{ Scan(...interface{}) error }
-	},
+	querier EncryptedMessageQuerier,
 	senderUserID string,
 	senderDeviceID string,
 	content map[string]any,
@@ -76,16 +79,16 @@ func ProcessEncryptedMessage(
 
 	// Verify sender has device identity key
 	var signingPublicKeyB64 string
-	err := querier.QueryRowContext(ctx, `
+	err := querier.QueryRow(ctx, `
 		SELECT signing_public_key
 		FROM device_identity_keys
 		WHERE device_id = $1 AND user_id = $2
 	`, senderDeviceID, senderUserID).Scan(&signingPublicKeyB64)
 
-	if err == sql.ErrNoRows {
-		return nil, errors.New("sender_device_not_found")
-	}
 	if err != nil {
+		if err.Error() == "no rows in result set" {
+			return nil, errors.New("sender_device_not_found")
+		}
 		return nil, fmt.Errorf("failed to query sender device: %w", err)
 	}
 
@@ -127,7 +130,7 @@ func ProcessEncryptedMessage(
 
 		// Verify recipient device exists
 		var exists bool
-		err := querier.QueryRowContext(ctx, `
+		err := querier.QueryRow(ctx, `
 			SELECT EXISTS(
 				SELECT 1 FROM devices
 				WHERE id = $1 AND user_id = $2

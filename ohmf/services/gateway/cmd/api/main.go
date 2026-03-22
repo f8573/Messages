@@ -232,7 +232,7 @@ func main() {
 	miniappHandler := miniapp.NewHandler(miniappSvc, miniapp.NewRegistryClient(cfg.AppsAddr))
 	abuseHandler := &abuse.Handler{Svc: abuseSvc}
 	deviceKeysHandler := &devicekeys.Handler{DB: deviceKeysSvc.DB()}
-	e2eeHandler := e2ee.NewHandler(pool, pool)
+	e2eeHandler := e2ee.NewHandler(pool)
 	msgHandler := messages.NewHandler(msgSvc)
 	syncSvc := sync.NewService(pool, replicationStore)
 	syncHandler := &sync.Handler{Svc: syncSvc}
@@ -380,6 +380,7 @@ func main() {
 			protected.Get("/device-keys/{userID}", deviceKeysHandler.ListForUser)
 			protected.Post("/device-keys/{userID}/claim", deviceKeysHandler.ClaimForUser)
 			// E2EE endpoints
+			protected.Get("/e2ee/keys", e2eeHandler.ListDeviceKeys)
 			protected.Get("/device-keys/{userID}/{deviceID}/bundle", e2eeHandler.GetDeviceKeyBundle)
 			protected.Post("/device-keys/{deviceID}/claim-otp", e2eeHandler.ClaimOneTimePrekey)
 			protected.Post("/e2ee/session/verify", e2eeHandler.VerifyDeviceFingerprint)
