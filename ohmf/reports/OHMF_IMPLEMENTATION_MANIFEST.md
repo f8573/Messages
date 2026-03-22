@@ -21,17 +21,39 @@
 
 ## Executive Summary
 
-The OHMF mini-app platform has reached **production-readiness** for Phase 1 + Phase 2 work:
+The OHMF mini-app platform has achieved **core system completeness** with strong architectural foundations. However, it is **not production-ready** in its current state.
 
-### Completion Status
-- **30/30 Core Items Completed** (100%)
-- **Phase 1**: Architecture, Security, Storage, Runtime Hardening (Weeks 1-3)
-- **Phase 2**: Real-time Delivery via WebSocket v2 (Weeks 4-5)
-- **Code Quality**: Optimized for efficiency, safety, and maintainability
-- **Test Coverage**: Integration tests for critical paths
-- **Documentation**: Comprehensive 7-step analysis per feature
+### Status: System-Complete ← → Production-Incomplete
 
-### What Works Now ✅
+**What This Means**:
+- ✅ Architecture is sound and extensible
+- ✅ Core runtime protocols defined and tested
+- ✅ Security model implemented (with known limitations)
+- ✅ Basic observability instrumentation in place
+- ❌ Not validated under production load
+- ❌ Missing critical operational infrastructure
+- ❌ Failure modes not comprehensively tested
+- ❌ UX flows incomplete (re-consent required)
+
+### Actual Readiness Assessment
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| **Core Architecture** | ✅ Production-Grade | Ownership, persistence, event model solid |
+| **Security Model** | ⚠️ Strong but Incomplete | See Section 9: Threat Model Expansion |
+| **Real-Time Transport** | ✅ Ready for Load Testing | Redis pub/sub + WebSocket v2 implemented |
+| **Observability** | ❌ Pre-Alpha | Metrics collected; dashboards/alerting missing |
+| **Infrastructure** | ❌ Not Provisioned | No S3, CDN, KMS in use |
+| **Load Validation** | ❌ Not Performed | Performance claims unvalidated at scale |
+| **UX/Re-Consent** | ❌ Not Implemented | Backend ready; UI missing |
+| **Disaster Recovery** | ⚠️ Partial | Event replay implemented; full RTO/RPO untested |
+
+### Completion Metrics (What Actually Changed)
+- **30/30 Core Items Designed/Implemented** (100%) — *architecture layer*
+- **~50% of Production Prerequisites Completed** — *infrastructure layer*
+- **~20% of Operational Readiness** — *monitoring/runbooks/failure response*
+
+### What's Working Today ✅
 - Ownership boundaries enforced (apps service ↔️ gateway)
 - Publisher trust model with key rotation
 - Capability enforcement at bridge layer
@@ -47,16 +69,292 @@ The OHMF mini-app platform has reached **production-readiness** for Phase 1 + Ph
 - Real-time session events via WebSocket v2
 - SDKs (Web + Android) with auto-subscribe
 
-### What's Blocked (Requires Phase 3)
+### What's Missing for Production ⏳
 - Cloud infrastructure (CDN, S3, KMS)
+- Production observability stack (Prometheus, Grafana, Jaeger, alerting)
+- Load validation (1000+ concurrent clients, >1000 events/sec)
 - UI implementations (re-consent workflows)
-- Android build & CI/CD
-- Stress/load/soak testing
-- Observability infrastructure
+- Android production build & CI/CD
+- Comprehensive failure mode testing
+- Run-book documentation & incident response procedures
+- Disaster recovery validation (RTO/RPO testing)
+- Developer experience tooling (debugging, profiling, replay)
 
 ---
 
-## Phase 1: Completed Implementations
+## Critical Gaps & Known Limitations
+
+This section documents areas that require work before production deployment.
+
+### 1. Failure Modes & Recovery Guarantees
+
+**The Gap**: No comprehensive failure mode analysis or recovery procedures defined.
+
+**Known Risks**:
+
+| Failure Mode | Impact | Current Mitigation | Production Readiness |
+|---|---|---|---|
+| Redis down / events dropped | Event loss → inconsistency | PostgreSQL fallback (polling only) | ⚠️ Needs RTO/RPO validation |
+| WebSocket client misses 100+ events | Client stale | Resume via event_seq polling | ⚠️ Resync protocol untested at scale |
+| Partial network partition | Split-brain risk | Not addressed | ❌ Critical gap |
+| Consumer lag (app falls behind) | Dropped events | No backpressure mechanism | ⚠️ Needs implementation |
+| Event ordering violation | Cascade failures | event_seq enforced; not tested | ⚠️ Needs failure injection testing |
+| Postgres query slow (>5s lock) | Read loop stalls | No timeout on queries | ⚠️ Needs query optimization |
+
+**What Needs to Happen**:
+1. Formalize RPO (recovery point objective): "0 event loss" or "eventual consistency acceptable?"
+2. Define RTO (recovery time objective): max time to detect + recover
+3. Implement circuit breakers per component (Redis, Postgres)
+4. Add exponential backoff with jitter for retries
+5. Run 72-hour chaos engineering tests before production
+
+---
+
+### 2. Event Model Durability & Consistency Guarantees
+
+**The Current Model**:
+- Postgres `miniapp_events` = append-only source of truth ✅
+- Redis pub/sub = transport layer (best-effort) ⚠️
+- Clients resume via event_seq query ⚠️
+
+**What's **Explicitly Guaranteed**:
+- No event loss (stored in Postgres)
+- Ordering preserved (event_seq is monotonic)
+- Durability: Postgres durability guarantees apply
+
+**What's **Not Guaranteed**:
+- Real-time delivery (Redis may drop events during pub/sub)
+- Event delivery ordering at transport layer (redis pub/sub is not FIFO across reconnects)
+- Client-side consistency if refresh fails
+
+**Production Gap**: System is *eventually consistent* but lacks:
+- Explicit consistency SLA
+- Formal proof of convergence
+- Anomaly detection for consistency violations
+
+**Fix Required**:
+```
+Define explicitly:
+
+1. Consistency Model
+   - Strong consistency? (no)
+   - Causal consistency? (no)
+   - Eventual consistency? (yes, but SLA?)
+
+2. Delivery Guarantees
+   - At-most-once? (yes, Redis best-effort)
+   - At-least-once? (only via polling)
+   - Exactly-once? (no)
+
+3. Client Reconciliation
+   - Automatic via event_seq query? (yes)
+   - Max stale duration? (undefined, needs SLA)
+   - Conflict resolution on re-sync? (undefined)
+```
+
+---
+
+### 3. Security Model: Incomplete Threat Coverage
+
+**What's Implemented**:
+- ✅ Capability enforcement
+- ✅ Bridge isolation
+- ✅ CSP hardening
+- ✅ Publisher key verification
+
+**What's Missing**:
+
+#### 3a. Data Exfiltration Attacks
+```
+Even with CSP, a malicious app can:
+- Encode data in allowed bridge calls
+- Exploit timing channels
+- Abuse bulk export capabilities
+```
+
+**Gap**: No data access boundaries; no per-app quotas on bridge calls.
+
+#### 3b. Malicious-but-Signed App Model
+```
+Current assumption: "publisher key = trusted"
+Reality: Keys can be compromised; publishers attacked.
+```
+
+**Gap**: No revocation cascade; no "kill all apps by publisher X" mechanism.
+
+#### 3c. Supply Chain Attack (Compromised Release)
+```
+Current flow:
+App Version → Publisher Signs → Gateway Verifies → Deployed
+
+Missing: No mechanism to revoke all instances of a compromised version.
+```
+
+**Gap**: Can suspend release, but not retroactively for active sessions.
+
+#### 3d. Usage Anomalies (Abuse)
+```
+No detection for:
+- Abnormal event rates (DoS vs. normal spike)
+- Unusual capability patterns
+- Cross-app data correlation
+```
+
+**Gap**: Zero abuse detection; relies on manual review.
+
+---
+
+### 4. Performance Claims — Methodology Gap
+
+**Claims Made**:
+- p95 latency: < 100ms
+- Throughput: 1000+ events/sec
+- Improvement: 3-5x over naive approach
+
+**Problem**: These are **unvalidated claims**.
+
+**What's Missing**:
+- Test environment specification
+- Load model definition (users x sessions x events)
+- Hardware specs used for benchmarks
+- Bottleneck analysis (CPU? I/O? network?)
+- Failure points (at what scale does system break?)
+
+**Production Issue**: If you claim p95 < 100ms but reality is p99 = 5s, customers experience catastrophic outages.
+
+**Fix Required**:
+```
+Before production:
+1. Define performance SLA
+   Example: p95 < 100ms, p99 < 500ms, 1000+ events/sec per connection
+
+2. Measure in production-like environment
+   - Real AWS instance types
+   - Real network conditions (latency, packet loss)
+   - Realistic app behavior (not synthetic)
+
+3. Identify breaking points
+   - At 10,000 concurrent clients, what fails first?
+   - At 10,000 events/sec, where's the bottleneck?
+   - At 100+ subscriptions per client, what breaks?
+
+4. Document SLA limits
+   - Max concurrent clients per gateway
+   - Max subscriptions per client
+   - Max event rate per session
+```
+
+---
+
+### 5. Bridge Architecture: Long-Term Scalability Gap
+
+**Current Model**: Bridge is the only path to host resources.
+
+**Problem**: Becomes a bottleneck for:
+- High-frequency updates (100+ updates/sec app)
+- Media streaming (image/video apps)
+- Real-time games
+- GPU-accelerated apps
+
+**Missing**: No path for "trusted" direct access without bridge routing.
+
+**Production Evolution Path**:
+```
+Phase 1 (Now): All via bridge ✅
+Phase 2 (Q3): Add "streaming" channels for bulk transfer
+Phase 3 (Q4): Selective direct paths for specific capabilities
+Phase 4+: Zero-copy GPU paths for media apps
+```
+
+---
+
+### 6. Observability: Currently Pre-Alpha
+
+**Current State**:
+- ✅ Basic Redis pub/sub publishing
+- ✅ Event logging to Postgres
+- ✅ Error codes returned to clients
+- ❌ No centralized metrics
+- ❌ No alerting
+- ❌ No distributed tracing
+- ❌ No dashboard visibility
+
+**Production Requirement**:
+Must have observability **before** accepting users, because:
+- Cannot debug production issues without logs/traces
+- Cannot validate SLA compliance without metrics
+- Cannot respond to incidents without alerts
+
+**Critical Metrics Missing**:
+```
+1. Event delivery latency (p50, p95, p99, p99.9)
+2. Redis pub/sub lag (message age at delivery)
+3. WebSocket reconnect latency
+4. Capability enforcement rate (allowed vs denied)
+5. Release suspension propagation latency
+6. Session concurrency (max live sessions)
+7. Bridge method error rates (per method)
+8. Database query latency (per query type)
+```
+
+**Phase 0 Pre-Requisite**: Setup Prometheus + Grafana + Jaeger before load testing.
+
+---
+
+### 7. Design Decisions & Tradeoffs
+
+**Why Redis pub/sub instead of Kafka?**
+```
+Trade-off:
+✅ Simpler, fewer dependencies
+✅ Lower latency (in-memory)
+❌ No persistence / replay
+❌ Doesn't scale to 100k+ events/sec
+
+Decision: Acceptable for Phase 1 (single-digit k events/sec).
+Risk: If throughput exceeds 10k events/sec, need migration to Kafka.
+```
+
+**Why Postgres instead of event store (EventStoreDB, etc.)?**
+```
+Trade-off:
+✅ Existing infrastructure
+✅ ACID guarantees
+✅ Full SQL Query capability
+❌ Not optimized for event queries
+❌ Deletes become expensive (compaction)
+
+Decision: Acceptable for single-app platform.
+Risk: Multi-tenant future requires event store refactor.
+```
+
+**Why WebSocket v2 instead of SSE?**
+```
+Trade-off:
+✅ Bidirectional (enables features)
+✅ Lower latency (persistent connection)
+❌ Stateful (harder to scale)
+❌ More resource-intensive
+
+Decision: WebSocket wins for mini-app use case (frequent bidirectional updates).
+Risk: If clients exceed 100k+, need HTTP/2 Server Push fallback.
+```
+
+**Why Bridge-first instead of direct iframe APIs?**
+```
+Trade-off:
+✅ Security boundary (capability model works)
+✅ Audit trail (all calls logged)
+❌ Latency overhead (postMessage round-trip)
+❌ Scaling bottleneck at extreme scale
+
+Decision: Security wins; latency overhead acceptable (<5ms).
+Risk: As workloads increase, may need zero-copy optimizations.
+```
+
+---
+
+
 
 ### P0 — Core Architecture Corrections
 
@@ -857,7 +1155,148 @@ See [P4.3 above](#p43-realtime-fanout--complete-phase-2)
 
 ---
 
-## Future Phases (Blocked/Deferred)
+---
+
+## Critical Path to Production
+
+### Phase 2.5: Production Prerequisites (Must Complete Before Load Testing)
+
+**Must-Have**:
+1. Observability Infrastructure
+   - [ ] Prometheus metrics collection
+   - [ ] Grafana dashboards (latency, throughput, errors)
+   - [ ] Jaeger distributed tracing
+   - [ ] Alert rules for SLA violations
+
+2. Disaster Recovery
+   - [ ] Failover procedure for gateway
+   - [ ] Redis failover validation
+   - [ ] Postgres backup/restore tested
+   - [ ] RTO/RPO documented
+
+3. Security Validation
+   - [ ] Penetration testing (simulated malicious app)
+   - [ ] Chaos engineering tests
+   - [ ] Rate limiting validation
+   - [ ] Audit log analysis
+
+4. Performance Validation
+   - [ ] Load test: 1000 concurrent clients
+   - [ ] Endurance test: 72 hours
+   - [ ] Latency profiling under load
+   - [ ] Identify and fix bottlenecks
+
+### Phase 3 (After prerequisites)
+
+**Infrastructure**:
+- Cloud provisioning (S3, CDN, KMS)
+- Production environment setup
+- Auto-scaling configuration
+
+**UX**:
+- Re-consent workflows (web + Android)
+- Error handling UX improvements
+
+**Testing**:
+- Android CI/CD
+- Full integration test suite
+
+---
+
+## Developer Experience (Currently Missing)
+
+**What Developers Need**:
+
+1. **Local Development Environment**
+   - [ ] Docker Compose for full stack (gateway + apps service + postgres + redis)
+   - [ ] Sample mini-app templates (React, Vue, vanilla)
+   - [ ] Hot reload during development
+
+2. **Debugging Tools**
+   - [ ] Chrome DevTools integration for message inspection
+   - [ ] Event replay tool (replay captured events to test app)
+   - [ ] Sandbox violation detector (CSP warnings)
+   - [ ] Capability checker (show available methods for app permissions)
+
+3. **Profiling & Monitoring (Dev)**
+   - [ ] Event rate profiler
+   - [ ] Memory profiler (detect leaks)
+   - [ ] Network waterfall (bridge call timing)
+
+4. **Documentation**
+   - [ ] "Hello World" mini-app (5-minute setup)
+   - [ ] API reference with examples
+   - [ ] Bridge method catalog
+   - [ ] Troubleshooting guide
+
+**Current State**: Minimal. Example apps exist but no tooling.
+
+**Impact on Adoption**: High. Developers will abandon platform if onboarding > 30 minutes.
+
+---
+
+## Expanded Threat Model
+
+### Threat 1: Malicious Mini-App (Signed by Legitimate Publisher)
+
+**Scenario**: Publisher account compromised; attacker uploads malicious app.
+- Signs with compromised key
+- Gateway validates signature (✅ trusted)
+- Malicious app runs in user sessions
+
+**Current Mitigation**:
+- [ ] Capability enforcement (partial; data access unbounded)
+- [ ] Rate limiting per method
+
+**Missing**:
+- [ ] Data access quotas
+- [ ] Anomaly detection (unusual capability patterns)
+- [ ] Cross-session data correlation prevention
+
+**Required Fix**: Add per-app quotas, anomaly detection, audit logging of all bridge method calls.
+
+---
+
+### Threat 2: Supply Chain Attack (Compromised Release After Deployment)
+
+**Scenario**: A mini-app version in production is discovered to be malicious.
+- Already running in 10,000 active sessions
+- Attacker has exfiltrated user data
+
+**Current Tool**: Release suspension (can block new sessions)
+
+**Missing**: No retroactive session termination; no automatic data purge notification.
+
+**Required Fix**:
+1. Add endpoint to force-terminate all sessions for a release
+2. Add incident response playbook
+3. Add customer notification mechanism
+
+---
+
+### Threat 3: Timing Channel (Exfiltrate Data via Latency)
+
+**Scenario**: App measures bridge call latency to encode data (fast = bit 0, slow = bit 1).
+
+**Current Defense**: None.
+
+**Required Fix**: Add jitter to response times; implement rate limiting with consistent response times.
+
+---
+
+### Threat 4: Quota Exhaustion DoS
+
+**Scenario**: Malicious app makes 10,000 `storage.read` calls/sec, exhausting budget.
+
+**Current Defense**: Per-capability rate limiting.
+
+**Missing**: SLA for legitimate apps; no priority/fairness.
+
+**Required Fix**: Add token bucket per app with spillover backpressure (not just rejection).
+
+---
+
+
 
 ### Phase 3 — Infrastructure & Observability (Requires Provisioning)
 
@@ -1143,17 +1582,20 @@ All WebSocket & real-time items complete:
 
 ## Summary Statistics
 
-### Implementation Scope
+### Implementation Scope (Honest Assessment)
 
-| Category | Count | Status |
-|----------|-------|--------|
-| P0 Items (Architecture) | 4 | ✅ Complete |
-| P1 Items (Security) | 3 | ✅ Complete |
-| P2 Items (Storage) | 4 | ✅ Complete |
-| P3 Items (Web Runtime) | 5 | ✅ Complete |
-| P4 Items (Session & Realtime) | 3 | ✅ Complete |
-| **Phase 1 + 2 Total** | **30** | **✅ 100% Complete** |
-| Phase 3+ (Blocked) | ~20 | ⏳ Pending |
+| Category | Count | Design | Implemented | Tested | Production-Ready |
+|----------|-------|--------|-----------|--------|-----------------|
+| P0 Items (Architecture) | 4 | ✅ | ✅ | ⚠️ | ⚠️ |
+| P1 Items (Security) | 3 | ✅ | ✅ | ⚠️ | ⚠️ |
+| P2 Items (Storage) | 4 | ✅ | ✅ | ✅ | ⚠️ |
+| P3 Items (Web Runtime) | 5 | ✅ | ✅ | ⚠️ | ⚠️ |
+| P4 Items (Session & Realtime) | 3 | ✅ | ✅ | ✅ | ⚠️ |
+| **Phase 1 + 2 Total** | **30** | **✅ 100%** | **✅ 100%** | **⚠️ 60%** | **⚠️ 20%** |
+| Phase 2.5 (Pre-Prod) | ~10 | ❌ | ❌ | ❌ | ❌ |
+| Phase 3+ (Infrastructure) | ~20 | ⚠️ | ❌ | ❌ | ❌ |
+
+**Legend**: ✅ = Done | ⚠️ = Partial/Needs Validation | ❌ = Not Started
 
 ### Code Metrics
 
@@ -1169,40 +1611,112 @@ All WebSocket & real-time items complete:
 
 ### Quality Metrics
 
-| Metric | Status |
-|--------|--------|
-| P0 items depending on P1 | 0 (all independent) |
-| Breaking changes to public API | 0 |
-| Unhandled edge cases | 0 (all documented) |
-| Security vulnerabilities | 0 (all mitigated) |
-| Production-ready test coverage | ✅ |
+| Metric | Status | Notes |
+|--------|--------|-------|
+| P0 items depending on P1 | 0 | All independent |
+| Breaking changes to public API | 0 | Backward compatible |
+| **Unhandled edge cases** | ❌ Incomplete | See "Critical Gaps" section; chaos engineering needed |
+| **Known security issues** | ✅ 0 Critical | With caveat: Threat model not comprehensive; see Threat Model Expansion |
+| **Production-grade test coverage** | ⚠️ Partial | Integration tests exist; load testing not done |
+| Code review status | ⚠️ Team-Only | No external security audit |
+| Performance validated at scale | ❌ No | Claims unverified; SLA not stress-tested |
 
 ---
 
 ## Maintenance & Future Work
 
-### Critical Path (Post-Phase 2)
+## Production Readiness Checklist
 
-1. **Cloud Infrastructure Setup** (Week 1-2)
-   - Provision S3, CloudFront, KMS
-   - Setup monitoring and alerting
-   - Test failover procedures
+**Status: DO NOT DEPLOY TO PRODUCTION UNTIL ALL ITEMS COMPLETE**
 
-2. **Stress Testing** (Week 3-4)
-   - Run 1000+ concurrent client test
-   - 72-hour soak test
-   - Failure injection scenarios
+### Critical Prerequisites (Must Complete)
 
-3. **Production Deployment** (Week 5+)
-   - Deploy to production with gradual rollout
-   - Monitor error rates and latency
-   - Scale as needed
+- [ ] **Observability Stack Deployed**
+  - Prometheus collecting metrics
+  - Grafana dashboards operational
+  - Jaeger distributed tracing working
+  - Alert rules tuned to SLA
 
-### Long-Term Maintainability
+- [ ] **Performance Validated**
+  - Load test: 1000 concurrent clients ✅ latency < SLA
+  - Soak test: 72 hours without memory leaks
+  - Bottleneck analysis completed
+  - Failure points documented
 
-- **Code Review Process**: All changes must pass capability enforcement review
-- **Security Audits**: Quarterly penetration testing
-- **Performance Monitoring**: Continuous monitoring of event delivery latency
+- [ ] **Security Review Complete**
+  - External penetration test performed
+  - Threat model reviewed by security team
+  - Chaos engineering: fault injection tested
+  - Incident response playbook written
+
+- [ ] **Disaster Recovery Proven**
+  - Redis failover tested
+  - Postgres backup/restore validated
+  - RTO/RPO measured and documented
+  - 1-click recovery procedure automated
+
+- [ ] **UX Flows Complete**
+  - Re-consent workflow implemented (web + Android)
+  - Error handling screens designed
+  - User testing completed
+
+### Minor Prerequisites (Should Complete)
+
+- [ ] Developer tooling deployed (Docker, templates, debugging)
+- [ ] Documentation audit (onboarding path <30 min)
+- [ ] Android CI/CD pipeline working
+- [ ] CDN/S3 integration complete (if needed)
+
+### Post-Deployment (Continuous)
+
+- [ ] Monitoring alerts configured and tested
+- [ ] On-call rotation established
+- [ ] Incident response procedures drilled
+- [ ] Weekly performance reviews
+
+---
+
+## Maintenance & Future Work
+
+### Immediate Next Steps (Weeks 1-4)
+
+1. **Setup Observability Stack** (Week 1)
+   - Deploy Prometheus + Grafana
+   - Hook metrics collection points
+   - Create dashboard templates
+   - Configure alerting rules
+
+2. **Load Testing** (Week 2-3)
+   - Implement load test harness
+   - Run 1000 concurrent client scenario
+   - Run 72-hour endurance test
+   - Identify + fix bottlenecks
+
+3. **Security Validation** (Week 3)
+   - Penetration test (external)
+   - Chaos engineering (failure injection)
+   - Audit log review
+
+4. **UI Implementation** (Week 4)
+   - Re-consent workflows
+   - Error handling UX
+
+### Long-Term Maintenance Strategy
+
+**Quarterly**:
+- Penetration testing refresh
+- Performance SLA audit
+- Audit log analysis for anomalies
+
+**Monthly**:
+- Security patch review
+- Dependency updates
+- Performance metric review
+
+**Weekly**:
+- Incident review
+- Capability enforcement audit
+- Bridge method usage analysis
 - **Error Tracking**: All 4xx/5xx responses logged and tracked
 - **Documentation**: Keep in sync with code changes (this manifest updated per commit)
 
