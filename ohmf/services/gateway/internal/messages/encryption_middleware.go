@@ -33,7 +33,9 @@ type RecipientKeyInfo struct {
 // ProcessEncryptedMessage validates and extracts metadata from encrypted message content
 func ProcessEncryptedMessage(
 	ctx context.Context,
-	db *sql.DB,
+	querier interface {
+		QueryRowContext(ctx context.Context, query string, args ...interface{}) interface{ Scan(...interface{}) error }
+	},
 	senderUserID string,
 	senderDeviceID string,
 	content map[string]any,
@@ -74,7 +76,7 @@ func ProcessEncryptedMessage(
 
 	// Verify sender has device identity key
 	var signingPublicKeyB64 string
-	err := db.QueryRowContext(ctx, `
+	err := querier.QueryRowContext(ctx, `
 		SELECT signing_public_key
 		FROM device_identity_keys
 		WHERE device_id = $1 AND user_id = $2
@@ -125,7 +127,7 @@ func ProcessEncryptedMessage(
 
 		// Verify recipient device exists
 		var exists bool
-		err := db.QueryRowContext(ctx, `
+		err := querier.QueryRowContext(ctx, `
 			SELECT EXISTS(
 				SELECT 1 FROM devices
 				WHERE id = $1 AND user_id = $2
@@ -181,9 +183,11 @@ func ValidateEncryptionSignature(
 }
 
 // ComputeFingerprintForDevice computes fingerprint for a device's signing key
-func ComputeFingerprintForDevice(ctx context.Context, db *sql.DB, deviceID string) (string, error) {
+func ComputeFingerprintForDevice(ctx context.Context, querier interface {
+	QueryRowContext(ctx context.Context, query string, args ...interface{}) interface{ Scan(...interface{}) error }
+}, deviceID string) (string, error) {
 	var signingPublicKeyB64 string
-	err := db.QueryRowContext(ctx, `
+	err := querier.QueryRowContext(ctx, `
 		SELECT signing_public_key FROM device_identity_keys WHERE device_id = $1
 	`, deviceID).Scan(&signingPublicKeyB64)
 
@@ -195,9 +199,11 @@ func ComputeFingerprintForDevice(ctx context.Context, db *sql.DB, deviceID strin
 }
 
 // CountEncryptedMessagesInConversation returns count of encrypted messages
-func CountEncryptedMessagesInConversation(ctx context.Context, db *sql.DB, conversationID string) (int64, error) {
+func CountEncryptedMessagesInConversation(ctx context.Context, querier interface {
+	QueryRowContext(ctx context.Context, query string, args ...interface{}) interface{ Scan(...interface{}) error }
+}, conversationID string) (int64, error) {
 	var count int64
-	err := db.QueryRowContext(ctx, `
+	err := querier.QueryRowContext(ctx, `
 		SELECT COUNT(*)
 		FROM messages
 		WHERE conversation_id = $1 AND is_encrypted = TRUE
@@ -207,9 +213,11 @@ func CountEncryptedMessagesInConversation(ctx context.Context, db *sql.DB, conve
 }
 
 // GetEncryptionStateForConversation retrieves the encryption state
-func GetEncryptionStateForConversation(ctx context.Context, db *sql.DB, conversationID string) (string, error) {
+func GetEncryptionStateForConversation(ctx context.Context, querier interface {
+	QueryRowContext(ctx context.Context, query string, args ...interface{}) interface{ Scan(...interface{}) error }
+}, conversationID string) (string, error) {
 	var state string
-	err := db.QueryRowContext(ctx, `
+	err := querier.QueryRowContext(ctx, `
 		SELECT encryption_state
 		FROM conversations
 		WHERE id = $1
@@ -260,7 +268,10 @@ func LogEncryptionEvent(
 // Attachments must have encrypted keys wrapped in the message encryption
 func ValidateEncryptedAttachments(
 	ctx context.Context,
-	db *sql.DB,
+	db interface {
+		QueryRowContext(ctx context.Context, query string, args ...interface{}) interface{ Scan(...interface{}) error }
+		ExecContext(ctx context.Context, query string, args ...interface{}) (interface{}, error)
+	},
 	content map[string]any,
 ) error {
 	// Check if attachments array exists
@@ -279,7 +290,7 @@ func ValidateEncryptedAttachments(
 		// Required fields for encrypted attachments
 		attachmentID, _ := attachmentObj["attachment_id"].(string)
 		mediaKeyWrapped, _ := attachmentObj["media_key_wrapped"].(string)
-		mimeType, _ := attachmentObj["mime_type"].(string)
+		_, _ = attachmentObj["mime_type"].(string)
 
 		if attachmentID == "" {
 			return fmt.Errorf("attachment at index %d missing attachment_id", i)
@@ -331,7 +342,9 @@ func ValidateEncryptedAttachments(
 // Mentions are wrapped in the message encryption, server validates structure only
 func ValidateEncryptedMentions(
 	ctx context.Context,
-	db *sql.DB,
+	db interface {
+		QueryRowContext(ctx context.Context, query string, args ...interface{}) interface{ Scan(...interface{}) error }
+	},
 	content map[string]any,
 ) error {
 	// Check if mentions array exists
@@ -363,7 +376,7 @@ func ValidateEncryptedMentions(
 		var userExists bool
 		err := db.QueryRowContext(ctx, `
 			SELECT EXISTS(
-				SELECT 1 FROM users WHERE user_id = $1
+				SELECT 1 FROM users WHERE id = $1
 			)
 		`, mentionedUserID).Scan(&userExists)
 
@@ -386,13 +399,15 @@ var ErrEncryptedMessageEdit = errors.New("e2ee_immutable_content")
 // Only metadata edits (like marking as edited) are allowed
 func ValidateEncryptedMessageEdit(
 	ctx context.Context,
-	db *sql.DB,
+	querier interface {
+		QueryRowContext(ctx context.Context, query string, args ...interface{}) interface{ Scan(...interface{}) error }
+	},
 	messageID string,
 	newContent map[string]any,
 ) error {
 	// Check if message is encrypted
 	var isEncrypted bool
-	err := db.QueryRowContext(ctx, `
+	err := querier.QueryRowContext(ctx, `
 		SELECT is_encrypted FROM messages WHERE id = $1
 	`, messageID).Scan(&isEncrypted)
 
@@ -495,7 +510,10 @@ func HandleDeviceRevocationE2EE(
 // Deletes sessions, trust records, and group keys via CASCADE
 func HandleAccountDeletionE2EE(
 	ctx context.Context,
-	db *sql.DB,
+	db interface {
+		QueryRowContext(ctx context.Context, query string, args ...interface{}) interface{ Scan(...interface{}) error }
+		ExecContext(ctx context.Context, query string, args ...interface{}) (interface{}, error)
+	},
 	deletedUserID string,
 ) error {
 	// Database CASCADE deletes should handle e2ee_sessions and device_key_trust

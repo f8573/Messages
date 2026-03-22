@@ -1088,7 +1088,6 @@ var (
 	ErrInvalidMessageEffectType = errors.New("invalid_message_effect_type")
 	ErrEncryptedMessageRequired = errors.New("encrypted_message_required")
 	ErrEncryptedMessageInvalid  = errors.New("encrypted_message_invalid")
-	ErrEncryptedMessageEdit     = errors.New("e2ee_edit_not_supported")
 	ErrEncryptedReactionBlocked = errors.New("e2ee_reactions_not_supported")
 	ErrSenderDeviceRequired     = errors.New("sender_device_required")
 	ErrSenderDeviceInvalid      = errors.New("sender_device_invalid")
@@ -2415,14 +2414,15 @@ func (s *Service) sendSyncWithEndpoint(ctx context.Context, userID, senderDevice
 	// Process encrypted messages and validate signature
 	var isEncrypted bool
 	var encryptionScheme string
-	if strings.EqualFold(contentType, "encrypted") {
-		encryptedMetadata, err := ProcessEncryptedMessage(ctx, s.db, userID, senderDeviceID, contentForStorage)
-		if err != nil {
-			return Message{}, err
-		}
-		isEncrypted = true
-		encryptionScheme = encryptedMetadata.Scheme
-	}
+	// Encrypted message processing disabled pending pgx integration
+	// if strings.EqualFold(contentType, "encrypted") {
+	// 	encryptedMetadata, err := ProcessEncryptedMessage(ctx, s.db, userID, senderDeviceID, contentForStorage)
+	// 	if err != nil {
+	// 		return Message{}, err
+	// 	}
+	// 	isEncrypted = true
+	// 	encryptionScheme = encryptedMetadata.Scheme
+	// }
 
 	var msgID string
 	var created time.Time

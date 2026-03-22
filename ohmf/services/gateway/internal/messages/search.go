@@ -3,7 +3,6 @@ package messages
 import (
 	"strings"
 	"unicode"
-	"unicode/utf8"
 )
 
 // SearchQuery represents a normalized and parsed search query
@@ -23,15 +22,15 @@ type SearchQuery struct {
 var stopwords = map[string]bool{
 	"a": true, "an": true, "and": true, "are": true, "as": true, "at": true,
 	"be": true, "by": true, "for": true, "from": true, "in": true, "is": true,
-	"it": true, "of": true, "on": true, "or": true, "the": true, "to": true,
+	"of": true, "on": true, "or": true, "the": true, "to": true,
 	"with": true, "i": true, "me": true, "my": true, "we": true, "you": true,
-	"he": true, "she": true, "it": true, "they": true, "this": true, "that": true,
+	"he": true, "she": true, "they": true, "this": true, "that": true,
 	"what": true, "which": true, "who": true, "where": true, "when": true,
 	"why": true, "how": true, "all": true, "each": true, "every": true,
 	"both": true, "few": true, "more": true, "most": true, "some": true,
 	"such": true, "no": true, "nor": true, "not": true, "only": true,
 	"same": true, "so": true, "than": true, "too": true, "very": true,
-	"just": true, "than": true, "but": true, "can": true, "will": true,
+	"just": true, "but": true, "can": true, "will": true,
 	"do": true, "have": true, "has": true, "had": true, "does": true,
 	"did": true, "could": true, "would": true, "should": true, "may": true,
 	"might": true, "must": true, "shall": true, "ought": true,
