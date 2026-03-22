@@ -950,6 +950,25 @@ func (s *Service) AppendEvent(ctx context.Context, sessionID, actorID, eventType
 	if err != nil {
 		return 0, err
 	}
+
+	// P4.3: Publish event to Redis for real-time WebSocket delivery (best-effort, async)
+	// Spawn goroutine to avoid blocking hot path. Errors are silently dropped as this is fanout-only.
+	if s.redis != nil {
+		go func() {
+			eventPayload := map[string]any{
+				"event_seq":  seq,
+				"event_type": eventType,
+				"actor_id":   actorID,
+				"body":       body,
+				"created_at": time.Now().UTC().Format(time.RFC3339),
+			}
+			if eventJSON, err := json.Marshal(eventPayload); err == nil {
+				channel := "miniapp:session:" + sessionID + ":events"
+				_ = s.redis.Publish(context.Background(), channel, string(eventJSON)).Err()
+			}
+		}()
+	}
+
 	_, _ = s.db.Exec(ctx, `UPDATE miniapp_sessions SET expires_at = now() + interval '1 hour' WHERE id = $1::uuid`, sessionID)
 	return seq, nil
 }
