@@ -1,7 +1,6 @@
 package messages
 
 import (
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"testing"
@@ -319,7 +318,6 @@ func BenchmarkEncryptedMessageProcessing(b *testing.B) {
 		},
 	}
 
-	ctx := context.Background()
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
