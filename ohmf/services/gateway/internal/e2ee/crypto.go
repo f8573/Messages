@@ -2,17 +2,23 @@ package e2ee
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/ed25519"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/crypto/curve25519"
+	"golang.org/x/crypto/hkdf"
 )
 
 // SessionManager handles Signal protocol sessions and message encryption/decryption
@@ -472,6 +478,158 @@ func GenerateRecipientWrappedKey(
 
 // UnwrapSessionKey unwraps a recipient's wrapped session key using our private identity key
 // removed: UnwrapSessionKey - dead code stub, never called in production paths
+
+// ==================== PHASE 4 WEEK 1: CRYPTOGRAPHIC PRIMITIVES ====================
+
+// X25519Keypair generates a new ECDH keypair for key agreement
+func X25519Keypair() ([32]byte, [32]byte, error) {
+	var privateKey [32]byte
+	_, err := io.ReadFull(rand.Reader, privateKey[:])
+	if err != nil {
+		return [32]byte{}, [32]byte{}, fmt.Errorf("failed to generate private key: %w", err)
+	}
+	publicKey, err := curve25519.X25519(privateKey[:], curve25519.Basepoint[:])
+	if err != nil {
+		return [32]byte{}, [32]byte{}, fmt.Errorf("failed to compute public key: %w", err)
+	}
+	var pubKeyArray [32]byte
+	copy(pubKeyArray[:], publicKey)
+	return pubKeyArray, privateKey, nil
+}
+
+// X25519SharedSecret performs ECDH key agreement with peer's public key
+func X25519SharedSecret(ourPrivateKey [32]byte, theirPublicKey [32]byte) ([32]byte, error) {
+	if [32]byte{} == theirPublicKey {
+		return [32]byte{}, errors.New("peer public key is zero")
+	}
+	shared, err := curve25519.X25519(ourPrivateKey[:], theirPublicKey[:])
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("ECDH failed: %w", err)
+	}
+	var result [32]byte
+	copy(result[:], shared)
+	return result, nil
+}
+
+// GenerateECDHKeys returns base64-encoded X25519 keypair for JSON serialization
+func GenerateECDHKeys() (string, string, error) {
+	pub, priv, err := X25519Keypair()
+	if err != nil {
+		return "", "", err
+	}
+	return base64.StdEncoding.EncodeToString(pub[:]), base64.StdEncoding.EncodeToString(priv[:]), nil
+}
+
+// HMACSign creates HMAC-SHA256 signature of data with key
+func HMACSign(key, data []byte) [32]byte {
+	h := hmac.New(sha256.New, key)
+	h.Write(data)
+	var sig [32]byte
+	copy(sig[:], h.Sum(nil))
+	return sig
+}
+
+// HMACVerify checks HMAC-SHA256 signature using constant-time comparison
+func HMACVerify(key, data []byte, signature [32]byte) bool {
+	computed := HMACSign(key, data)
+	return hmac.Equal(computed[:], signature[:])
+}
+
+// SignatureHex returns base64-encoded HMAC-SHA256 signature
+func SignatureHex(key, data []byte) string {
+	sig := HMACSign(key, data)
+	return base64.StdEncoding.EncodeToString(sig[:])
+}
+
+// HKDFExpand performs HKDF-Expand with SHA256
+func HKDFExpand(prk, info []byte, length int) ([]byte, error) {
+	if length < 0 || length > 255*32 {
+		return nil, fmt.Errorf("invalid HKDF length: %d (must be 0-%d)", length, 255*32)
+	}
+	r := hkdf.Expand(sha256.New, prk, info)
+	key := make([]byte, length)
+	_, err := io.ReadFull(r, key)
+	if err != nil {
+		return nil, fmt.Errorf("HKDF-Expand failed: %w", err)
+	}
+	return key, nil
+}
+
+// HKDFExtractExpand performs HKDF-Extract + HKDF-Expand (RFC 5869)
+func HKDFExtractExpand(salt, ikm, info []byte, length int) ([]byte, error) {
+	prk := hmac.New(sha256.New, salt)
+	prk.Write(ikm)
+	return HKDFExpand(prk.Sum(nil), info, length)
+}
+
+// ChainKeyDerive derives message key and next chain key from chain key (Double Ratchet KDF)
+func ChainKeyDerive(chainKey []byte) ([32]byte, [32]byte) {
+	msgKey := HMACSign(chainKey, []byte{0x01})
+	nextKey := HMACSign(chainKey, []byte{0x02})
+	return msgKey, nextKey
+}
+
+// AESGCMEncrypt encrypts plaintext with AES-256-GCM
+func AESGCMEncrypt(key [32]byte, plaintext, aad []byte) ([]byte, [12]byte, error) {
+	c, err := aes.NewCipher(key[:])
+	if err != nil {
+		return nil, [12]byte{}, fmt.Errorf("failed to create cipher: %w", err)
+	}
+	g, err := cipher.NewGCM(c)
+	if err != nil {
+		return nil, [12]byte{}, fmt.Errorf("failed to create GCM: %w", err)
+	}
+	var nonce [12]byte
+	if _, err := io.ReadFull(rand.Reader, nonce[:]); err != nil {
+		return nil, [12]byte{}, fmt.Errorf("failed to generate nonce: %w", err)
+	}
+	ciphertext := g.Seal(nil, nonce[:], plaintext, aad)
+	return ciphertext, nonce, nil
+}
+
+// AESGCMDecrypt decrypts ciphertext encrypted with AES-256-GCM
+func AESGCMDecrypt(key [32]byte, ciphertext []byte, nonce [12]byte, aad []byte) ([]byte, error) {
+	c, err := aes.NewCipher(key[:])
+	if err != nil {
+		return nil, fmt.Errorf("failed to create cipher: %w", err)
+	}
+	g, err := cipher.NewGCM(c)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create GCM: %w", err)
+	}
+	plaintext, err := g.Open(nil, nonce[:], ciphertext, aad)
+	if err != nil {
+		return nil, fmt.Errorf("decryption failed: %w", err)
+	}
+	return plaintext, nil
+}
+
+// MessageEncrypt encrypts message using AES-256-GCM with base64 encoding
+func MessageEncrypt(messageKey [32]byte, plaintext []byte) (string, string, error) {
+	ciphertext, nonce, err := AESGCMEncrypt(messageKey, plaintext, nil)
+	if err != nil {
+		return "", "", err
+	}
+	return base64.StdEncoding.EncodeToString(ciphertext), base64.StdEncoding.EncodeToString(nonce[:]), nil
+}
+
+// MessageDecrypt decrypts message encrypted with MessageEncrypt
+func MessageDecrypt(messageKey [32]byte, ciphertextB64, nonceB64 string) ([]byte, error) {
+	ciphertext, err := base64.StdEncoding.DecodeString(ciphertextB64)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode ciphertext: %w", err)
+	}
+	nonceBytes, err := base64.StdEncoding.DecodeString(nonceB64)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode nonce: %w", err)
+	}
+	if len(nonceBytes) != 12 {
+		return nil, fmt.Errorf("invalid nonce size: expected 12, got %d", len(nonceBytes))
+	}
+	var nonce [12]byte
+	copy(nonce[:], nonceBytes)
+	return AESGCMDecrypt(messageKey, ciphertext, nonce, nil)
+}
 
 // Note: Actual Double Ratchet and libsignal integration will be implemented
 // in the following production flow:
