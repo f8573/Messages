@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  postgres-e2ee:
+    image: postgres:15-alpine
+    container_name: e2ee-test-db
+    environment:
+      POSTGRES_USER: e2ee_test
+      POSTGRES_PASSWORD: test_password_e2ee
+      POSTGRES_DB: e2ee_test
+    ports:
+      - "5432:5432"
+    volumes:
+      - e2ee_postgres_data:/var/lib/postgresql/data
+      - ./internal/e2ee/migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U e2ee_test -d e2ee_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - e2ee-test
+
+volumes:
+  e2ee_postgres_data:
+
+networks:
+  e2ee-test:
+    driver: bridge
