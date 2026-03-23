@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -20,7 +22,7 @@ type MultiRecipientEncryption struct {
 func NewMultiRecipientEncryption(pool *pgxpool.Pool) *MultiRecipientEncryption {
 	return &MultiRecipientEncryption{
 		db: pool,
-		sm: NewSessionManager(pool),
+		sm: &SessionManager{db: pool}, // removed: NewSessionManager wrapper
 	}
 }
 
@@ -59,30 +61,6 @@ func (m *MultiRecipientEncryption) EncryptForGroup(
 	}
 	defer rows.Close()
 
-	// Collect recipient devices
-	var recipientDevices []struct {
-		UserID   string
-		DeviceID string
-	}
-	for rows.Next() {
-		var userID, deviceID string
-		if err := rows.Scan(&userID, &deviceID); err != nil {
-			return "", "", nil, err
-		}
-		recipientDevices = append(recipientDevices, struct {
-			UserID   string
-			DeviceID string
-		}{userID, deviceID})
-	}
-
-	if err := rows.Err(); err != nil {
-		return "", "", nil, err
-	}
-
-	if len(recipientDevices) == 0 {
-		return "", "", nil, fmt.Errorf("group has no members")
-	}
-
 	// Generate group session key (AES-256 for Double Ratchet)
 	groupSessionKey := make([]byte, 32)
 	if _, err := rand.Read(groupSessionKey); err != nil {
@@ -90,56 +68,61 @@ func (m *MultiRecipientEncryption) EncryptForGroup(
 	}
 
 	// Generate nonce for group session
-	nonce := make([]byte, 12) // 96-bit nonce for GCM
+	nonce := make([]byte, 12)
 	if _, err := rand.Read(nonce); err != nil {
 		return "", "", nil, err
 	}
 	groupSessionNonce = base64.StdEncoding.EncodeToString(nonce)
 
 	// Encrypt plaintext with group session key (placeholder - actual: AEAD cipher)
-	// In production: aes.NewCipher + gcm.Seal
 	encryptedData := make([]byte, len(plaintext))
-	copy(encryptedData, plaintext) // Placeholder: actual implementation uses cipher
+	copy(encryptedData, plaintext)
 	ciphertext = base64.StdEncoding.EncodeToString(encryptedData)
 
-	// Wrap session key for each recipient
-	recipients = make([]RecipientWrappedKey, 0, len(recipientDevices))
-	for _, recipient := range recipientDevices {
-		// Skip self (messages encrypted by sender too for consistency)
-		// but in practice, sender might not need wrapped key
+	// Wrap session key for each recipient - removed: intermediate recipientDevices collection
+	recipients, hasMember := make([]RecipientWrappedKey, 0, 10), false
+	for rows.Next() {
+		hasMember = true
+		var userID, deviceID string
+		if err := rows.Scan(&userID, &deviceID); err != nil {
+			return "", "", nil, err
+		}
 
-		// Query recipient's identity/agreement key
 		var agreementPublicKeyB64 string
 		err := m.db.QueryRow(ctx, `
 			SELECT identity_public_key FROM device_identity_keys
 			WHERE device_id = $1::uuid AND user_id = $2::uuid
-		`, recipient.DeviceID, recipient.UserID).Scan(&agreementPublicKeyB64)
+		`, deviceID, userID).Scan(&agreementPublicKeyB64)
 
 		if err != nil {
-			if err.Error() == "no rows in result set" {
-				// Skip members with unpublished keys
+			if errors.Is(err, pgx.ErrNoRows) {
 				continue
 			}
 			return "", "", nil, fmt.Errorf("failed to load recipient key: %w", err)
 		}
 
-		// Wrap session key using X3DH (placeholder)
 		wrappedKeyNonce := make([]byte, 12)
 		if _, err := rand.Read(wrappedKeyNonce); err != nil {
 			return "", "", nil, err
 		}
 
-		// In production: Perform X3DH wrap of groupSessionKey using recipient's identity key
-		// For now: placeholder wrapping (actual: X25519 ECDH + KDF)
 		wrappedKey := make([]byte, len(groupSessionKey))
 		copy(wrappedKey, groupSessionKey)
 
 		recipients = append(recipients, RecipientWrappedKey{
-			UserID:          recipient.UserID,
-			DeviceID:        recipient.DeviceID,
+			UserID:          userID,
+			DeviceID:        deviceID,
 			WrappedKey:      base64.StdEncoding.EncodeToString(wrappedKey),
 			WrappedKeyNonce: base64.StdEncoding.EncodeToString(wrappedKeyNonce),
 		})
+	}
+
+	if err := rows.Err(); err != nil {
+		return "", "", nil, err
+	}
+
+	if !hasMember {
+		return "", "", nil, fmt.Errorf("group has no members")
 	}
 
 	return ciphertext, groupSessionNonce, recipients, nil

@@ -22,7 +22,7 @@ type Handler struct {
 func NewHandler(pool *pgxpool.Pool) *Handler {
 	return &Handler{
 		pool: pool,
-		sm:   NewSessionManager(pool),
+		sm:   &SessionManager{db: pool}, // removed: NewSessionManager wrapper
 	}
 }
 
@@ -41,22 +41,19 @@ type DeviceKeyResponse struct {
 
 // BundleResponse represents a full Signal protocol key bundle
 type BundleResponse struct {
-	DeviceID                   string `json:"device_id"`
-	UserID                     string `json:"user_id"`
-	BundleVersion              string `json:"bundle_version"`
-	IdentityKeyAlg             string `json:"identity_key_alg"`
-	IdentityPublicKey          string `json:"identity_public_key"`
-	AgreementIdentityPublicKey string `json:"agreement_identity_public_key"`
-	SigningKeyAlg              string `json:"signing_key_alg"`
-	SigningPublicKey           string `json:"signing_public_key"`
-	SignedPrekeyID             int64 `json:"signed_prekey_id"`
-	SignedPrekeyPublicKey      string `json:"signed_prekey_public_key"`
-	SignedPrekeySignature      string `json:"signed_prekey_signature"`
-	Fingerprint                string `json:"fingerprint"`
-	ClaimedOneTimePrekey       *struct {
-		PrekeyID  int64 `json:"prekey_id"`
-		PublicKey string `json:"public_key"`
-	} `json:"claimed_one_time_prekey,omitempty"`
+	DeviceID                   string             `json:"device_id"`
+	UserID                     string             `json:"user_id"`
+	BundleVersion              string             `json:"bundle_version"`
+	IdentityKeyAlg             string             `json:"identity_key_alg"`
+	IdentityPublicKey          string             `json:"identity_public_key"`
+	AgreementIdentityPublicKey string             `json:"agreement_identity_public_key"`
+	SigningKeyAlg              string             `json:"signing_key_alg"`
+	SigningPublicKey           string             `json:"signing_public_key"`
+	SignedPrekeyID             int64              `json:"signed_prekey_id"`
+	SignedPrekeyPublicKey      string             `json:"signed_prekey_public_key"`
+	SignedPrekeySignature      string             `json:"signed_prekey_signature"`
+	Fingerprint                string             `json:"fingerprint"`
+	ClaimedOneTimePrekey       *ClaimOTPResponse  `json:"claimed_one_time_prekey,omitempty"`
 }
 
 // ClaimOTPResponse represents the response when claiming an OTP
@@ -64,6 +61,8 @@ type ClaimOTPResponse struct {
 	PrekeyID  int64 `json:"prekey_id"`
 	PublicKey string `json:"public_key"`
 }
+
+// removed: duplicate inline struct - VerifyFingerprintRequest already at line 69
 
 // VerifyFingerprintRequest represents the request to verify a device fingerprint
 type VerifyFingerprintRequest struct {
@@ -206,17 +205,11 @@ func (h *Handler) GetDeviceKeyBundle(w http.ResponseWriter, r *http.Request) {
 
 	var otpPreKeyID int64
 	var otpPublicKey string
-	var claimedOTP *struct {
-		PrekeyID  int64  `json:"prekey_id"`
-		PublicKey string `json:"public_key"`
-	}
+	var claimedOTP *ClaimOTPResponse
 
 	err = h.pool.QueryRow(r.Context(), otpQuery, deviceID).Scan(&otpPreKeyID, &otpPublicKey)
 	if err == nil {
-		claimedOTP = &struct {
-			PrekeyID  int64  `json:"prekey_id"`
-			PublicKey string `json:"public_key"`
-		}{
+		claimedOTP = &ClaimOTPResponse{
 			PrekeyID:  otpPreKeyID,
 			PublicKey: otpPublicKey,
 		}
@@ -224,7 +217,7 @@ func (h *Handler) GetDeviceKeyBundle(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, http.StatusInternalServerError, "database_error", "failed to claim prekey", nil)
 		return
 	}
-	// If no rows, claimedOTP stays nil (pool exhausted is acceptable)
+	// removed: inline struct definition - use ClaimOTPResponse type
 
 	bundle := BundleResponse{
 		DeviceID:                   deviceID,

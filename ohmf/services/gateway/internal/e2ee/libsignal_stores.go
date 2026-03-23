@@ -34,10 +34,7 @@ type PostgresSessionStore struct {
 	db *pgxpool.Pool
 }
 
-// NewPostgresSessionStore creates a new session store backed by PostgreSQL
-func NewPostgresSessionStore(db *pgxpool.Pool) *PostgresSessionStore {
-	return &PostgresSessionStore{db: db}
-}
+// removed: NewPostgresSessionStore - trivial wrapper, inlined at 8 call sites
 
 // LoadSession retrieves a session for the given address
 // Implements: signal.SessionStore.LoadSession(ctx, address) (*signal.SessionRecord, error)
@@ -151,10 +148,7 @@ type PostgresIdentityKeyStore struct {
 	db *pgxpool.Pool
 }
 
-// NewPostgresIdentityKeyStore creates a new identity key store
-func NewPostgresIdentityKeyStore(db *pgxpool.Pool) *PostgresIdentityKeyStore {
-	return &PostgresIdentityKeyStore{db: db}
-}
+// removed: NewPostgresIdentityKeyStore - trivial wrapper, inlined at 3 call sites
 
 // GetIdentityKeyPair retrieves our own identity keypair
 // Implements: signal.IdentityKeyStore.GetIdentityKeyPair(ctx) (*signal.IdentityKeyPair, error)
@@ -238,8 +232,8 @@ func (s *PostgresIdentityKeyStore) IsTrustedIdentity(ctx context.Context, name s
 // Query: INSERT INTO device_key_trust (...) VALUES (...)
 //        ON CONFLICT DO NOTHING / UPDATE
 func (s *PostgresIdentityKeyStore) SaveIdentity(ctx context.Context, name string, deviceID uint32, identityKey []byte) (bool, error) {
-	// Compute fingerprint: SHA256 of identity key
-	fingerprint := computeFingerprintFromKey(identityKey)
+	hash := sha256.Sum256(identityKey)
+	fingerprint := fmt.Sprintf("%x", hash)
 
 	query := `
 		INSERT INTO device_key_trust (user_id, contact_user_id, contact_device_id, trust_state, fingerprint, trust_established_at)
@@ -268,10 +262,7 @@ type PostgresPreKeyStore struct {
 	db *pgxpool.Pool
 }
 
-// NewPostgresPreKeyStore creates a new prekey store
-func NewPostgresPreKeyStore(db *pgxpool.Pool) *PostgresPreKeyStore {
-	return &PostgresPreKeyStore{db: db}
-}
+// removed: NewPostgresPreKeyStore - trivial wrapper, inlined at 1 call site
 
 // LoadPreKey retrieves a prekey by ID
 // Implements: signal.PreKeyStore.LoadPreKey(ctx, preKeyID) (*signal.PreKeyRecord, error)
@@ -349,10 +340,7 @@ type PostgresSignedPreKeyStore struct {
 	db *pgxpool.Pool
 }
 
-// NewPostgresSignedPreKeyStore creates a new signed prekey store
-func NewPostgresSignedPreKeyStore(db *pgxpool.Pool) *PostgresSignedPreKeyStore {
-	return &PostgresSignedPreKeyStore{db: db}
-}
+// removed: NewPostgresSignedPreKeyStore - trivial wrapper, inlined at 1 call site
 
 // LoadSignedPreKey retrieves the current signed prekey
 // Implements: signal.SignedPreKeyStore.LoadSignedPreKey(ctx, signedPreKeyID) (*signal.SignedPreKeyRecord, error)
@@ -422,11 +410,7 @@ func (s *PostgresSignedPreKeyStore) ContainsSignedPreKey(ctx context.Context, si
 
 // =================== Helper Functions ===================
 
-// computeFingerprintFromKey generates SHA256 fingerprint of a key
-func computeFingerprintFromKey(keyBytes []byte) string {
-	hash := sha256.Sum256(keyBytes)
-	return fmt.Sprintf("%x", hash)
-}
+// removed: computeFingerprintFromKey - inlined into SaveIdentity (single call site)
 
 // =================== SessionManager Integration ===================
 //

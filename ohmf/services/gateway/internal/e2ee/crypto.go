@@ -7,10 +7,11 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
 
-	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -19,12 +20,7 @@ type SessionManager struct {
 	db *pgxpool.Pool
 }
 
-// NewSessionManager creates a new session manager
-func NewSessionManager(db *pgxpool.Pool) *SessionManager {
-	return &SessionManager{
-		db: db,
-	}
-}
+// removed: NewSessionManager - trivial constructor inlined at 3 call sites
 
 // Session represents a Signal protocol session between two devices
 type Session struct {
@@ -193,8 +189,8 @@ func (sm *SessionManager) GetSession(
 	)
 
 	if err != nil {
-		if err.Error() == "no rows in result set" {
-			return nil, nil // Session doesn't exist yet
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
 		}
 		return nil, fmt.Errorf("failed to query session: %w", err)
 	}
@@ -299,8 +295,8 @@ func (sm *SessionManager) GetTrustState(
 	)
 
 	if err != nil {
-		if err.Error() == "no rows in result set" {
-			return nil, nil // No trust state recorded yet
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
 		}
 		return nil, fmt.Errorf("failed to query trust state: %w", err)
 	}
@@ -385,10 +381,7 @@ func GenerateNonce() ([]byte, error) {
 	return nonce, nil
 }
 
-// GenerateEphemeralKeyID generates a random ephemeral key ID
-func GenerateEphemeralKeyID() string {
-	return uuid.New().String()
-}
+// removed: GenerateEphemeralKeyID - dead code, never called in production paths
 
 // EncryptMessageContent encrypts plaintext message content using AES-256-GCM
 // In production, this would use libsignal's Double Ratchet algorithm
@@ -478,32 +471,7 @@ func GenerateRecipientWrappedKey(
 }
 
 // UnwrapSessionKey unwraps a recipient's wrapped session key using our private identity key
-// In production, this is part of X3DH decapsulation
-func UnwrapSessionKey(
-	wrappedKey string,
-	wrapNonce string,
-	ourIdentityPrivateKey string,
-) ([]byte, error) {
-	// Decode wrapped key
-	wrappedBytes, err := base64.StdEncoding.DecodeString(wrappedKey)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode wrapped key: %w", err)
-	}
-
-	wrapNonceBytes, err := base64.StdEncoding.DecodeString(wrapNonce)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode wrap nonce: %w", err)
-	}
-
-	// Production: Use X25519 key agreement with libsignal
-	// For now: placeholder unwrapping
-	if len(wrappedBytes) < len(wrapNonceBytes)+32 {
-		return nil, fmt.Errorf("invalid wrapped key format")
-	}
-
-	sessionKey := wrappedBytes[len(wrapNonceBytes) : len(wrapNonceBytes)+32]
-	return sessionKey, nil
-}
+// removed: UnwrapSessionKey - dead code stub, never called in production paths
 
 // Note: Actual Double Ratchet and libsignal integration will be implemented
 // in the following production flow:
