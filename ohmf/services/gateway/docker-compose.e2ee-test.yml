@@ -1,29 +1,55 @@
 version: '3.8'
 
+# E2EE Testing Database Configuration
+# Automatically initializes PostgreSQL with E2EE schema on first startup
+#
+# First run: docker-compose -f docker-compose.e2ee-test.yml up -d
+# Verify: docker-compose -f docker-compose.e2ee-test.yml ps
+# Stop: docker-compose -f docker-compose.e2ee-test.yml down
+
 services:
   postgres-e2ee:
     image: postgres:15-alpine
     container_name: e2ee-test-db
     environment:
       POSTGRES_USER: e2ee_test
-      POSTGRES_PASSWORD: test_password_e2ee
+      POSTGRES_PASSWORD: test_password_e2ee  # Use strong password in production
       POSTGRES_DB: e2ee_test
+      # Reduce initialization logs
+      POSTGRES_INITDB_ARGS: "--locale=C"
     ports:
-      - "5432:5432"
+      - "5432:5432"  # Must be available (Docker host:container)
     volumes:
+      # Persistent data volume (survives container restarts)
       - e2ee_postgres_data:/var/lib/postgresql/data
-      - ./internal/e2ee/migrations:/docker-entrypoint-initdb.d
+      # SQL migrations auto-executed on first startup
+      # PostgreSQL runs *.sql files in /docker-entrypoint-initdb.d in alphabetical order
+      - ./internal/e2ee/migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
+      # Verifies PostgreSQL is ready and accessible
       test: ["CMD-SHELL", "pg_isready -U e2ee_test -d e2ee_test"]
+      # Check every 5 seconds
       interval: 5s
+      # Wait max 5 seconds for response
       timeout: 5s
+      # Retry up to 5 times before marking unhealthy
       retries: 5
+      # Additional 30 second startup grace period
+      start_period: 30s
     networks:
       - e2ee-test
+    labels:
+      description: "E2EE Testing Database - PostgreSQL 15"
+      purpose: "Integration testing for cryptographic E2EE implementation"
 
 volumes:
   e2ee_postgres_data:
+    driver: local
 
 networks:
   e2ee-test:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.25.0.0/16
+
