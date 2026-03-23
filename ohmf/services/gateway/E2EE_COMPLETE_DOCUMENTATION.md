@@ -436,6 +436,10 @@ docker-compose -f docker-compose.e2ee-test.yml down
 
 ### Database Schema
 
+**Automatic initialization**: The schema below is **automatically created** by PostgreSQL on first startup via `internal/e2ee/migrations/001_e2ee_schema.sql`.
+
+**No manual setup required** - Docker Compose handles initialization automatically.
+
 ```sql
 CREATE TABLE device_identity_keys (
   device_id UUID PRIMARY KEY,
@@ -476,6 +480,24 @@ CREATE TABLE sessions (
   PRIMARY KEY (user_id, contact_user_id, contact_device_id)
 );
 ```
+
+**Auto-initialization process**:
+1. `docker-compose up -d` starts PostgreSQL 15
+2. If data volume is empty, initialization runs
+3. `001_e2ee_schema.sql` creates all tables
+4. Indexes created for efficient queries
+5. Permissions set for test user
+6. Database ready for integration tests
+
+**Subsequent startups**: Schema persists in named volume - migrations don't re-run.
+
+**Full reset** (if needed):
+```bash
+docker-compose -f docker-compose.e2ee-test.yml down -v  # Delete volume
+docker-compose -f docker-compose.e2ee-test.yml up -d    # Re-initialize
+```
+
+For troubleshooting, see `internal/e2ee/migrations/README.md`
 
 ### Running Unit Tests
 
