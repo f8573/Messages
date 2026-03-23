@@ -127,7 +127,7 @@ func TestPostgresSessionStore_StoreAndLoadSession(t *testing.T) {
 	fixtures := SetupFixtures(t, db)
 	defer fixtures.Cleanup(t)
 
-	store := NewPostgresSessionStore(db)
+	store := &PostgresSessionStore{db: db}
 	ctx := fixtures.TestCtx
 
 	// Test data: mock session record (in production, this comes from libsignal)
@@ -199,7 +199,7 @@ func TestPostgresSessionStore_DeleteAllSessions(t *testing.T) {
 	fixtures := SetupFixtures(t, db)
 	defer fixtures.Cleanup(t)
 
-	store := NewPostgresSessionStore(db)
+	store := &PostgresSessionStore{db: db}
 	ctx := fixtures.TestCtx
 
 	// Store multiple sessions with different contact devices
@@ -257,7 +257,7 @@ func TestPostgresIdentityKeyStore_TrustModel(t *testing.T) {
 	fixtures := SetupFixtures(t, db)
 	defer fixtures.Cleanup(t)
 
-	store := NewPostgresIdentityKeyStore(db)
+	store := &PostgresIdentityKeyStore{db: db}
 	ctx := fixtures.TestCtx
 
 	contactName := fixtures.ContactUserID
@@ -322,8 +322,8 @@ func TestE2EESessionFlow(t *testing.T) {
 	ctx := fixtures.TestCtx
 
 	// Test scenario: Two devices establishing E2EE session
-	sessionStore := NewPostgresSessionStore(db)
-	identityStore := NewPostgresIdentityKeyStore(db)
+	sessionStore := &PostgresSessionStore{db: db}
+	identityStore := &PostgresIdentityKeyStore{db: db}
 
 	// Step 1: Device A saves Device B's identity (TOFU)
 	deviceBIdentityKey := []byte("device_b_identity")
@@ -371,7 +371,7 @@ func BenchmarkSessionStoreLoad(b *testing.B) {
 	db := SetupTestDB(&testing.T{})
 	defer db.Close()
 
-	store := NewPostgresSessionStore(db)
+	store := &PostgresSessionStore{db: db}
 	ctx := context.Background()
 
 	// Setup test data
@@ -389,7 +389,7 @@ func BenchmarkIdentityTrustCheck(b *testing.B) {
 	db := SetupTestDB(&testing.T{})
 	defer db.Close()
 
-	store := NewPostgresIdentityKeyStore(db)
+	store := &PostgresIdentityKeyStore{db: db}
 	ctx := context.Background()
 
 	b.ResetTimer()

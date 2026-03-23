@@ -20,7 +20,7 @@ type SessionStoreWithUser struct {
 // NewSessionStoreWithUser creates a store bound to a specific user
 func NewSessionStoreWithUser(db *pgxpool.Pool, userID string, deviceID int64) *SessionStoreWithUser {
 	return &SessionStoreWithUser{
-		store:    NewPostgresSessionStore(db),
+		store:    &PostgresSessionStore{db: db},
 		userID:   userID,
 		deviceID: deviceID,
 	}
@@ -124,7 +124,7 @@ type IdentityStoreWithUser struct {
 // NewIdentityStoreWithUser creates an identity store bound to a specific user
 func NewIdentityStoreWithUser(db *pgxpool.Pool, userID string) *IdentityStoreWithUser {
 	return &IdentityStoreWithUser{
-		store:  NewPostgresIdentityKeyStore(db),
+		store:  &PostgresIdentityKeyStore{db: db},
 		userID: userID,
 	}
 }
@@ -188,7 +188,7 @@ type PreKeyStoreWithUser struct {
 // NewPreKeyStoreWithUser creates a prekey store for a user
 func NewPreKeyStoreWithUser(db *pgxpool.Pool, userID string) *PreKeyStoreWithUser {
 	return &PreKeyStoreWithUser{
-		store:  NewPostgresPreKeyStore(db),
+		store:  &PostgresPreKeyStore{db: db},
 		userID: userID,
 	}
 }
@@ -264,7 +264,7 @@ type SignedPreKeyStoreWithUser struct {
 // NewSignedPreKeyStoreWithUser creates a signed prekey store for a user
 func NewSignedPreKeyStoreWithUser(db *pgxpool.Pool, userID string) *SignedPreKeyStoreWithUser {
 	return &SignedPreKeyStoreWithUser{
-		store:  NewPostgresSignedPreKeyStore(db),
+		store:  &PostgresSignedPreKeyStore{db: db},
 		userID: userID,
 	}
 }

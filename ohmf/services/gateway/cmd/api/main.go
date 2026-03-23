@@ -181,7 +181,6 @@ func main() {
 
 	usersSvc := users.NewService(pool, replicationStore)
 
-	// Create MLS session store for group E2EE
 	mlsStore := e2ee.NewMLSSessionStore(pool)
 	convSvc := conversations.NewService(pool, replicationStore, mlsStore)
 	// removed: derive subscription key from config for AES-GCM encryption
@@ -234,7 +233,7 @@ func main() {
 	miniappHandler := miniapp.NewHandler(miniappSvc, miniapp.NewRegistryClient(cfg.AppsAddr))
 	abuseHandler := &abuse.Handler{Svc: abuseSvc}
 	deviceKeysHandler := &devicekeys.Handler{DB: deviceKeysSvc.DB()}
-	e2eeHandler := e2ee.NewHandler(pool)
+	e2eeHandler := e2ee.NewHandler(pool) // removed: inlining prevented by private fields in other packages
 	msgHandler := messages.NewHandler(msgSvc)
 	syncSvc := sync.NewService(pool, replicationStore)
 	syncHandler := &sync.Handler{Svc: syncSvc}
