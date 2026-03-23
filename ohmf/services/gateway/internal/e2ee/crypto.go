@@ -907,16 +907,182 @@ func DecryptMessageContentLegacy(ctx context.Context, ciphertext string, nonce s
 	return AESGCMDecrypt(keyArray, ct, nonceArray, nil)
 }
 
-// Note: Actual Double Ratchet and libsignal integration will be implemented
-// in the following production flow:
-// 1. X3DH (Elliptic Curve Diffie-Hellman) for initial key agreement
-//    - Uses: Sender identity key + Sender signed prekey + Recipient identity key +
-//            Recipient signed prekey + Recipient one-time prekey
-//    - Produces: Initial shared secret
-// 2. KDF (Key Derivation Function) to derive root key and chain key from shared secret
-// 3. Double Ratchet algorithm for forward secrecy:
-//    - Root key evolution with each message
-//    - Chain key ratcheting for ordering
+// ===================== X3DH KEY EXCHANGE PROTOCOL =====================
+
+// X3DHKeys represents the key material exchanged in X3DH protocol
+type X3DHKeys struct {
+	SenderIdentityPrivate   [32]byte
+	SenderIdentityPublic    [32]byte
+	SenderEphemeralPrivate  [32]byte
+	SenderEphemeralPublic   [32]byte
+	RecipientIdentityPublic [32]byte
+	RecipientSignedPrekey   [32]byte
+	RecipientOneTimePrekey  [32]byte // Can be empty for optional use
+}
+
+// PerformX3DH performs X3DH key agreement using 3 or 4 ECDH computations
+// Returns shared secret for use with Double Ratchet initialization
+// Protocol overview:
+// - DH1 = ECDH(sender_identity_private, recipient_identity_public)
+// - DH2 = ECDH(sender_ephemeral_private, recipient_signed_prekey)
+// - DH3 = ECDH(sender_ephemeral_private, recipient_identity_public)
+// - (optional) DH4 = ECDH(sender_ephemeral_private, recipient_one_time_prekey)
+// - shared_secret = KDF(DH1 || DH2 || DH3 [|| DH4])
+func PerformX3DH(keys *X3DHKeys) ([32]byte, error) {
+	if keys == nil {
+		return [32]byte{}, errors.New("keys is nil")
+	}
+
+	// Verify all required keys are non-zero
+	if keys.SenderIdentityPrivate == [32]byte{} {
+		return [32]byte{}, errors.New("sender identity private key is empty")
+	}
+	if keys.SenderEphemeralPrivate == [32]byte{} {
+		return [32]byte{}, errors.New("sender ephemeral private key is empty")
+	}
+	if keys.RecipientIdentityPublic == [32]byte{} {
+		return [32]byte{}, errors.New("recipient identity public key is empty")
+	}
+	if keys.RecipientSignedPrekey == [32]byte{} {
+		return [32]byte{}, errors.New("recipient signed prekey is empty")
+	}
+
+	// Compute DH1: sender_identity_private * recipient_identity_public
+	dh1, err := X25519SharedSecret(keys.SenderIdentityPrivate, keys.RecipientIdentityPublic)
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("DH1 failed: %w", err)
+	}
+
+	// Compute DH2: sender_ephemeral_private * recipient_signed_prekey
+	dh2, err := X25519SharedSecret(keys.SenderEphemeralPrivate, keys.RecipientSignedPrekey)
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("DH2 failed: %w", err)
+	}
+
+	// Compute DH3: sender_ephemeral_private * recipient_identity_public
+	dh3, err := X25519SharedSecret(keys.SenderEphemeralPrivate, keys.RecipientIdentityPublic)
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("DH3 failed: %w", err)
+	}
+
+	// Build combined material: DH1 || DH2 || DH3 [|| DH4]
+	combinedMaterial := make([]byte, 96) // 3 * 32 bytes
+	copy(combinedMaterial[0:32], dh1[:])
+	copy(combinedMaterial[32:64], dh2[:])
+	copy(combinedMaterial[64:96], dh3[:])
+
+	// Optional DH4 (one-time prekey usage)
+	if keys.RecipientOneTimePrekey != [32]byte{} {
+		dh4, err := X25519SharedSecret(keys.SenderEphemeralPrivate, keys.RecipientOneTimePrekey)
+		if err == nil {
+			combinedMaterial = append(combinedMaterial, dh4[:]...)
+		}
+		// If DH4 fails, continue without it (one-time prekeys are optional)
+	}
+
+	// Derive shared secret using HKDF
+	sharedSecret, err := HKDFExtractExpand(
+		[]byte("X3DH"),                  // salt
+		combinedMaterial,                // IKM
+		[]byte("Signal X3DH context"),   // info
+		32,                              // output length
+	)
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("KDF failed: %w", err)
+	}
+
+	var result [32]byte
+	copy(result[:], sharedSecret)
+	return result, nil
+}
+
+// PerformX3DHInitiator is a convenience wrapper for the initiating party
+// Generates ephemeral keypair and performs X3DH
+func PerformX3DHInitiator(
+	senderIdentityPrivate [32]byte,
+	senderIdentityPublic [32]byte,
+	recipientIdentityPublic [32]byte,
+	recipientSignedPrekey [32]byte,
+	recipientOneTimePrekey [32]byte, // Can be empty
+) ([32]byte, [32]byte, [32]byte, error) {
+	// Generate ephemeral keypair
+	ephPub, ephPriv, err := X25519Keypair()
+	if err != nil {
+		return [32]byte{}, [32]byte{}, [32]byte{}, fmt.Errorf("failed to generate ephemeral key: %w", err)
+	}
+
+	// Perform X3DH
+	sharedSecret, err := PerformX3DH(&X3DHKeys{
+		SenderIdentityPrivate:   senderIdentityPrivate,
+		SenderIdentityPublic:    senderIdentityPublic,
+		SenderEphemeralPrivate:  ephPriv,
+		SenderEphemeralPublic:   ephPub,
+		RecipientIdentityPublic: recipientIdentityPublic,
+		RecipientSignedPrekey:   recipientSignedPrekey,
+		RecipientOneTimePrekey:  recipientOneTimePrekey,
+	})
+
+	return sharedSecret, ephPub, ephPriv, err
+}
+
+// PerformX3DHResponder is a convenience wrapper for the receiving party
+// Performs X3DH using the sender's ephemeral key from the message
+func PerformX3DHResponder(
+	senderEphemeralPublic [32]byte,
+	recipientIdentityPrivate [32]byte,
+	recipientIdentityPublic [32]byte,
+	recipientSignedPrekeyPrivate [32]byte,
+	recipientSignedPrekeyPublic [32]byte,
+	recipientOneTimePrekeyPrivate [32]byte, // Can be empty
+	senderIdentityPublic [32]byte,
+) ([32]byte, error) {
+	// Compute DH1: recipient_identity_private * sender_identity_public
+	dh1, err := X25519SharedSecret(recipientIdentityPrivate, senderIdentityPublic)
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("DH1 failed: %w", err)
+	}
+
+	// Compute DH2: recipient_signed_prekey_private * sender_ephemeral_public
+	dh2, err := X25519SharedSecret(recipientSignedPrekeyPrivate, senderEphemeralPublic)
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("DH2 failed: %w", err)
+	}
+
+	// Compute DH3: recipient_identity_private * sender_ephemeral_public
+	dh3, err := X25519SharedSecret(recipientIdentityPrivate, senderEphemeralPublic)
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("DH3 failed: %w", err)
+	}
+
+	// Build combined material
+	combinedMaterial := make([]byte, 96)
+	copy(combinedMaterial[0:32], dh1[:])
+	copy(combinedMaterial[32:64], dh2[:])
+	copy(combinedMaterial[64:96], dh3[:])
+
+	// Optional DH4
+	if recipientOneTimePrekeyPrivate != [32]byte{} {
+		dh4, err := X25519SharedSecret(recipientOneTimePrekeyPrivate, senderEphemeralPublic)
+		if err == nil {
+			combinedMaterial = append(combinedMaterial, dh4[:]...)
+		}
+	}
+
+	// Derive shared secret
+	sharedSecret, err := HKDFExtractExpand(
+		[]byte("X3DH"),
+		combinedMaterial,
+		[]byte("Signal X3DH context"),
+		32,
+	)
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("KDF failed: %w", err)
+	}
+
+	var result [32]byte
+	copy(result[:], sharedSecret)
+	return result, nil
+}
 //    - Message keys derived from chain keys
 // This implementation uses: github.com/signal-golang/libsignal-go (when integrated)
 // For now, we have placeholder AES-GCM operations showing the structure.
