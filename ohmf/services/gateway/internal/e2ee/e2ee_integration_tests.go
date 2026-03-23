@@ -32,7 +32,7 @@ func TestE2EEEncryptionFlow(t *testing.T) {
 	plaintext := []byte("Hello, this is an encrypted message!")
 
 	// Step 4: Encrypt message (use placeholder since libsignal not yet integrated)
-	ciphertext, nonce, err := EncryptMessageContent(plaintext, sessionKey)
+	ciphertext, nonce, err := EncryptMessageContentLegacy(plaintext, sessionKey)
 	if err != nil {
 		t.Fatalf("Encryption failed: %v", err)
 	}
@@ -48,7 +48,7 @@ func TestE2EEEncryptionFlow(t *testing.T) {
 	// (server stores ciphertext, sends to recipient)
 
 	// Step 6: Recipient decrypts
-	decrypted, err := DecryptMessageContent(ctx, ciphertext, nonce, sessionKey)
+	decrypted, err := DecryptMessageContentLegacy(ctx, ciphertext, nonce, sessionKey)
 	if err != nil {
 		t.Fatalf("Decryption failed: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestMediaEncryption(t *testing.T) {
 	}
 
 	// Step 3: Encrypt media
-	encryptedMedia, mediaNonce, err := EncryptMessageContent(mediaBlob, mediaKey)
+	encryptedMedia, mediaNonce, err := EncryptMessageContentLegacy(mediaBlob, mediaKey)
 	if err != nil {
 		t.Fatalf("Media encryption failed: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestMediaEncryption(t *testing.T) {
 	// Create message that embeds media key
 	messageContent := []byte("{\"text\":\"Check this image!\",\"media_key\":\"" + encryptedMedia + "\"}")
 
-	encryptedMessage, msgNonce, err := EncryptMessageContent(messageContent, messageSessionKey)
+	encryptedMessage, msgNonce, err := EncryptMessageContentLegacy(messageContent, messageSessionKey)
 	if err != nil {
 		t.Fatalf("Message encryption failed: %v", err)
 	}
@@ -102,7 +102,7 @@ func TestMediaEncryption(t *testing.T) {
 	t.Logf("✓ Media encrypted separately")
 
 	// Step 5: Recipient decrypts message
-	decryptedMessage, err := DecryptMessageContent(ctx, encryptedMessage, msgNonce, messageSessionKey)
+	decryptedMessage, err := DecryptMessageContentLegacy(ctx, encryptedMessage, msgNonce, messageSessionKey)
 	if err != nil {
 		t.Fatalf("Message decryption failed: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestMediaEncryption(t *testing.T) {
 	_ = decryptedMessage // Contains wrapped media key
 
 	// Decrypt media
-	decryptedMedia, err := DecryptMessageContent(ctx, encryptedMedia, mediaNonce, mediaKey)
+	decryptedMedia, err := DecryptMessageContentLegacy(ctx, encryptedMedia, mediaNonce, mediaKey)
 	if err != nil {
 		t.Fatalf("Media decryption failed: %v", err)
 	}
@@ -205,7 +205,7 @@ func TestRecipientKeyWrapping(t *testing.T) {
 	recipientPublicKeyString := "mock_x25519_public_key_recipient"
 
 	// Wrap session key for recipient
-	wrappedKey, wrapNonce, err := GenerateRecipientWrappedKey(recipientPublicKeyString, sessionKey)
+	wrappedKey, wrapNonce, err := GenerateRecipientWrappedKeyLegacy(recipientPublicKeyString, sessionKey)
 	if err != nil {
 		t.Fatalf("Key wrapping failed: %v", err)
 	}
@@ -351,7 +351,7 @@ func TestEncryptionPerformance(t *testing.T) {
 	// Measure encryption time
 	start := time.Now()
 	for i := 0; i < 100; i++ {
-		EncryptMessageContent(plaintext, sessionKey)
+		EncryptMessageContentLegacy(plaintext, sessionKey)
 	}
 	encryptDuration := time.Since(start)
 
@@ -366,11 +366,11 @@ func TestEncryptionPerformance(t *testing.T) {
 	}
 
 	// Measure decryption time
-	ciphertext, nonce, _ := EncryptMessageContent(plaintext, sessionKey)
+	ciphertext, nonce, _ := EncryptMessageContentLegacy(plaintext, sessionKey)
 
 	start = time.Now()
 	for i := 0; i < 100; i++ {
-		DecryptMessageContent(ctx, ciphertext, nonce, sessionKey)
+		DecryptMessageContentLegacy(ctx, ciphertext, nonce, sessionKey)
 	}
 	decryptDuration := time.Since(start)
 
@@ -392,7 +392,7 @@ func BenchmarkEncryption(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		EncryptMessageContent(plaintext, sessionKey)
+		EncryptMessageContentLegacy(plaintext, sessionKey)
 	}
 }
 
@@ -401,11 +401,11 @@ func BenchmarkDecryption(b *testing.B) {
 	sessionKey := make([]byte, 32)
 	plaintext := make([]byte, 4096)
 
-	ciphertext, nonce, _ := EncryptMessageContent(plaintext, sessionKey)
+	ciphertext, nonce, _ := EncryptMessageContentLegacy(plaintext, sessionKey)
 
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		DecryptMessageContent(ctx, ciphertext, nonce, sessionKey)
+		DecryptMessageContentLegacy(ctx, ciphertext, nonce, sessionKey)
 	}
 }
