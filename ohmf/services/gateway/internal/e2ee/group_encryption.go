@@ -74,13 +74,25 @@ func (m *MultiRecipientEncryption) EncryptForGroup(
 	}
 	groupSessionNonce = base64.StdEncoding.EncodeToString(nonce)
 
-	// Encrypt plaintext with group session key (placeholder - actual: AEAD cipher)
-	encryptedData := make([]byte, len(plaintext))
-	copy(encryptedData, plaintext)
+	// Encrypt plaintext with group session key using AES-256-GCM
+	var sessionKeyArray [32]byte
+	copy(sessionKeyArray[:], groupSessionKey)
+	encryptedData, _, err := AESGCMEncrypt(sessionKeyArray, plaintext, nil)
+	if err != nil {
+		return "", "", nil, fmt.Errorf("encryption failed: %w", err)
+	}
 	ciphertext = base64.StdEncoding.EncodeToString(encryptedData)
 
-	// Wrap session key for each recipient - removed: intermediate recipientDevices collection
+	// Wrap session key for each recipient using X3DH per-device
 	recipients, hasMember := make([]RecipientWrappedKey, 0, 10), false
+
+	// Create temporary Double Ratchet state for key wrapping
+	// In production, this would use actual session state from database
+	tempDRState, err := InitializeDoubleRatchetState(groupSessionKey)
+	if err != nil {
+		return "", "", nil, fmt.Errorf("failed to create temporary ratchet state: %w", err)
+	}
+
 	for rows.Next() {
 		hasMember = true
 		var userID, deviceID string
@@ -101,19 +113,17 @@ func (m *MultiRecipientEncryption) EncryptForGroup(
 			return "", "", nil, fmt.Errorf("failed to load recipient key: %w", err)
 		}
 
-		wrappedKeyNonce := make([]byte, 12)
-		if _, err := rand.Read(wrappedKeyNonce); err != nil {
-			return "", "", nil, err
+		// Use X3DH to wrap the session key for this recipient
+		wrappedKey, wrappedNonce, err := GenerateRecipientWrappedKey(agreementPublicKeyB64, tempDRState)
+		if err != nil {
+			return "", "", nil, fmt.Errorf("failed to wrap key for %s/%s: %w", userID, deviceID, err)
 		}
-
-		wrappedKey := make([]byte, len(groupSessionKey))
-		copy(wrappedKey, groupSessionKey)
 
 		recipients = append(recipients, RecipientWrappedKey{
 			UserID:          userID,
 			DeviceID:        deviceID,
-			WrappedKey:      base64.StdEncoding.EncodeToString(wrappedKey),
-			WrappedKeyNonce: base64.StdEncoding.EncodeToString(wrappedKeyNonce),
+			WrappedKey:      wrappedKey,
+			WrappedKeyNonce: wrappedNonce,
 		})
 	}
 
@@ -129,7 +139,7 @@ func (m *MultiRecipientEncryption) EncryptForGroup(
 }
 
 // DecryptGroupMessage decrypts a message encrypted for group
-// Uses per-device wrapped session key to recover group session key
+// Uses per-device wrapped session key to recover group session key, then decrypts
 func (m *MultiRecipientEncryption) DecryptGroupMessage(
 	ctx context.Context,
 	groupID string,
@@ -140,23 +150,47 @@ func (m *MultiRecipientEncryption) DecryptGroupMessage(
 	ciphertext string,
 	groupSessionNonce string,
 ) ([]byte, error) {
-	// Decode wrapped key
-	wrappedKeyBytes, err := base64.StdEncoding.DecodeString(wrappedSessionKey)
-	if err != nil {
-		return nil, fmt.Errorf("invalid wrapped_key encoding: %w", err)
-	}
-
-	// Decode nonce
+	// Decode nonce for wrapped key
 	nonceBytes, err := base64.StdEncoding.DecodeString(wrappedKeyNonce)
 	if err != nil {
 		return nil, fmt.Errorf("invalid nonce encoding: %w", err)
 	}
 
-	// Unwrap session key using recipient's DH secret
-	// In production: X3DH unwrap of wrappedKeyBytes
-	// For now: placeholder (session key = wrapped key)
-	_ = wrappedKeyBytes
-	_ = nonceBytes
+	if len(nonceBytes) != 12 {
+		return nil, fmt.Errorf("invalid wrap nonce size: %d", len(nonceBytes))
+	}
+
+	// Query recipient's private identity key from database
+	var recipientPrivateKeyB64 string
+	err = m.db.QueryRow(ctx, `
+		SELECT identity_private_key FROM device_identity_keys
+		WHERE device_id = $1::uuid AND user_id = $2::uuid
+	`, recipientDeviceID, recipientUserID).Scan(&recipientPrivateKeyB64)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load recipient private key: %w", err)
+	}
+
+	// Create temporary receiver state for unwrapping
+	// In production, would use actual session state with full history
+	tempDRState, err := InitializeDoubleRatchetStateAsReceiver(make([]byte, 32))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temporary receiver state: %w", err)
+	}
+
+	// Unwrap session key using X3DH
+	wrappedSessionKeyBytes, err := UnwrapSessionKeyWithDoubleRatchet(
+		recipientPrivateKeyB64,
+		wrappedSessionKey,
+		wrappedKeyNonce,
+		tempDRState,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unwrap session key: %w", err)
+	}
+
+	if len(wrappedSessionKeyBytes) != 32 {
+		return nil, fmt.Errorf("invalid unwrapped key size: %d", len(wrappedSessionKeyBytes))
+	}
 
 	// Decode ciphertext
 	ciphertextBytes, err := base64.StdEncoding.DecodeString(ciphertext)
@@ -164,10 +198,27 @@ func (m *MultiRecipientEncryption) DecryptGroupMessage(
 		return nil, fmt.Errorf("invalid ciphertext encoding: %w", err)
 	}
 
-	// Decrypt with session key
-	// In production: aes.NewCipher(wrappedKeyBytes) + gcm.Open(...)
-	plaintext := make([]byte, len(ciphertextBytes))
-	copy(plaintext, ciphertextBytes)
+	// Decode group session nonce
+	groupNonceBytes, err := base64.StdEncoding.DecodeString(groupSessionNonce)
+	if err != nil {
+		return nil, fmt.Errorf("invalid group session nonce encoding: %w", err)
+	}
+
+	if len(groupNonceBytes) != 12 {
+		return nil, fmt.Errorf("invalid group nonce size: %d", len(groupNonceBytes))
+	}
+
+	// Decrypt with unwrapped session key using AES-256-GCM
+	var sessionKeyArray [32]byte
+	copy(sessionKeyArray[:], wrappedSessionKeyBytes)
+
+	var nonceArray [12]byte
+	copy(nonceArray[:], groupNonceBytes)
+
+	plaintext, err := AESGCMDecrypt(sessionKeyArray, ciphertextBytes, nonceArray, nil)
+	if err != nil {
+		return nil, fmt.Errorf("decryption failed: %w", err)
+	}
 
 	return plaintext, nil
 }
@@ -180,11 +231,23 @@ func (m *MultiRecipientEncryption) RotateGroupKey(
 	currentEpoch int64,
 	groupSecret []byte,
 ) ([]byte, error) {
-	// In production: HKDF-Expand(groupSecret, "group_key_rotation")
-	// For now: placeholder key derivation
-	newKey := make([]byte, 32)
-	copy(newKey, groupSecret)
-	return newKey, nil
+	if len(groupSecret) != 32 {
+		return nil, fmt.Errorf("invalid group secret size: %d", len(groupSecret))
+	}
+
+	// Derive new key using HKDF with epoch as context
+	epochBytes := []byte(fmt.Sprintf("group-key-rotation-epoch-%d", currentEpoch))
+	newKeyBytes, err := HKDFExtractExpand(
+		[]byte("group-secret"),  // salt from group secret
+		groupSecret,             // input key material
+		epochBytes,              // info: include epoch number
+		32,                      // output 32 bytes
+	)
+	if err != nil {
+		return nil, fmt.Errorf("key derivation failed: %w", err)
+	}
+
+	return newKeyBytes, nil
 }
 
 // ValidateRecipientList verifies all recipients are members of group

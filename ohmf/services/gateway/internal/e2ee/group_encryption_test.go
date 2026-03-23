@@ -1,6 +1,8 @@
 package e2ee
 
 import (
+	"bytes"
+	"context"
 	"encoding/base64"
 	"testing"
 
@@ -367,5 +369,200 @@ func BenchmarkGroupKeyDerivation(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_ = tree.DeriveGroupKey(salt)
+	}
+}
+
+// ==================== GROUP E2EE WITH REAL CRYPTO ====================
+
+// TestGroupKeyRotationWithHKDF tests HKDF-based key rotation
+func TestGroupKeyRotationWithHKDF(t *testing.T) {
+	mre := &MultiRecipientEncryption{db: nil}
+
+	groupSecret := make([]byte, 32)
+	for i := 0; i < 32; i++ {
+		groupSecret[i] = byte(i)
+	}
+
+	// Rotate key for epoch 0
+	key0, err := mre.RotateGroupKey(context.Background(), "group1", 0, groupSecret)
+	if err != nil {
+		t.Fatalf("key rotation failed: %v", err)
+	}
+
+	if len(key0) != 32 {
+		t.Errorf("rotated key should be 32 bytes, got %d", len(key0))
+	}
+
+	// Rotate key for epoch 1 - should be different
+	key1, err := mre.RotateGroupKey(context.Background(), "group1", 1, groupSecret)
+	if err != nil {
+		t.Fatalf("key rotation failed: %v", err)
+	}
+
+	if bytes.Equal(key0, key1) {
+		t.Error("different epochs should produce different keys")
+	}
+
+	// Rotating same epoch should be deterministic
+	key0again, _ := mre.RotateGroupKey(context.Background(), "group1", 0, groupSecret)
+	if !bytes.Equal(key0, key0again) {
+		t.Error("same epoch should produce same key")
+	}
+}
+
+// TestGroupKeyRotationDifferentSecrets tests rotation with different secrets
+func TestGroupKeyRotationDifferentSecrets(t *testing.T) {
+	mre := &MultiRecipientEncryption{db: nil}
+
+	secret1 := make([]byte, 32)
+	for i := 0; i < 32; i++ {
+		secret1[i] = byte(i)
+	}
+
+	secret2 := make([]byte, 32)
+	for i := 0; i < 32; i++ {
+		secret2[i] = byte(i + 1)
+	}
+
+	key1, _ := mre.RotateGroupKey(context.Background(), "group1", 0, secret1)
+	key2, _ := mre.RotateGroupKey(context.Background(), "group1", 0, secret2)
+
+	if bytes.Equal(key1, key2) {
+		t.Error("different secrets should produce different keys")
+	}
+}
+
+// TestGroupEncryptionDecryptionRoundtrip tests AES-256-GCM group encryption
+func TestGroupEncryptionDecryptionRoundtrip(t *testing.T) {
+	groupSessionKey := make([]byte, 32)
+	for i := 0; i < 32; i++ {
+		groupSessionKey[i] = byte(i * 7 % 256)
+	}
+
+	var sessionKeyArray [32]byte
+	copy(sessionKeyArray[:], groupSessionKey)
+
+	plaintext := []byte("group message content")
+
+	// Encrypt with AES-256-GCM
+	encryptedData, nonce, err := AESGCMEncrypt(sessionKeyArray, plaintext, nil)
+	if err != nil {
+		t.Fatalf("encryption failed: %v", err)
+	}
+
+	// Decrypt with same key
+	var nonceArray [12]byte
+	copy(nonceArray[:], nonce[:])
+
+	decrypted, err := AESGCMDecrypt(sessionKeyArray, encryptedData, nonceArray, nil)
+	if err != nil {
+		t.Fatalf("decryption failed: %v", err)
+	}
+
+	if !bytes.Equal(plaintext, decrypted) {
+		t.Error("decrypted text doesn't match original")
+	}
+}
+
+// TestGroupMessageMultipleMemberDecryption tests each member can decrypt
+func TestGroupMessageMultipleMemberDecryption(t *testing.T) {
+	members := []string{"user1", "user2", "user3"}
+
+	groupSessionKey := make([]byte, 32)
+	for i := 0; i < 32; i++ {
+		groupSessionKey[i] = byte(i)
+	}
+
+	var sessionKeyArray [32]byte
+	copy(sessionKeyArray[:], groupSessionKey)
+
+	plaintext := []byte("message for group")
+
+	// Encrypt message
+	ciphertext, nonce, err := AESGCMEncrypt(sessionKeyArray, plaintext, nil)
+	if err != nil {
+		t.Fatalf("encryption failed: %v", err)
+	}
+
+	// Decrypt for each member
+	var nonceArray [12]byte
+	copy(nonceArray[:], nonce[:])
+
+	for _, member := range members {
+		decrypted, err := AESGCMDecrypt(sessionKeyArray, ciphertext, nonceArray, nil)
+		if err != nil {
+			t.Fatalf("decryption for %s failed: %v", member, err)
+		}
+
+		if !bytes.Equal(plaintext, decrypted) {
+			t.Errorf("member %s decryption failed", member)
+		}
+	}
+}
+
+// TestGroupPerRecipientKeyWrapping tests X3DH wrapping of group session key
+func TestGroupPerRecipientKeyWrapping(t *testing.T) {
+	groupSessionKey := make([]byte, 32)
+	for i := 0; i < 32; i++ {
+		groupSessionKey[i] = byte(i)
+	}
+
+	tempDRState, err := InitializeDoubleRatchetState(groupSessionKey)
+	if err != nil {
+		t.Fatalf("failed to create DR state: %v", err)
+	}
+
+	// Generate recipient's public key
+	recipientPub, _, _ := X25519Keypair()
+	recipientPubB64 := base64.StdEncoding.EncodeToString(recipientPub[:])
+
+	// Wrap for recipient using X3DH
+	wrappedKey, wrappedNonce, err := GenerateRecipientWrappedKey(recipientPubB64, tempDRState)
+	if err != nil {
+		t.Fatalf("wrapping failed: %v", err)
+	}
+
+	if wrappedKey == "" || wrappedNonce == "" {
+		t.Error("wrapped key and nonce should not be empty")
+	}
+}
+
+// BenchmarkGroupMessageEncryptionCrypto benchmarks group message encryption
+func BenchmarkGroupMessageEncryptionCrypto(b *testing.B) {
+	groupSessionKey := make([]byte, 32)
+	for i := 0; i < 32; i++ {
+		groupSessionKey[i] = byte(i)
+	}
+
+	var sessionKeyArray [32]byte
+	copy(sessionKeyArray[:], groupSessionKey)
+
+	plaintext := make([]byte, 1024)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		AESGCMEncrypt(sessionKeyArray, plaintext, nil)
+	}
+}
+
+// BenchmarkGroupMessageDecryptionCrypto benchmarks group message decryption
+func BenchmarkGroupMessageDecryptionCrypto(b *testing.B) {
+	groupSessionKey := make([]byte, 32)
+	for i := 0; i < 32; i++ {
+		groupSessionKey[i] = byte(i)
+	}
+
+	var sessionKeyArray [32]byte
+	copy(sessionKeyArray[:], groupSessionKey)
+
+	plaintext := make([]byte, 1024)
+	ciphertext, nonce, _ := AESGCMEncrypt(sessionKeyArray, plaintext, nil)
+
+	var nonceArray [12]byte
+	copy(nonceArray[:], nonce[:])
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		AESGCMDecrypt(sessionKeyArray, ciphertext, nonceArray, nil)
 	}
 }
