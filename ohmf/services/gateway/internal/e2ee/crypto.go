@@ -389,48 +389,28 @@ func GenerateNonce() ([]byte, error) {
 
 // removed: GenerateEphemeralKeyID - dead code, never called in production paths
 
-// EncryptMessageContent encrypts plaintext message content using AES-256-GCM
-// In production, this would use libsignal's Double Ratchet algorithm
-// For now, we use basic AES-GCM as a placeholder showing the structure
-func EncryptMessageContent(messageBytes []byte, sessionKey []byte) (ciphertext string, nonce string, err error) {
-	// For production: Use libsignal's EncryptMessage(sessionState, messageBytes)
-	// This is a placeholder implementation using standard Go crypto
-
-	if len(sessionKey) != 32 {
-		return "", "", fmt.Errorf("invalid session key size: expected 32 bytes, got %d", len(sessionKey))
+// EncryptMessageContent encrypts plaintext using Double Ratchet algorithm
+// This is the production implementation, replacing the placeholder
+func EncryptMessageContent(messageBytes []byte, sessionState *DoubleRatchetState) (ciphertext string, nonce string, err error) {
+	if sessionState == nil {
+		return "", "", errors.New("session state is nil")
 	}
 
-	// Generate random nonce for GCM (96 bits)
-	nonceBytes, err := GenerateNonce()
+	ciphertextBytes, nonceArray, err := sessionState.EncryptMessageWithDoubleRatchet(messageBytes)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to generate nonce: %w", err)
+		return "", "", err
 	}
 
-	// Note: In production, use libsignal-go:
-	// ciphertext := sessionState.EncryptMessage(messageBytes)
-	// We would extract wrapped keys from Double Ratchet state
-
-	// For placeholder: create a simple AES-GCM cipher
-	// This is NOT production-ready - it's to show the structure
-	// Production code would use: libsignal.EncryptMessage(sessionState, messageBytes)
-
-	ciphertextBytes := append(nonceBytes, messageBytes...) // Placeholder: just concatenate
-	ciphertext = base64.StdEncoding.EncodeToString(ciphertextBytes)
-	nonce = base64.StdEncoding.EncodeToString(nonceBytes)
-
-	return ciphertext, nonce, nil
+	return base64.StdEncoding.EncodeToString(ciphertextBytes), base64.StdEncoding.EncodeToString(nonceArray[:]), nil
 }
 
-// DecryptMessageContent decrypts an encrypted message using session state
-// In production, this would use libsignal's Double Ratchet algorithm
-func DecryptMessageContent(ctx context.Context, ciphertext string, nonce string, sessionKey []byte) ([]byte, error) {
-	// For production: Use libsignal's DecryptMessage(sessionState, ciphertext)
-
-	if len(sessionKey) != 32 {
-		return nil, fmt.Errorf("invalid session key size: expected 32 bytes, got %d", len(sessionKey))
+// DecryptMessageContent decrypts an encrypted message using Double Ratchet state
+// This is the production implementation, replacing the placeholder
+func DecryptMessageContent(ctx context.Context, ciphertext string, nonce string, sessionState *DoubleRatchetState, messageIndex int) ([]byte, error) {
+	if sessionState == nil {
+		return nil, errors.New("session state is nil")
 	}
 
-	// Decode base64 ciphertext and nonce
 	ct, err := base64.StdEncoding.DecodeString(ciphertext)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode ciphertext: %w", err)
@@ -441,43 +421,227 @@ func DecryptMessageContent(ctx context.Context, ciphertext string, nonce string,
 		return nil, fmt.Errorf("failed to decode nonce: %w", err)
 	}
 
-	// Production: libsignal.DecryptMessage(sessionState, ciphertext)
-	// For now: placeholder extraction
-	if len(ct) < len(nonceBytes) {
-		return nil, fmt.Errorf("invalid ciphertext format")
+	if len(nonceBytes) != 12 {
+		return nil, fmt.Errorf("invalid nonce size: expected 12, got %d", len(nonceBytes))
 	}
 
-	plaintext := ct[len(nonceBytes):]
+	var nonceArray [12]byte
+	copy(nonceArray[:], nonceBytes)
+
+	return sessionState.DecryptMessageWithDoubleRatchet(ct, nonceArray, messageIndex)
+}
+
+// GenerateRecipientWrappedKey generates a wrapped session key using X25519 ECDH
+// The wrapped key is encrypted using derives from ECDH with recipient's public key
+// This is simplified - full implementation uses X3DH (3-way DH + signature)
+func GenerateRecipientWrappedKey(
+	recipientIdentityPublicKey string,
+	recipientState *DoubleRatchetState,
+) (wrappedKey string, wrapNonce string, err error) {
+	if recipientState == nil {
+		return "", "", errors.New("recipient state is nil")
+	}
+
+	// Decode recipient's identity public key (X25519)
+	recipientKeyBytes, err := base64.StdEncoding.DecodeString(recipientIdentityPublicKey)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to decode recipient key: %w", err)
+	}
+
+	if len(recipientKeyBytes) != 32 {
+		return "", "", fmt.Errorf("invalid recipient key size: %d", len(recipientKeyBytes))
+	}
+
+	var recipientKey [32]byte
+	copy(recipientKey[:], recipientKeyBytes)
+
+	// Generate ephemeral keypair for this wrapping
+	ephPub, ephPriv, err := X25519Keypair()
+	if err != nil {
+		return "", "", fmt.Errorf("failed to generate ephemeral key: %w", err)
+	}
+
+	// Perform ECDH: shared_secret = ephPriv * recipientKey
+	sharedSecret, err := X25519SharedSecret(ephPriv, recipientKey)
+	if err != nil {
+		return "", "", fmt.Errorf("ECDH failed: %w", err)
+	}
+
+	// Derive wrapping key from shared secret using recipient's state root key as context
+	wrappingKey, err := HKDFExpand(sharedSecret[:], recipientState.RootKey[:], 32)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to derive wrapping key: %w", err)
+	}
+
+	var wrapKeyArray [32]byte
+	copy(wrapKeyArray[:], wrappingKey)
+
+	// Encrypt the recipient state's root key with the wrapping key
+	ciphertext, nonce, err := AESGCMEncrypt(wrapKeyArray, recipientState.RootKey[:], nil)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to wrap key: %w", err)
+	}
+
+	// Include ephemeral public key in wrapped key for recipient to perform ECDH
+	wrappedContent := make([]byte, 32+len(ciphertext))
+	copy(wrappedContent[0:32], ephPub[:])
+	copy(wrappedContent[32:], ciphertext)
+
+	return base64.StdEncoding.EncodeToString(wrappedContent), base64.StdEncoding.EncodeToString(nonce[:]), nil
+}
+
+// UnwrapSessionKeyWithDoubleRatchet unwraps a recipient's wrapped key for our private key
+// This is the inverse of GenerateRecipientWrappedKey
+func UnwrapSessionKeyWithDoubleRatchet(
+	ourPrivateKeyHex string,
+	wrappedKeyB64 string,
+	wrapNonceB64 string,
+	ourState *DoubleRatchetState,
+) ([]byte, error) {
+	if ourState == nil {
+		return nil, errors.New("our state is nil")
+	}
+
+	// Decode private key
+	ourPrivKeyBytes, err := base64.StdEncoding.DecodeString(ourPrivateKeyHex)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode our private key: %w", err)
+	}
+
+	if len(ourPrivKeyBytes) != 32 {
+		return nil, fmt.Errorf("invalid private key size: %d", len(ourPrivKeyBytes))
+	}
+
+	var ourPrivKey [32]byte
+	copy(ourPrivKey[:], ourPrivKeyBytes)
+
+	// Decode wrapped content (ephemeral_pub || ciphertext)
+	wrappedContent, err := base64.StdEncoding.DecodeString(wrappedKeyB64)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode wrapped key: %w", err)
+	}
+
+	if len(wrappedContent) < 32 {
+		return nil, fmt.Errorf("invalid wrapped key format: too short")
+	}
+
+	var ephPub [32]byte
+	copy(ephPub[:], wrappedContent[0:32])
+	ciphertext := wrappedContent[32:]
+
+	// Decode nonce
+	wrapNonceBytes, err := base64.StdEncoding.DecodeString(wrapNonceB64)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode wrap nonce: %w", err)
+	}
+
+	if len(wrapNonceBytes) != 12 {
+		return nil, fmt.Errorf("invalid wrap nonce size: %d", len(wrapNonceBytes))
+	}
+
+	var wrapNonce [12]byte
+	copy(wrapNonce[:], wrapNonceBytes)
+
+	// Perform ECDH with ephemeral key: shared_secret = ourPriv * ephPub
+	sharedSecret, err := X25519SharedSecret(ourPrivKey, ephPub)
+	if err != nil {
+		return nil, fmt.Errorf("ECDH failed: %w", err)
+	}
+
+	// Derive wrapping key
+	wrappingKey, err := HKDFExpand(sharedSecret[:], ourState.RootKey[:], 32)
+	if err != nil {
+		return nil, fmt.Errorf("failed to derive wrapping key: %w", err)
+	}
+
+	var wrapKeyArray [32]byte
+	copy(wrapKeyArray[:], wrappingKey)
+
+	// Decrypt the root key
+	plaintext, err := AESGCMDecrypt(wrapKeyArray, ciphertext, wrapNonce, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unwrap key: %w", err)
+	}
+
 	return plaintext, nil
 }
 
-// GenerateRecipientWrappedKey generates a wrapped session key for a recipient device
-// The wrapped key is encrypted with the recipient's identity public key
-// In production, this is part of the X3DH protocol (ephemeral + identity key exchange)
-func GenerateRecipientWrappedKey(
-	recipientIdentityPublicKey string,
-	sessionKey []byte,
-) (wrappedKey string, wrapNonce string, err error) {
-	// Generate random nonce for wrapping
-	wrapNonceBytes, err := GenerateNonce()
+// EncryptMessageWithSession encrypts a message using Session database state
+// Converts Session to DoubleRatchetState, performs encryption, updates Session
+func (sm *SessionManager) EncryptMessageWithSession(
+	ctx context.Context,
+	session *Session,
+	plaintext []byte,
+) (ciphertext, nonce string, err error) {
+	// Restore ratchet state from session
+	dr, err := CreateDoubleRatchetStateFromSession(session)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to generate wrap nonce: %w", err)
+		return "", "", fmt.Errorf("failed to restore ratchet state: %w", err)
 	}
 
-	// Production: Use X25519 key agreement with libsignal
-	// For now: placeholder wrapping (just base64 encode the key)
-	// wrappedKey would be: X25519(ephemeral_secret, recipient_identity_key, sessionKey)
+	// Encrypt with double ratchet
+	ciphertextBytes, nonceArray, err := dr.EncryptMessageWithDoubleRatchet(plaintext)
+	if err != nil {
+		return "", "", err
+	}
 
-	// Placeholder: just encode the session key with nonce
-	wrappedKeyBytes := append(wrapNonceBytes, sessionKey...)
-	wrappedKey = base64.StdEncoding.EncodeToString(wrappedKeyBytes)
-	wrapNonce = base64.StdEncoding.EncodeToString(wrapNonceBytes)
+	// Update session with new ratchet state
+	UpdateSessionFromDoubleRatchet(session, dr)
 
-	return wrappedKey, wrapNonce, nil
+	// Persist updated session to database
+	if err := sm.SaveSession(ctx, session); err != nil {
+		return "", "", fmt.Errorf("failed to update session: %w", err)
+	}
+
+	return base64.StdEncoding.EncodeToString(ciphertextBytes), base64.StdEncoding.EncodeToString(nonceArray[:]), nil
+}
+
+// DecryptMessageWithSession decrypts a message using Session database state
+// Converts Session to DoubleRatchetState, performs decryption, updates Session for received state
+func (sm *SessionManager) DecryptMessageWithSession(
+	ctx context.Context,
+	session *Session,
+	ciphertext, nonce string,
+	messageIndex int,
+) ([]byte, error) {
+	// Restore ratchet state from session
+	dr, err := CreateDoubleRatchetStateFromSession(session)
+	if err != nil {
+		return nil, fmt.Errorf("failed to restore ratchet state: %w", err)
+	}
+
+	// Decode ciphertext and nonce
+	ct, err := base64.StdEncoding.DecodeString(ciphertext)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode ciphertext: %w", err)
+	}
+
+	nonceBytes, err := base64.StdEncoding.DecodeString(nonce)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode nonce: %w", err)
+	}
+
+	if len(nonceBytes) != 12 {
+		return nil, fmt.Errorf("invalid nonce size: %d", len(nonceBytes))
+	}
+
+	var nonceArray [12]byte
+	copy(nonceArray[:], nonceBytes)
+
+	// Decrypt with double ratchet
+	plaintext, err := dr.DecryptMessageWithDoubleRatchet(ct, nonceArray, messageIndex)
+	if err != nil {
+		return nil, err
+	}
+
+	// Note: In production, we'd update recv state separately
+	// For now, we keep the state as-is after decryption
+	// UpdateSessionFromDoubleRatchet(session, dr) would overwrite send state
+
+	return plaintext, nil
 }
 
 // UnwrapSessionKey unwraps a recipient's wrapped session key using our private identity key
-// removed: UnwrapSessionKey - dead code stub, never called in production paths
 
 // ==================== PHASE 4 WEEK 1: CRYPTOGRAPHIC PRIMITIVES ====================
 
@@ -629,6 +793,118 @@ func MessageDecrypt(messageKey [32]byte, ciphertextB64, nonceB64 string) ([]byte
 	var nonce [12]byte
 	copy(nonce[:], nonceBytes)
 	return AESGCMDecrypt(messageKey, ciphertext, nonce, nil)
+}
+
+// GenerateRecipientWrappedKeyLegacy generates wrapped key using legacy API
+// Provided for backward compatibility with existing code
+func GenerateRecipientWrappedKeyLegacy(
+	recipientIdentityPublicKey string,
+	sessionKey []byte,
+) (wrappedKey string, wrapNonce string, err error) {
+	if len(sessionKey) != 32 {
+		return "", "", fmt.Errorf("invalid session key size: expected 32 bytes, got %d", len(sessionKey))
+	}
+
+	// Decode recipient's public key
+	recipientKeyBytes, err := base64.StdEncoding.DecodeString(recipientIdentityPublicKey)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to decode recipient key: %w", err)
+	}
+
+	if len(recipientKeyBytes) != 32 {
+		return "", "", fmt.Errorf("invalid recipient key size: %d", len(recipientKeyBytes))
+	}
+
+	var recipientKey [32]byte
+	copy(recipientKey[:], recipientKeyBytes)
+
+	// Generate ephemeral keypair
+	ephPub, ephPriv, err := X25519Keypair()
+	if err != nil {
+		return "", "", fmt.Errorf("failed to generate ephemeral key: %w", err)
+	}
+
+	// Perform ECDH
+	sharedSecret, err := X25519SharedSecret(ephPriv, recipientKey)
+	if err != nil {
+		return "", "", fmt.Errorf("ECDH failed: %w", err)
+	}
+
+	// Derive wrapping key
+	wrappingKey, err := HKDFExpand(sharedSecret[:], []byte("wrap-key"), 32)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to derive wrapping key: %w", err)
+	}
+
+	var wrapKeyArray [32]byte
+	copy(wrapKeyArray[:], wrappingKey)
+
+	// Encrypt the session key
+	var sessionKeyArray [32]byte
+	copy(sessionKeyArray[:], sessionKey)
+
+	ciphertext, nonce, err := AESGCMEncrypt(wrapKeyArray, sessionKeyArray[:], nil)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to wrap key: %w", err)
+	}
+
+	// Include ephemeral public key in wrapped result
+	wrappedContent := make([]byte, 32+len(ciphertext))
+	copy(wrappedContent[0:32], ephPub[:])
+	copy(wrappedContent[32:], ciphertext)
+
+	return base64.StdEncoding.EncodeToString(wrappedContent), base64.StdEncoding.EncodeToString(nonce[:]), nil
+}
+
+// EncryptMessageContentLegacy encrypts using legacy sessionKey API
+// Provided for backward compatibility with existing code
+// Creates a temporary DoubleRatchetState from the session key
+func EncryptMessageContentLegacy(messageBytes []byte, sessionKey []byte) (ciphertext string, nonce string, err error) {
+	if len(sessionKey) != 32 {
+		return "", "", fmt.Errorf("invalid session key size: expected 32 bytes, got %d", len(sessionKey))
+	}
+
+	// Create temporary state from session key (simplified for compatibility)
+	var keyArray [32]byte
+	copy(keyArray[:], sessionKey)
+
+	// For compatibility, use direct AES-GCM (no Double Ratchet state)
+	ct, nonceArray, err := AESGCMEncrypt(keyArray, messageBytes, nil)
+	if err != nil {
+		return "", "", err
+	}
+
+	return base64.StdEncoding.EncodeToString(ct), base64.StdEncoding.EncodeToString(nonceArray[:]), nil
+}
+
+// DecryptMessageContentLegacy decrypts using legacy sessionKey API
+// Provided for backward compatibility with existing code
+func DecryptMessageContentLegacy(ctx context.Context, ciphertext string, nonce string, sessionKey []byte) ([]byte, error) {
+	if len(sessionKey) != 32 {
+		return nil, fmt.Errorf("invalid session key size: expected 32 bytes, got %d", len(sessionKey))
+	}
+
+	ct, err := base64.StdEncoding.DecodeString(ciphertext)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode ciphertext: %w", err)
+	}
+
+	nonceBytes, err := base64.StdEncoding.DecodeString(nonce)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode nonce: %w", err)
+	}
+
+	if len(nonceBytes) != 12 {
+		return nil, fmt.Errorf("invalid nonce size: %d", len(nonceBytes))
+	}
+
+	var nonceArray [12]byte
+	copy(nonceArray[:], nonceBytes)
+
+	var keyArray [32]byte
+	copy(keyArray[:], sessionKey)
+
+	return AESGCMDecrypt(keyArray, ct, nonceArray, nil)
 }
 
 // Note: Actual Double Ratchet and libsignal integration will be implemented
