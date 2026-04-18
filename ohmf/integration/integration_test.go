@@ -3,7 +3,6 @@ package integration
 import (
     "bytes"
     "encoding/json"
-    "fmt"
     "net/http"
     "os"
     "testing"
@@ -64,42 +63,7 @@ func TestGatewayIntegration(t *testing.T) {
         t.Fatalf("discover status: %v", resp.Status)
     }
 
-    // 3) Register an app via gateway
-    app := map[string]interface{}{
-        "manifest": map[string]interface{}{
-            "manifest_version": "1.0",
-            "app_id": fmt.Sprintf("com.example.test.%d", time.Now().UnixNano()),
-            "name": "Integration Test App",
-            "version": "1.0.0",
-            "entrypoint": map[string]any{
-                "type": "url",
-                "url":  "https://example.com/app",
-            },
-            "message_preview": map[string]any{
-                "type": "static_image",
-                "url":  "https://example.com/preview.png",
-            },
-            "permissions": []string{"conversation.read_context"},
-            "capabilities": map[string]any{
-                "turn_based": true,
-            },
-            "signature": map[string]any{
-                "alg": "RS256",
-                "kid": "integration",
-                "sig": "placeholder",
-            },
-        },
-    }
-    ab, _ := json.Marshal(app)
-    resp, err = client.Post(gateway+"/v1/apps/register", "application/json", bytes.NewReader(ab))
-    if err != nil {
-        t.Fatalf("apps register failed: %v", err)
-    }
-    if resp.StatusCode != http.StatusCreated {
-        t.Fatalf("apps register status: %v", resp.Status)
-    }
-
-    // 4) Media upload init + complete via gateway
+    // 3) Media upload init + complete via gateway
     resp, err = client.Post(gateway+"/v1/media/uploads", "application/json", nil)
     if err != nil {
         t.Fatalf("media create failed: %v", err)

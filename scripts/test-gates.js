@@ -205,6 +205,26 @@ const gates = {
       },
     ],
   },
+  stress: {
+    description: "Stateful end-to-end messaging stress validation against a running stack.",
+    steps: [
+      {
+        name: "stress-harness",
+        cwd: repoRoot,
+        command: "node",
+        args: [path.join("testing", "stress", "run.js")],
+        tags: [
+          "auth",
+          "messages",
+          "conversations",
+          "sync",
+          "realtime",
+          "devices",
+          "perf",
+        ],
+      },
+    ],
+  },
   staging: {
     description: "Manual and staging signoff gate with optional automated checks.",
     steps: [],
@@ -239,6 +259,8 @@ function printUsage() {
   console.log("");
   console.log("Capability tags:");
   console.log("  auth, conversations, devices, e2ee, media, messages, migration, miniapp, perf, privacy, realtime, relay, search, sync");
+  console.log("");
+  console.log(`Stress harness docs: ${path.join(repoRoot, "testing", "stress", "README.md")}`);
 }
 
 function printGateList() {

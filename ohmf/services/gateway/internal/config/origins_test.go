@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
@@ -17,8 +18,8 @@ func TestGenerateAppOrigin_Determinism(t *testing.T) {
 
 func TestGenerateAppOrigin_Uniqueness(t *testing.T) {
 	tests := []struct {
-		appID     string
-		releaseID string
+		appID      string
+		releaseID  string
 		wantUnique bool
 	}{
 		{"app.ohmf.counter", "v1.0.0", false},
@@ -99,9 +100,9 @@ func TestGenerateAppOrigin_NormalizesInput(t *testing.T) {
 
 func TestGenerateOriginConfig_Complete(t *testing.T) {
 	params := OriginGenerationParams{
-		AppID:       "app.ohmf.counter",
-		ReleaseID:   "v1.0.0",
-		BaseDomain:  "miniapp.local",
+		AppID:        "app.ohmf.counter",
+		ReleaseID:    "v1.0.0",
+		BaseDomain:   "miniapp.local",
 		SubdomainLen: 8,
 	}
 
@@ -217,9 +218,9 @@ func TestValidateOrigin_DefaultBaseDomain(t *testing.T) {
 
 func TestIsSameOriginRequestValid(t *testing.T) {
 	tests := []struct {
-		requestOrigin    string
-		expectedOrigin   string
-		wantValid        bool
+		requestOrigin  string
+		expectedOrigin string
+		wantValid      bool
 	}{
 		{"a7f3e1c5.miniapp.local", "a7f3e1c5.miniapp.local", true},
 		{"a7f3e1c5.miniapp.local", "b8g4f2d6.miniapp.local", false},
@@ -251,8 +252,8 @@ func TestGenerateAppOrigin_CollisionResistance(t *testing.T) {
 	// Generate 100 origins with different app/release IDs
 	origins := make(map[string]int)
 	for i := 0; i < 100; i++ {
-		appID := "app.ohmf.test" + string(rune(i))
-		releaseID := "v" + string(rune(i))
+		appID := fmt.Sprintf("app.ohmf.test-%03d", i)
+		releaseID := fmt.Sprintf("v%03d", i)
 		origin := GenerateAppOrigin(appID, releaseID, "miniapp.local", 8)
 		origins[origin]++
 	}

@@ -121,8 +121,6 @@ services:
       dockerfile: Dockerfile
     container_name: ohmf-api
     depends_on:
-      apps:
-        condition: service_started
       db:
         condition: service_healthy
       redis:
@@ -141,7 +139,6 @@ services:
       APP_REDIS_ADDR: redis:6379
       APP_REDIS_DB: "0"
       APP_JWT_SECRET: dev-only-change-me
-      APP_APPS_ADDR: http://apps:18086
       APP_ACCESS_TTL_MINUTES: "15"
       APP_REFRESH_TTL_HOURS: "720"
       APP_USE_KAFKA_SEND: "true"
@@ -161,23 +158,6 @@ services:
       APP_CASSANDRA_CONSISTENCY: quorum
     ports:
       - "${API_HOST_PORT:-18080}:${API_CONTAINER_PORT:-8080}"
-
-  apps:
-    image: ohmf-apps:dev
-    build:
-      context: ../../..
-      dockerfile: ohmf/services/apps/Dockerfile
-    container_name: ohmf-apps
-    depends_on:
-      db:
-        condition: service_healthy
-    environment:
-      APP_ADDR: :18086
-      APP_DB_DSN: postgres://${POSTGRES_USER:-ohmf}:${POSTGRES_PASSWORD:-ohmf}@db:5432/${POSTGRES_DB:-ohmf}?sslmode=disable
-      APP_MIGRATIONS_DIR: /opt/ohmf/apps/migrations
-      DATA_FILE: /var/lib/ohmf/apps/registry.json
-    ports:
-      - "18086:18086"
 
   messages-processor:
     build:

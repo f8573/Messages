@@ -65,7 +65,8 @@ func main() {
 		r.Use(observability.HTTPMetricsMiddleware)
 
 		// Lightweight reverse-proxy handlers for local dev and integration tests.
-		// These proxy /v1/contacts, /v1/apps, /v1/media to configured backend addresses.
+		// These proxy /v1/contacts, /v1/apps, /v1/media to configured backend addresses
+		// when those backends are enabled for the current stack.
 		makeProxy := func(target string) http.Handler {
 			u, err := url.Parse(target)
 			if err != nil {
@@ -86,13 +87,20 @@ func main() {
 			return proxy
 		}
 
+		mountProxy := func(path string, target string) {
+			if strings.TrimSpace(target) == "" {
+				return
+			}
+			r.Handle(path, makeProxy(target))
+		}
+
 		// Mount both exact and wildcard paths for proxies so chi routing matches.
-		r.Handle("/v1/contacts", makeProxy(cfg.ContactsAddr))
-		r.Handle("/v1/contacts/*", makeProxy(cfg.ContactsAddr))
-		r.Handle("/v1/apps", makeProxy(cfg.AppsAddr))
-		r.Handle("/v1/apps/*", makeProxy(cfg.AppsAddr))
-		r.Handle("/v1/media", makeProxy(cfg.MediaAddr))
-		r.Handle("/v1/media/*", makeProxy(cfg.MediaAddr))
+		mountProxy("/v1/contacts", cfg.ContactsAddr)
+		mountProxy("/v1/contacts/*", cfg.ContactsAddr)
+		mountProxy("/v1/apps", cfg.AppsAddr)
+		mountProxy("/v1/apps/*", cfg.AppsAddr)
+		mountProxy("/v1/media", cfg.MediaAddr)
+		mountProxy("/v1/media/*", cfg.MediaAddr)
 		r.Handle("/metrics", observability.MetricsHandler())
 		r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusOK)

@@ -83,6 +83,25 @@ function Write-RuntimeConfig {
   Set-Content -Path $Path -Value $content -Encoding ascii
 }
 
+function Restore-RuntimeConfig {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Path,
+    [Parameter(Mandatory = $true)]
+    [bool]$FileExisted,
+    [byte[]]$OriginalBytes
+  )
+
+  if ($FileExisted) {
+    [System.IO.File]::WriteAllBytes($Path, $OriginalBytes)
+    return
+  }
+
+  if (Test-Path $Path) {
+    Remove-Item -LiteralPath $Path
+  }
+}
+
 function Remove-ExistingOHMFContainers {
   param(
     [Parameter(Mandatory = $true)]
@@ -129,20 +148,35 @@ Write-Host "Stopping existing OHMF Docker containers..."
 & $docker compose -f $composeFile -f $clientComposeFile down --remove-orphans | Out-Null
 Remove-ExistingOHMFContainers -DockerPath $docker
 
-Write-RuntimeConfig -Path $runtimeConfigFile -FrontendPort $selectedClientPort -ApiHostPort $selectedHostPort -AssetVersion $assetVersion
+$runtimeConfigExisted = Test-Path $runtimeConfigFile
+$originalRuntimeConfig = if ($runtimeConfigExisted) { [System.IO.File]::ReadAllBytes($runtimeConfigFile) } else { $null }
+$startupSucceeded = $false
 
-$env:CLIENT_PORT = [string]$selectedClientPort
-$env:API_CONTAINER_PORT = [string]$selectedContainerPort
-$env:API_HOST_PORT = [string]$selectedHostPort
+try {
+  Write-RuntimeConfig -Path $runtimeConfigFile -FrontendPort $selectedClientPort -ApiHostPort $selectedHostPort -AssetVersion $assetVersion
 
-Write-Host "Starting db, api, client, messages-processor, and delivery-processor containers..."
-& $docker compose -f $composeFile -f $clientComposeFile up -d --build db api client messages-processor delivery-processor
+  $env:CLIENT_PORT = [string]$selectedClientPort
+  $env:API_CONTAINER_PORT = [string]$selectedContainerPort
+  $env:API_HOST_PORT = [string]$selectedHostPort
 
-Write-Host ""
-Write-Host "Selected ports:"
-Write-Host "CLIENT_PORT=$selectedClientPort"
-Write-Host "CONTAINER_PORT=$selectedContainerPort"
-Write-Host "HOST_PORT=$selectedHostPort"
-Write-Host ""
-Write-Host "Client: http://localhost:$selectedClientPort"
-Write-Host "API:    http://localhost:$selectedHostPort"
+  Write-Host "Starting db, api, client, messages-processor, and delivery-processor containers..."
+  & $docker compose -f $composeFile -f $clientComposeFile up -d --build db api client messages-processor delivery-processor
+  if ($LASTEXITCODE -ne 0) {
+    throw "docker compose up failed with exit code $LASTEXITCODE"
+  }
+
+  $startupSucceeded = $true
+
+  Write-Host ""
+  Write-Host "Selected ports:"
+  Write-Host "CLIENT_PORT=$selectedClientPort"
+  Write-Host "CONTAINER_PORT=$selectedContainerPort"
+  Write-Host "HOST_PORT=$selectedHostPort"
+  Write-Host ""
+  Write-Host "Client: http://localhost:$selectedClientPort"
+  Write-Host "API:    http://localhost:$selectedHostPort"
+} finally {
+  if (-not $startupSucceeded) {
+    Restore-RuntimeConfig -Path $runtimeConfigFile -FileExisted $runtimeConfigExisted -OriginalBytes $originalRuntimeConfig
+  }
+}

@@ -148,7 +148,7 @@ func Load() Config {
 		APISunset:               get("APP_API_SUNSET", ""),
 		MiniappPublicKeyPEM:     get("APP_MINIAPP_PUBLIC_KEY_PEM", ""),
 		ContactsAddr:            get("APP_CONTACTS_ADDR", "http://localhost:18085"),
-		AppsAddr:                get("APP_APPS_ADDR", "http://localhost:18086"),
+		AppsAddr:                getOptional("APP_APPS_ADDR", ""),
 		MediaAddr:               get("APP_MEDIA_ADDR", "http://localhost:18087"),
 		EnableE2EEOTT:           getBool("APP_ENABLE_E2EE_OTT_V1", true),
 		EnableGroups:            getBool("APP_ENABLE_GROUPS_V1", true),
@@ -185,6 +185,13 @@ func Load() Config {
 
 func get(k, d string) string {
 	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return d
+}
+
+func getOptional(k, d string) string {
+	if v, ok := os.LookupEnv(k); ok {
 		return v
 	}
 	return d

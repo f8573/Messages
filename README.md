@@ -31,6 +31,8 @@ From the repository root:
 docker compose up -d --build
 ```
 
+The current deployment intentionally excludes the embedded apps service. Embedded apps are deferred to a later release.
+
 Check status:
 
 ```powershell
@@ -70,7 +72,6 @@ If successful, the command returns HTTP 200.
 
 Inside Docker network (service-to-service):
 - Contacts: `http://contacts:18085`
-- Apps: `http://apps:18086`
 - Media: `http://media:18087`
 - Gateway: `http://gateway:8081`
 
@@ -175,6 +176,7 @@ docker compose -f .\ohmf\infra\docker\docker-compose.yml up -d --build
 ```
 
 That stack includes additional components (Kafka, Redis, Cassandra, processors, and API variants) for broader end-to-end testing.
+The embedded apps deployment is intentionally omitted there as well for this release.
 
 ### Using `ohmf/scripts/run-dev.ps1` (recommended on Windows)
 

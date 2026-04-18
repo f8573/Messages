@@ -102,6 +102,19 @@ window.OHMF_RUNTIME_CONFIG = Object.freeze({
 EOF
 }
 
+restore_runtime_config() {
+  local runtime_file="$1"
+  local existed="$2"
+  local backup_file="$3"
+
+  if [ "$existed" = "1" ]; then
+    cp "$backup_file" "$runtime_file"
+    return 0
+  fi
+
+  rm -f "$runtime_file"
+}
+
 remove_existing_ohmf_containers() {
   local names=(
     ohmf-db
@@ -132,6 +145,19 @@ COMPOSE_FILE="${ROOT_DIR}/infra/docker/docker-compose.yml"
 CLIENT_COMPOSE_FILE="${ROOT_DIR}/infra/docker/docker-compose.client.yml"
 RUNTIME_CONFIG_FILE="${ROOT_DIR}/apps/web/runtime-config.js"
 DOCKER_BIN="$(find_docker)"
+RUNTIME_CONFIG_BACKUP="$(mktemp)"
+runtime_config_existed=0
+startup_succeeded=0
+
+cleanup() {
+  if [ "$startup_succeeded" -ne 1 ]; then
+    restore_runtime_config "$RUNTIME_CONFIG_FILE" "$runtime_config_existed" "$RUNTIME_CONFIG_BACKUP"
+  fi
+
+  rm -f "$RUNTIME_CONFIG_BACKUP"
+}
+
+trap cleanup EXIT
 
 selected_client_port="$(next_available_port "$CLIENT_PORT")"
 selected_container_port="$(next_available_port "$CONTAINER_PORT" "$selected_client_port")"
@@ -142,6 +168,11 @@ printf '%s\n' "Stopping existing OHMF Docker containers..."
 "$DOCKER_BIN" compose -f "$COMPOSE_FILE" -f "$CLIENT_COMPOSE_FILE" down --remove-orphans >/dev/null || true
 remove_existing_ohmf_containers
 
+if [ -f "$RUNTIME_CONFIG_FILE" ]; then
+  cp "$RUNTIME_CONFIG_FILE" "$RUNTIME_CONFIG_BACKUP"
+  runtime_config_existed=1
+fi
+
 write_runtime_config "$RUNTIME_CONFIG_FILE" "$selected_client_port" "$selected_host_port" "$asset_version"
 
 export CLIENT_PORT="$selected_client_port"
@@ -150,6 +181,7 @@ export API_HOST_PORT="$selected_host_port"
 
 printf '%s\n' "Starting db, api, client, messages-processor, and delivery-processor containers..."
 "$DOCKER_BIN" compose -f "$COMPOSE_FILE" -f "$CLIENT_COMPOSE_FILE" up -d --build db api client messages-processor delivery-processor
+startup_succeeded=1
 
 printf '\nSelected ports:\n'
 printf 'CLIENT_PORT=%s\n' "$selected_client_port"

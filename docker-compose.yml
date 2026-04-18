@@ -14,19 +14,6 @@ services:
       timeout: 3s
       retries: 5
 
-  apps:
-    build:
-      context: .
-      dockerfile: ohmf/services/apps/Dockerfile
-    container_name: ohmf_apps
-    expose:
-      - "18086"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:18086/healthz"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
   media:
     build:
       context: .
@@ -52,11 +39,9 @@ services:
       - APP_SMOKE_MODE=1
       - APP_LOG_LEVEL=debug
       - APP_CONTACTS_ADDR=http://contacts:18085
-      - APP_APPS_ADDR=http://apps:18086
       - APP_MEDIA_ADDR=http://media:18087
     depends_on:
       - contacts
-      - apps
       - media
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8081/healthz"]
@@ -72,7 +57,6 @@ services:
       - ./:/src:ro
     depends_on:
       - contacts
-      - apps
       - media
       - gateway
     environment:

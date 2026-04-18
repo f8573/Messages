@@ -660,6 +660,9 @@ Server-side states implemented; Android execution incomplete.
 
 ## 13. Mini-Apps/Embedded Apps
 
+Current release note:
+- Embedded apps are implemented in the repository, but their deployment is intentionally deferred to a later release.
+
 ### Mini-app Runtime
 - **Web-based sandboxed runtime**: **[IMPLEMENTED]**
   - Android: WebView sandbox
@@ -1067,12 +1070,12 @@ Server-side states implemented; Android execution incomplete.
 - Android relay agent: ✗
 - Client implementation blocking
 
-### Phase 4: Mini-Apps (COMPLETE ✓)
+### Phase 4: Mini-Apps (IMPLEMENTED, DEPLOYMENT DEFERRED)
 - Runtime: ✓
 - Bridge protocol: ✓
 - Examples: ✓
 - Registry: ✓
-- All features in this phase implemented
+- Feature work is implemented, but the deployment rollout is intentionally postponed
 
 ### Phase 5: Hardening & Expansion (MINIMAL)
 - E2EE path: Documented only

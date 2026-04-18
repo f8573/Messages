@@ -26,3 +26,12 @@ func TestLoadIncludesSecurityTunables(t *testing.T) {
 		t.Fatalf("expected OTP verify window 12 minutes, got %v", cfg.OTPVerifyWindow)
 	}
 }
+
+func TestLoadAllowsAppsRegistryToBeDisabled(t *testing.T) {
+	t.Setenv("APP_APPS_ADDR", "")
+
+	cfg := Load()
+	if cfg.AppsAddr != "" {
+		t.Fatalf("expected empty apps addr, got %q", cfg.AppsAddr)
+	}
+}

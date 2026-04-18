@@ -50,6 +50,8 @@ This stack now includes:
 - `delivery-processor`
 - `sms-processor`
 
+Embedded apps are implemented in-repo but intentionally excluded from this deployment. Their rollout is deferred to a later release.
+
 WebSocket endpoint: `ws://localhost:18081/v1/ws?access_token=<JWT>`
 
 Feature flags (gateway):

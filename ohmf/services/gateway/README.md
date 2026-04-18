@@ -66,7 +66,8 @@ The gateway **delegates to app service** (via REST API):
 - `miniapp_installs` — deprecated; use apps service instead
 - See: Migration 000043_remove_miniapp_legacy_tables
 
-In production, the `AppsAddr` configuration option MUST be set to enable RegistryClient for proper delegation.
+For the current release, embedded-app deployment is deferred and `AppsAddr` should be left unset in deployed environments.
+When the apps service is rolled out later, set `AppsAddr` to enable `RegistryClient` delegation.
 See `docs/miniapp/ownership-boundaries.md` for detailed ownership matrix, data flow, and failure modes.
 
 ## Operational Notes

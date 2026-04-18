@@ -2,6 +2,8 @@
 
 Use this checklist for the manual/device gates that the repo cannot fully automate today.
 
+For end-to-end load validation of the messaging pipeline, pair this checklist with [STRESS_TESTING_PLAN.md](C:/Users/James/Downloads/Messages/testing/STRESS_TESTING_PLAN.md).
+
 ## Staging Preconditions
 
 - Gateway stack is healthy and reachable.
@@ -21,6 +23,7 @@ npm run test:integration
 npm run test:e2e
 npm run test:live
 npm run test:perf
+npm run test:stress
 ```
 
 If the environment supports it, `npm run test:staging` with `OHMF_RUN_STAGING_AUTOMATION=1` can run the automated staging subset first.
@@ -52,9 +55,11 @@ If the environment supports it, `npm run test:staging` with `OHMF_RUN_STAGING_AU
 - Key errors include request IDs and enough context to trace send, fanout, and sync flows.
 - Reconnect and retry paths do not duplicate timeline state.
 - Metrics show sane latency and error rates during sustained messaging.
+- Stress-run artifacts are captured from `testing/stress/reports/` for the candidate build being signed off.
 
 ## Release Signoff
 
 - Complete one soak run with sustained messaging, reconnects, group churn, and live metrics review.
+- Use the stress-testing contract and proof artifacts defined in [STRESS_TESTING_PLAN.md](C:/Users/James/Downloads/Messages/testing/STRESS_TESTING_PLAN.md) for any release-level performance claim.
 - Record which partial features were verified in degraded mode versus fully exercised.
 - Record any excluded flows and the blocking reason.

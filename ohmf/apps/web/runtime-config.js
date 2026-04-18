@@ -5,5 +5,5 @@ window.OHMF_RUNTIME_CONFIG = Object.freeze({
   developer_mode: true,
   miniapp_sandbox_port: "5173",
   miniapp_sandbox_url: "http://localhost:5173",
-  asset_version: "1775138294",
+  asset_version: "1775526387",
 });
