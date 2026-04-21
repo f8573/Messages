@@ -21,6 +21,7 @@ Install the following first:
 - Docker Desktop (running)
 - Git
 - Go 1.25+ (optional if you only run services via Docker)
+- Node.js 22+ (required for the standardized repo-root test gates)
 - PowerShell (Windows) or a POSIX shell (Linux/macOS)
 
 ## 1) Start Local Hosting
@@ -105,10 +106,30 @@ docker compose run --rm itest
 
 ## 5) Run Repository Tests
 
+Install the repo-root JavaScript dependencies once:
+
+```powershell
+npm install
+```
+
+Install the Playwright browsers before browser-based gates:
+
+```powershell
+npx playwright install chromium firefox webkit
+```
+
 Windows PowerShell:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-tests.ps1 -Integration
+```
+
+Standardized repo-root gates:
+
+```powershell
+npm run test:web
+npm run test:e2e
+npm run test:live
 ```
 
 For gateway-only Go tests, prefer the bundled toolchain:

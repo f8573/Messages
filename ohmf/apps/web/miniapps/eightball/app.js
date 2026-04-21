@@ -1333,11 +1333,11 @@ async function bootstrap() {
   }
   attachPlayfieldObserver();
   ensureTurnTimerLoop();
-  await ensureRenderAssets();
   if (isPreviewMode) {
     await bootstrapPreview();
     return;
   }
+  await ensureRenderAssets();
   try {
     await refreshLaunchContext();
     try {

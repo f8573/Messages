@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -26,20 +29,23 @@ type persistedEvent struct {
 	TraceID         string   `json:"trace_id"`
 }
 
+var (
+	startupRetryDelay     = time.Second
+	startupAttemptTimeout = 3 * time.Second
+)
+
 func main() {
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	brokers := splitCSV(getenv("APP_KAFKA_BROKERS", "localhost:9092"))
 	persistedTopic := getenv("APP_KAFKA_PERSISTED_TOPIC", "msg.persisted.v1")
 	deliveryTopic := getenv("APP_KAFKA_DELIVERY_TOPIC", "msg.delivery.v1")
 	dlqTopic := getenv("APP_KAFKA_DELIVERY_DLQ_TOPIC", "msg.delivery.dlq.v1")
-	pg, err := pgxpool.New(ctx, getenv("APP_DB_DSN", "postgres://ohmf:ohmf@localhost:5432/ohmf?sslmode=disable"))
+	pg, err := openPostgres(ctx, getenv("APP_DB_DSN", "postgres://ohmf:ohmf@localhost:5432/ohmf?sslmode=disable"))
 	if err != nil {
 		log.Fatalf("postgres init failed: %v", err)
 	}
 	defer pg.Close()
-	if err := pg.Ping(ctx); err != nil {
-		log.Fatalf("postgres ping failed: %v", err)
-	}
 
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:     brokers,
@@ -55,16 +61,19 @@ func main() {
 	dlqWriter := writer(brokers, dlqTopic)
 	defer dlqWriter.Close()
 
-	rdb := redis.NewClient(&redis.Options{Addr: getenv("APP_REDIS_ADDR", "localhost:6379")})
-	defer rdb.Close()
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		log.Fatalf("redis ping failed: %v", err)
+	rdb, err := openRedis(ctx, getenv("APP_REDIS_ADDR", "localhost:6379"))
+	if err != nil {
+		log.Fatalf("redis init failed: %v", err)
 	}
+	defer rdb.Close()
 
 	log.Printf("delivery-processor started")
 	for {
 		msg, err := reader.FetchMessage(ctx)
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			log.Printf("fetch failed: %v", err)
 			time.Sleep(300 * time.Millisecond)
 			continue
@@ -182,4 +191,62 @@ func getenv(k, d string) string {
 		return v
 	}
 	return d
+}
+
+func retryUntilReady(ctx context.Context, name string, fn func(context.Context) error) error {
+	attempt := 0
+	for {
+		attempt += 1
+		attemptCtx, cancel := context.WithTimeout(ctx, startupAttemptTimeout)
+		err := fn(attemptCtx)
+		cancel()
+		if err == nil {
+			if attempt > 1 {
+				log.Printf("%s became ready after %d attempts", name, attempt)
+			}
+			return nil
+		}
+		if ctx.Err() != nil {
+			return fmt.Errorf("%s init canceled: %w", name, ctx.Err())
+		}
+		log.Printf("%s not ready (attempt %d): %v", name, attempt, err)
+		timer := time.NewTimer(startupRetryDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("%s init canceled: %w", name, ctx.Err())
+		case <-timer.C:
+		}
+	}
+}
+
+func openPostgres(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
+	var pool *pgxpool.Pool
+	err := retryUntilReady(ctx, "postgres", func(attemptCtx context.Context) error {
+		candidate, err := pgxpool.New(attemptCtx, dsn)
+		if err != nil {
+			return err
+		}
+		if err := candidate.Ping(attemptCtx); err != nil {
+			candidate.Close()
+			return err
+		}
+		pool = candidate
+		return nil
+	})
+	return pool, err
+}
+
+func openRedis(ctx context.Context, addr string) (*redis.Client, error) {
+	var client *redis.Client
+	err := retryUntilReady(ctx, "redis", func(attemptCtx context.Context) error {
+		candidate := redis.NewClient(&redis.Options{Addr: addr})
+		if err := candidate.Ping(attemptCtx).Err(); err != nil {
+			_ = candidate.Close()
+			return err
+		}
+		client = candidate
+		return nil
+	})
+	return client, err
 }

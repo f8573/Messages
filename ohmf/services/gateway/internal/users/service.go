@@ -1142,7 +1142,7 @@ func (s *Service) exportAccountMessages(ctx context.Context, userID string) ([]m
 // BlockUser creates a block relationship between two users
 func (s *Service) BlockUser(ctx context.Context, actorID, targetID string) error {
 	if _, err := s.db.Exec(ctx, `
-		INSERT INTO user_blocks (user_id, blocked_user_id, created_at)
+		INSERT INTO user_blocks (blocker_user_id, blocked_user_id, created_at)
 		VALUES ($1::uuid, $2::uuid, now())
 		ON CONFLICT DO NOTHING
 	`, actorID, targetID); err != nil {
@@ -1153,7 +1153,7 @@ func (s *Service) BlockUser(ctx context.Context, actorID, targetID string) error
 
 // UnblockUser removes a block relationship between two users
 func (s *Service) UnblockUser(ctx context.Context, actorID, targetID string) error {
-	if _, err := s.db.Exec(ctx, `DELETE FROM user_blocks WHERE user_id = $1::uuid AND blocked_user_id = $2::uuid`, actorID, targetID); err != nil {
+	if _, err := s.db.Exec(ctx, `DELETE FROM user_blocks WHERE blocker_user_id = $1::uuid AND blocked_user_id = $2::uuid`, actorID, targetID); err != nil {
 		return err
 	}
 	return s.emitBlockStateUpdates(ctx, actorID, targetID)
@@ -1163,7 +1163,7 @@ func (s *Service) UnblockUser(ctx context.Context, actorID, targetID string) err
 func (s *Service) HasBlocked(ctx context.Context, blockerID, blockedID string) (bool, error) {
 	var exists bool
 	if err := s.db.QueryRow(ctx, `
-		SELECT EXISTS(SELECT 1 FROM user_blocks WHERE user_id = $1::uuid AND blocked_user_id = $2::uuid)
+		SELECT EXISTS(SELECT 1 FROM user_blocks WHERE blocker_user_id = $1::uuid AND blocked_user_id = $2::uuid)
 	`, blockerID, blockedID).Scan(&exists); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false, nil
@@ -1232,7 +1232,7 @@ func (s *Service) ListBlockedUsers(ctx context.Context, userID string) ([]Profil
 		SELECT u.id::text, COALESCE(u.display_name, ''), COALESCE(u.avatar_url, ''), COALESCE(u.primary_phone_e164, '')
 		FROM users u
 		INNER JOIN user_blocks ub ON ub.blocked_user_id = u.id
-		WHERE ub.user_id = $1::uuid
+		WHERE ub.blocker_user_id = $1::uuid
 	`, userID)
 	if err != nil {
 		return nil, err

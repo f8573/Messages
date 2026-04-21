@@ -2,8 +2,8 @@ package observability
 
 import (
 	"bufio"
-	"net/http"
 	"net"
+	"net/http"
 	"strconv"
 	"sync"
 	"time"
@@ -55,6 +55,41 @@ var wsMessagesTotal = prometheus.NewCounterVec(
 	[]string{"direction", "event"},
 )
 
+var dbPoolAcquired = prometheus.NewGauge(
+	prometheus.GaugeOpts{
+		Name: "ohmf_gateway_db_pool_acquired_connections",
+		Help: "Current number of Postgres connections acquired from the gateway pool.",
+	},
+)
+
+var dbPoolIdle = prometheus.NewGauge(
+	prometheus.GaugeOpts{
+		Name: "ohmf_gateway_db_pool_idle_connections",
+		Help: "Current number of idle Postgres connections in the gateway pool.",
+	},
+)
+
+var dbPoolTotal = prometheus.NewGauge(
+	prometheus.GaugeOpts{
+		Name: "ohmf_gateway_db_pool_total_connections",
+		Help: "Current total number of Postgres connections tracked by the gateway pool.",
+	},
+)
+
+var dbPoolConstructing = prometheus.NewGauge(
+	prometheus.GaugeOpts{
+		Name: "ohmf_gateway_db_pool_constructing_connections",
+		Help: "Current number of Postgres connections being constructed by the gateway pool.",
+	},
+)
+
+var dbPoolMax = prometheus.NewGauge(
+	prometheus.GaugeOpts{
+		Name: "ohmf_gateway_db_pool_max_connections",
+		Help: "Configured maximum size of the gateway Postgres connection pool.",
+	},
+)
+
 type statusRecorder struct {
 	http.ResponseWriter
 	status int
@@ -91,7 +126,18 @@ func (r *statusRecorder) Unwrap() http.ResponseWriter {
 
 func initMetrics() {
 	metricsOnce.Do(func() {
-		prometheus.MustRegister(httpRequestsTotal, httpRequestDuration, httpRequestsInflight, wsConnectionsActive, wsMessagesTotal)
+		prometheus.MustRegister(
+			httpRequestsTotal,
+			httpRequestDuration,
+			httpRequestsInflight,
+			wsConnectionsActive,
+			wsMessagesTotal,
+			dbPoolAcquired,
+			dbPoolIdle,
+			dbPoolTotal,
+			dbPoolConstructing,
+			dbPoolMax,
+		)
 	})
 }
 
@@ -136,6 +182,15 @@ func RecordWSMessage(direction, event string) {
 		event = "unknown"
 	}
 	wsMessagesTotal.WithLabelValues(direction, event).Inc()
+}
+
+func RecordDBPool(acquired, idle, total, constructing, max int32) {
+	initMetrics()
+	dbPoolAcquired.Set(float64(acquired))
+	dbPoolIdle.Set(float64(idle))
+	dbPoolTotal.Set(float64(total))
+	dbPoolConstructing.Set(float64(constructing))
+	dbPoolMax.Set(float64(max))
 }
 
 func routePattern(r *http.Request) string {

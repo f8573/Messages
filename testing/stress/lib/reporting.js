@@ -42,6 +42,8 @@ function buildMarkdownSummary(summary) {
     `- Started: ${summary.started_at || "unknown"}`,
     `- Completed: ${summary.completed_at || "unknown"}`,
     `- Duration: ${summary.duration_ms ?? "unknown"} ms`,
+    `- Connected devices (final): ${summary.connected_devices ?? "unknown"}`,
+    `- Logical users: ${summary.logical_users ?? "unknown"}`,
     "",
     "## Results",
     "",
@@ -66,6 +68,22 @@ function buildMarkdownSummary(summary) {
     `- Delivery p95: ${summary.delivery_latency_ms.p95 ?? "n/a"} ms`,
     "",
   ];
+
+  if (summary.scenario_failures?.length) {
+    lines.push("## Scenario Failures", "");
+    for (const failure of summary.scenario_failures) {
+      lines.push(`- ${failure}`);
+    }
+    lines.push("");
+  }
+
+  if (summary.validation_warnings?.length) {
+    lines.push("## Validation Warnings", "");
+    for (const warning of summary.validation_warnings) {
+      lines.push(`- ${warning}`);
+    }
+    lines.push("");
+  }
 
   if (summary.missing_receipts?.length) {
     lines.push("## Missing Receipts", "");
@@ -109,6 +127,13 @@ function writeRunArtifacts(runDir, payload) {
     fs.writeFileSync(
       path.join(runDir, "metrics.json"),
       `${JSON.stringify(payload.metrics, null, 2)}\n`,
+      "utf8"
+    );
+  }
+  if (payload.details) {
+    fs.writeFileSync(
+      path.join(runDir, "details.json"),
+      `${JSON.stringify(payload.details, null, 2)}\n`,
       "utf8"
     );
   }

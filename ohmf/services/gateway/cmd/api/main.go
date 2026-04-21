@@ -138,6 +138,15 @@ func main() {
 		logger.Fatal().Err(err).Msg("db connection failed")
 	}
 	defer pool.Close()
+	observability.RecordDBPool(0, pool.Stat().IdleConns(), pool.Stat().TotalConns(), pool.Stat().ConstructingConns(), pool.Stat().MaxConns())
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			stats := pool.Stat()
+			observability.RecordDBPool(stats.AcquiredConns(), stats.IdleConns(), stats.TotalConns(), stats.ConstructingConns(), stats.MaxConns())
+		}
+	}()
 
 	if cfg.AutoMigrate {
 		if err := db.ApplyMigrations(ctx, pool, cfg.MigrationsDir); err != nil {
@@ -210,14 +219,21 @@ func main() {
 	miniappSvc := miniapp.NewService(pool, cfg, rdb, replicationStore)
 	deviceKeysSvc := devicekeys.NewService(pool)
 	msgSvc := messages.NewService(pool, messages.Options{
-		UseKafkaSend:      cfg.UseKafkaSend,
-		UseCassandraReads: cfg.UseCassandraReads,
-		AckTimeout:        cfg.AckTimeout,
-		Async:             asyncPipeline,
-		Cassandra:         cassandraStore,
-		RateLimiter:       rateLimiter,
-		Redis:             rdb,
-		Replication:       replicationStore,
+		UseKafkaSend:              cfg.UseKafkaSend,
+		UseCassandraReads:         cfg.UseCassandraReads,
+		AckTimeout:                cfg.AckTimeout,
+		Async:                     asyncPipeline,
+		Cassandra:                 cassandraStore,
+		RateLimiter:               rateLimiter,
+		SendRateWindow:            cfg.SendRateWindow,
+		SendRatePerUser:           int64(cfg.SendRatePerUser),
+		SendRateUserBurst:         int64(cfg.SendRateUserBurst),
+		SendRatePerConversation:   int64(cfg.SendRatePerConversation),
+		SendRateConversationBurst: int64(cfg.SendRateConversationBurst),
+		SendRatePerIP:             int64(cfg.SendRatePerIP),
+		SendRateIPBurst:           int64(cfg.SendRateIPBurst),
+		Redis:                     rdb,
+		Replication:               replicationStore,
 	})
 	eventsHandler := events.NewHandler(pool, rdb, msgSvc)
 	// removed: enableSend boolean parameter - using named constructors for clarity
@@ -227,6 +243,7 @@ func main() {
 	} else {
 		wsHandler = realtime.NewHandlerReadOnly(tokens, msgSvc, rdb, rateLimiter, replicationStore, miniappSvc)
 	}
+	wsHandler.SetConnectRateLimit(int64(cfg.WSConnectPerIPLimit), cfg.WSConnectWindow, int64(cfg.WSConnectBurst))
 
 	authHandler := auth.NewHandler(pool, rdb, tokens, otpProvider, cfg.AccessTTL, cfg.RefreshTTL, cfg, usersSvc, devSvc)
 	usersHandler := users.NewHandler(usersSvc)

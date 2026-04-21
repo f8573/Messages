@@ -3,12 +3,16 @@ package realtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	miniredis "github.com/alicebob/miniredis/v2"
 	pgxmock "github.com/pashagolub/pgxmock/v4"
 	"github.com/redis/go-redis/v9"
+	"ohmf/services/gateway/internal/limit"
 	"ohmf/services/gateway/internal/messages"
 	"ohmf/services/gateway/internal/replication"
 )
@@ -69,6 +73,48 @@ func TestHandleTypingSignalBroadcastsToOtherMembers(t *testing.T) {
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestWriteConnectErrorIncludesRetryAfterHeaders(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("start miniredis: %v", err)
+	}
+	defer mr.Close()
+
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer rdb.Close()
+
+	handler := NewHandlerReadOnly(nil, nil, rdb, limit.NewTokenBucket(rdb), nil, nil)
+	handler.SetConnectRateLimit(1, time.Second, 2)
+
+	if _, err := handler.allowConnect(context.Background(), "127.0.0.1"); err != nil {
+		t.Fatalf("first allowConnect failed: %v", err)
+	}
+	if _, err := handler.allowConnect(context.Background(), "127.0.0.1"); err != nil {
+		t.Fatalf("second allowConnect failed: %v", err)
+	}
+
+	decision, err := handler.allowConnect(context.Background(), "127.0.0.1")
+	if !errors.Is(err, limit.ErrRateLimited) {
+		t.Fatalf("expected rate limited error, got %v", err)
+	}
+	if decision.RetryAfter <= 0 {
+		t.Fatalf("expected positive retry after, got %v", decision.RetryAfter)
+	}
+
+	recorder := httptest.NewRecorder()
+	handler.writeConnectError(recorder, err, decision)
+
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d", recorder.Code)
+	}
+	if retryAfter := recorder.Header().Get("Retry-After"); retryAfter == "" {
+		t.Fatalf("expected Retry-After header")
+	}
+	if retryAfterMS := recorder.Header().Get("X-Retry-After-Ms"); retryAfterMS == "" {
+		t.Fatalf("expected X-Retry-After-Ms header")
 	}
 }
 

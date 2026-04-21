@@ -139,8 +139,27 @@ services:
       APP_REDIS_ADDR: redis:6379
       APP_REDIS_DB: "0"
       APP_JWT_SECRET: dev-only-change-me
-      APP_ACCESS_TTL_MINUTES: "15"
-      APP_REFRESH_TTL_HOURS: "720"
+      APP_ACCESS_TTL_MINUTES: "${APP_ACCESS_TTL_MINUTES:-15}"
+      APP_REFRESH_TTL_HOURS: "${APP_REFRESH_TTL_HOURS:-720}"
+      APP_OTP_START_WINDOW_MINUTES: "${APP_OTP_START_WINDOW_MINUTES:-10}"
+      APP_OTP_START_PER_PHONE_LIMIT: "${APP_OTP_START_PER_PHONE_LIMIT:-5}"
+      APP_OTP_START_PER_IP_LIMIT: "${APP_OTP_START_PER_IP_LIMIT:-20}"
+      APP_OTP_START_PER_SUBNET_LIMIT: "${APP_OTP_START_PER_SUBNET_LIMIT:-100}"
+      APP_OTP_VERIFY_WINDOW_MINUTES: "${APP_OTP_VERIFY_WINDOW_MINUTES:-10}"
+      APP_OTP_VERIFY_PER_CHALLENGE_LIMIT: "${APP_OTP_VERIFY_PER_CHALLENGE_LIMIT:-10}"
+      APP_OTP_VERIFY_PER_IP_LIMIT: "${APP_OTP_VERIFY_PER_IP_LIMIT:-50}"
+      APP_OTP_VERIFY_PER_DEVICE_LIMIT: "${APP_OTP_VERIFY_PER_DEVICE_LIMIT:-10}"
+      APP_OTP_VERIFY_PER_PHONE_LIMIT: "${APP_OTP_VERIFY_PER_PHONE_LIMIT:-10}"
+      APP_WS_CONNECT_WINDOW_SECONDS: "${APP_WS_CONNECT_WINDOW_SECONDS:-60}"
+      APP_WS_CONNECT_PER_IP_LIMIT: "${APP_WS_CONNECT_PER_IP_LIMIT:-60}"
+      APP_WS_CONNECT_BURST: "${APP_WS_CONNECT_BURST:-120}"
+      APP_SEND_RATE_WINDOW_SECONDS: "${APP_SEND_RATE_WINDOW_SECONDS:-10}"
+      APP_SEND_RATE_PER_USER: "${APP_SEND_RATE_PER_USER:-30}"
+      APP_SEND_RATE_USER_BURST: "${APP_SEND_RATE_USER_BURST:-60}"
+      APP_SEND_RATE_PER_CONVERSATION: "${APP_SEND_RATE_PER_CONVERSATION:-300}"
+      APP_SEND_RATE_CONVERSATION_BURST: "${APP_SEND_RATE_CONVERSATION_BURST:-500}"
+      APP_SEND_RATE_PER_IP: "${APP_SEND_RATE_PER_IP:-120}"
+      APP_SEND_RATE_IP_BURST: "${APP_SEND_RATE_IP_BURST:-240}"
       APP_USE_KAFKA_SEND: "true"
       APP_USE_CASSANDRA_READS: "false"
       APP_ENABLE_WS_SEND: "true"
@@ -164,6 +183,7 @@ services:
       context: ../../services/messages-processor
       dockerfile: Dockerfile
     container_name: ohmf-messages-processor
+    restart: on-failure
     depends_on:
       db:
         condition: service_healthy
@@ -194,6 +214,7 @@ services:
       context: ../../services/delivery-processor
       dockerfile: Dockerfile
     container_name: ohmf-delivery-processor
+    restart: on-failure
     depends_on:
       db:
         condition: service_healthy

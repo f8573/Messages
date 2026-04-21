@@ -5,11 +5,24 @@ param(
 Set-StrictMode -Version Latest
 $script:StartedPostgresMode = "external"
 
+function Write-Status([string]$Message) {
+    Write-Host $Message
+}
+
 function Find-Docker {
     if (Get-Command docker -ErrorAction SilentlyContinue) { return "docker" }
     $possible = "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe"
     if (Test-Path $possible) { return $possible }
     throw "docker not found. Ensure Docker Desktop is installed and running."
+}
+
+function Test-DockerDaemon([string]$DockerCommand) {
+    try {
+        & $DockerCommand version --format '{{.Server.Version}}' 2>$null | Out-Null
+        return $LASTEXITCODE -eq 0
+    } catch {
+        return $false
+    }
 }
 
 function Test-TcpPort([int]$Port) {
@@ -28,20 +41,29 @@ function Test-TcpPort([int]$Port) {
 
 function Start-Postgres {
     if ($env:TEST_DATABASE_URL -or $env:POSTGRES_URL -or $env:DB_DSN) {
-        Write-Output "External DB provided via environment; skipping postgres start."
+        Write-Status "External DB provided via environment; skipping postgres start."
         $script:StartedPostgresMode = "external"
         return $null
     }
     $docker = Find-Docker
-    Write-Output "Attempting to bring up postgres via docker compose..."
+    if (-not (Test-DockerDaemon $docker)) {
+        if (Test-TcpPort 5432) {
+            Write-Status "Docker daemon unavailable; using external Postgres on 127.0.0.1:5432."
+            $script:StartedPostgresMode = "external"
+            return $null
+        }
+        throw "Docker Desktop is not running and no external Postgres is available on 127.0.0.1:5432."
+    }
+
+    Write-Status "Attempting to bring up postgres via docker compose..."
     try {
         & $docker compose up -d postgres | Out-Null
         $cid = (& $docker compose ps -q postgres).Trim()
         $script:StartedPostgresMode = "compose"
     } catch {
-        Write-Output "No 'postgres' compose service or compose not available; starting standalone container..."
+        Write-Status "No 'postgres' compose service or compose not available; starting standalone container..."
         if (Test-TcpPort 5432) {
-            Write-Output "Port 5432 is already in use; assuming an external Postgres is available."
+            Write-Status "Port 5432 is already in use; assuming an external Postgres is available."
             $script:StartedPostgresMode = "external"
             return $null
         }
@@ -56,7 +78,7 @@ function Start-Postgres {
             $script:StartedPostgresMode = "standalone"
         } catch {
             if (Test-TcpPort 5432) {
-                Write-Output "Port 5432 is already in use; assuming an external Postgres is available."
+                Write-Status "Port 5432 is already in use; assuming an external Postgres is available."
                 $script:StartedPostgresMode = "external"
                 return $null
             }
@@ -66,11 +88,11 @@ function Start-Postgres {
 
     if (-not $cid) { throw "Could not determine postgres container id" }
 
-    Write-Output "Waiting for Postgres to accept connections..."
+    Write-Status "Waiting for Postgres to accept connections..."
     for ($i = 0; $i -lt 30; $i++) {
         try {
             & $docker exec $cid pg_isready -U dev -q | Out-Null
-            Write-Output "Postgres is ready"
+            Write-Status "Postgres is ready"
             return $cid
         } catch {
             Start-Sleep -Seconds 1
@@ -81,14 +103,23 @@ function Start-Postgres {
 
 function Stop-Postgres([string]$cid) {
     if ($script:StartedPostgresMode -eq "external") { return }
-    $docker = Get-Command docker -ErrorAction SilentlyContinue
-    if ($null -eq $docker) { Write-Output "docker CLI not found; skipping cleanup"; return }
+
+    try {
+        $docker = Find-Docker
+    } catch {
+        Write-Status "docker CLI not found; skipping cleanup"
+        return
+    }
+    if (-not (Test-DockerDaemon $docker)) {
+        Write-Status "Docker daemon unavailable; skipping cleanup."
+        return
+    }
 
     if ($script:StartedPostgresMode -eq "standalone") {
         try {
-            $id = (& docker ps -a -q -f name=ohmf_test_postgres).Trim()
+            $id = (& $docker ps -a -q -f name=ohmf_test_postgres).Trim()
             if ($id) {
-                & docker rm -f ohmf_test_postgres | Out-Null
+                & $docker rm -f ohmf_test_postgres | Out-Null
             }
         } catch {}
         return
@@ -96,10 +127,10 @@ function Stop-Postgres([string]$cid) {
 
     if ($script:StartedPostgresMode -eq "compose") {
         try {
-            $composeId = (& docker compose ps -q postgres) -join ""
+            $composeId = (& $docker compose ps -q postgres) -join ""
             if ($composeId) {
-                & docker compose stop postgres | Out-Null
-                & docker compose rm -f postgres | Out-Null
+                & $docker compose stop postgres | Out-Null
+                & $docker compose rm -f postgres | Out-Null
             }
         } catch {}
         return
@@ -115,17 +146,19 @@ try {
         if (Test-Path $localGo) { $goCmd = $localGo } elseif (Get-Command go -ErrorAction SilentlyContinue) { $goCmd = "go" } else { Write-Error "Go (go) is not on PATH and local ohmf/.tools/go/bin/go.exe not found."; exit 1 }
         # Run integration tests using compose itest service for proper networked environment
         $docker = Find-Docker
-        Write-Output "Starting compose itest for integration tests..."
+        Write-Status "Starting compose itest for integration tests..."
         & $docker compose up --build --abort-on-container-exit --exit-code-from itest itest
         $rc = $LASTEXITCODE
-        & $docker compose down -v | Out-Null
+        if (Test-DockerDaemon $docker) {
+            & $docker compose down -v | Out-Null
+        }
         if ($rc -ne 0) { exit $rc }
     } else {
         $cid = Start-Postgres
         $localGo = Join-Path -Path (Get-Location) -ChildPath "ohmf\.tools\go\bin\go.exe"
         if (Test-Path $localGo) { $goCmd = $localGo } elseif (Get-Command go -ErrorAction SilentlyContinue) { $goCmd = "go" } else { Write-Error "Go (go) is not on PATH and local ohmf/.tools/go/bin/go.exe not found."; exit 1 }
         Push-Location -Path .\ohmf
-        Write-Output "Running unit tests..."
+        Write-Status "Running unit tests..."
         & $goCmd test ./... -v
         $rc = $LASTEXITCODE
         Pop-Location

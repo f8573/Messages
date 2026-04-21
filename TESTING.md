@@ -19,6 +19,22 @@ List gates and suite-level tags:
 npm run test:list
 ```
 
+## Setup
+
+From the repository root:
+
+```powershell
+npm install
+```
+
+Install the Playwright browsers used by the mocked and live browser suites:
+
+```powershell
+npx playwright install chromium firefox webkit
+```
+
+The standardized `test:e2e` and `test:live` gates resolve Playwright from the root install. A separate `ohmf/apps/web/node_modules` directory is optional.
+
 ## Gate Definitions
 
 - `test:unit`: fast backend unit and contract coverage through the existing root Go test runner.
@@ -27,7 +43,7 @@ npm run test:list
 - `test:e2e`: mocked Playwright coverage for deterministic browser flows.
 - `test:live`: live Playwright coverage against a running OHMF stack. Requires a reachable API and frontend.
 - `test:perf`: targeted race detection and benchmark coverage for gateway realtime, messaging, and E2EE paths.
-- `test:stress`: stateful end-to-end messaging validation with real users, linked devices, WebSockets, persistence checks, and report artifacts under [testing/stress/](C:/Users/James/Downloads/Messages/testing/stress).
+- `test:stress`: stateful end-to-end messaging validation with real users, linked devices, WebSockets, persistence checks, realistic send-failure scenarios (`send-abort`, `high-latency-link`, `block-race`), and report artifacts under [testing/stress/](C:/Users/James/Downloads/Messages/testing/stress).
 - `test:staging`: staging/manual signoff gate. Prints the release checklist by default and optionally runs automation first when `OHMF_RUN_STAGING_AUTOMATION=1`.
 
 Important:
@@ -46,10 +62,15 @@ These variables are the supported inputs for the standardized gates:
 | `OHMF_API_BASE_URL` | Overrides the gateway base URL for web live tests. |
 | `OHMF_E2E_BASE_URL` | Overrides the frontend base URL for Playwright. |
 | `OHMF_STRESS_BASE_URL` | Gateway base URL for the stress harness. Defaults to `OHMF_API_BASE_URL` or `http://127.0.0.1:18080`. |
-| `OHMF_STRESS_SCENARIO` | Stress scenario selector: `smoke`, `throughput`, or `reconnect`. |
+| `OHMF_STRESS_SCENARIO` | Stress scenario selector: `smoke`, `throughput`, `reconnect`, `connect`, `reconnect-storm`, `send-abort`, `high-latency-link`, or `block-race`. |
 | `OHMF_STRESS_WS_VERSION` | Stress websocket mode: `v1` or `v2`. |
 | `OHMF_STRESS_USERS` / `OHMF_STRESS_DEVICES_PER_USER` | Logical user and linked-device counts for the stress harness. |
 | `OHMF_STRESS_MESSAGES` / `OHMF_STRESS_RATE` / `OHMF_STRESS_DURATION_MS` | Message volume and rate controls for stress runs. |
+| `OHMF_STRESS_HOLD_MS` / `OHMF_STRESS_CONNECT_TIMEOUT_MS` | Connection-ramp hold duration and websocket handshake timeout for `connect` and reconnect-storm runs. |
+| `OHMF_STRESS_RECONNECT_STORM_SIZE` / `OHMF_STRESS_RECONNECT_BATCH_SIZE` / `OHMF_STRESS_RECONNECT_BATCH_INTERVAL_MS` / `OHMF_STRESS_RECONNECT_PAUSE_MS` | Controls coordinated disconnect and reconnect storms. |
+| `OHMF_STRESS_RACE_ITERATIONS` | Number of concurrent send-vs-block races to run in the `block-race` scenario. |
+| `OHMF_STRESS_FAULT_REQUEST_DELAY_MS` / `OHMF_STRESS_FAULT_RESPONSE_DELAY_MS` / `OHMF_STRESS_FAULT_RETRY_DELAY_MS` | Local fault-proxy timing controls for `send-abort` and `high-latency-link`. |
+| `OHMF_STRESS_TOPOLOGY_FILE` | Reusable topology file for saved device ids and access tokens so reconnect-storm runs can skip OTP provisioning. |
 | `OHMF_STRESS_METRICS_URLS` | Comma-separated list of raw metrics endpoints to snapshot before and after a stress run. |
 | `OHMF_STRESS_REPORT_DIR` | Overrides the output directory for stress reports. |
 | `OHMF_STRESS_DRY_RUN` | When set to `1`, resolves the stress configuration and exits without hitting the stack. |

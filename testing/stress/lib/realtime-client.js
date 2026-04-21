@@ -3,6 +3,30 @@
 const { EventEmitter } = require("node:events");
 const WebSocket = require("ws");
 
+function parseRetryAfterMs(headers = {}) {
+  const explicitMs = Number(headers["x-retry-after-ms"]);
+  if (Number.isFinite(explicitMs) && explicitMs > 0) {
+    return explicitMs;
+  }
+
+  const retryAfter = headers["retry-after"];
+  if (!retryAfter) {
+    return null;
+  }
+
+  const seconds = Number(retryAfter);
+  if (Number.isFinite(seconds) && seconds > 0) {
+    return Math.round(seconds * 1000);
+  }
+
+  const retryAt = Date.parse(String(retryAfter));
+  if (Number.isFinite(retryAt)) {
+    return Math.max(0, retryAt - Date.now());
+  }
+
+  return null;
+}
+
 class RealtimeClient extends EventEmitter {
   constructor(options) {
     super();
@@ -20,6 +44,7 @@ class RealtimeClient extends EventEmitter {
     this.lastAckedCursor = 0;
     this.helloComplete = false;
     this.closingIntentionally = false;
+    this.handshakeFailure = false;
   }
 
   websocketURL() {
@@ -38,20 +63,37 @@ class RealtimeClient extends EventEmitter {
     const resumeCursor = Number.isFinite(options.resumeCursor)
       ? Number(options.resumeCursor)
       : this.lastAckedCursor;
+    const timeoutMs = Number.isFinite(options.timeoutMs)
+      ? Number(options.timeoutMs)
+      : 10000;
 
     const socket = new WebSocket(this.websocketURL());
     this.socket = socket;
     this.closed = false;
     this.helloComplete = this.wsVersion === "v1";
+    this.handshakeFailure = false;
 
     return new Promise((resolve, reject) => {
       let settled = false;
+      const connectTimer = timeoutMs > 0
+        ? setTimeout(() => {
+            try {
+              socket.terminate();
+            } catch {
+              // Ignore termination failures during timeout cleanup.
+            }
+            finish(new Error(`${this.label} connect timed out after ${timeoutMs}ms`));
+          }, timeoutMs)
+        : null;
 
       const finish = (error) => {
         if (settled) {
           return;
         }
         settled = true;
+        if (connectTimer) {
+          clearTimeout(connectTimer);
+        }
         if (error) {
           reject(error);
           return;
@@ -88,8 +130,28 @@ class RealtimeClient extends EventEmitter {
         }
       });
 
+      socket.on("unexpected-response", (_request, response) => {
+        this.handshakeFailure = true;
+        const retryAfterMs = parseRetryAfterMs(response?.headers || {});
+        const error = new Error(
+          retryAfterMs
+            ? `Unexpected server response: ${response.statusCode} retry_after_ms=${retryAfterMs}`
+            : `Unexpected server response: ${response.statusCode}`
+        );
+        error.status = response.statusCode;
+        if (Number.isFinite(retryAfterMs)) {
+          error.retryAfterMs = retryAfterMs;
+        }
+        if (response?.resume) {
+          response.resume();
+        }
+        finish(error);
+      });
+
       socket.on("error", (error) => {
-        this.emit("transport-error", error);
+        if (!this.handshakeFailure) {
+          this.emit("transport-error", error);
+        }
         if (!settled) {
           finish(error);
         }
@@ -105,8 +167,10 @@ class RealtimeClient extends EventEmitter {
         this.emit("closed", {
           code,
           reason,
+          handshakeFailure: this.handshakeFailure,
           intentional,
         });
+        this.handshakeFailure = false;
         if (!settled) {
           finish(new Error(`${this.label} socket closed before ready (${code} ${reason})`));
         }
@@ -212,30 +276,87 @@ class RealtimeClient extends EventEmitter {
 
   async disconnect(options = {}) {
     if (!this.socket) {
+      this.closed = true;
       return;
     }
     const code = Number.isFinite(options.code) ? Number(options.code) : 1000;
     const reason = String(options.reason || "client_disconnect");
+    const timeoutMs = Number.isFinite(options.timeoutMs) ? Number(options.timeoutMs) : 1000;
     const socket = this.socket;
     this.closingIntentionally = true;
 
     await new Promise((resolve) => {
       if (socket.readyState === WebSocket.CLOSED) {
+        this.socket = null;
+        this.closed = true;
+        this.helloComplete = false;
         resolve();
         return;
       }
       let resolved = false;
+      let timeout = null;
       const finish = () => {
         if (resolved) {
           return;
         }
         resolved = true;
+        if (timeout) {
+          clearTimeout(timeout);
+        }
+        if (this.socket === socket) {
+          this.socket = null;
+        }
+        this.closed = true;
+        this.helloComplete = false;
         resolve();
       };
       socket.once("close", finish);
-      socket.close(code, reason);
-      setTimeout(finish, 1000);
+      socket.once("error", finish);
+      timeout = setTimeout(() => {
+        try {
+          socket.terminate();
+        } catch {
+          // Ignore termination failures during forced disconnect cleanup.
+        }
+        finish();
+      }, Math.max(0, timeoutMs));
+      try {
+        if (socket.readyState === WebSocket.CONNECTING) {
+          socket.terminate();
+          return;
+        }
+        socket.close(code, reason);
+      } catch {
+        try {
+          socket.terminate();
+        } catch {
+          // Ignore termination failures during forced disconnect cleanup.
+        }
+        finish();
+      }
     });
+  }
+
+  forceClose() {
+    const socket = this.socket;
+    this.closingIntentionally = true;
+    this.socket = null;
+    this.closed = true;
+    this.helloComplete = false;
+    this.handshakeFailure = false;
+    if (!socket) {
+      return;
+    }
+    try {
+      socket.removeAllListeners();
+    } catch {
+      // Ignore listener cleanup failures during forced socket teardown.
+    }
+    try {
+      socket.terminate();
+    } catch {
+      // Ignore termination failures during forced socket teardown.
+    }
   }
 
   async reconnect(options = {}) {
@@ -244,6 +365,7 @@ class RealtimeClient extends EventEmitter {
       reason: "client_reconnect",
     });
     return this.connect({
+      timeoutMs: Number.isFinite(options.timeoutMs) ? Number(options.timeoutMs) : undefined,
       resumeCursor: Number.isFinite(options.resumeCursor)
         ? Number(options.resumeCursor)
         : this.lastAckedCursor,

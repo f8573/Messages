@@ -11,6 +11,7 @@ test.describe("group details and attachment draft", () => {
     await page.locator(".thread-item").filter({
       has: page.locator(".thread-name", { hasText: "Project Nightfall" })
     }).click();
+    await page.locator("#conversation-settings-btn").click();
     await page.locator("#group-details-btn").click();
 
     await expect(page.locator("#group-manager-name")).toContainText("Project Nightfall");

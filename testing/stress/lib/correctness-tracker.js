@@ -42,6 +42,7 @@ class CorrectnessTracker {
     this.scenario = options.scenario || "unknown";
     this.wsVersion = options.wsVersion || "v1";
     this.messages = new Map();
+    this.pendingReceipts = new Map();
     this.sendFailures = [];
     this.clientErrors = [];
     this.deliveryUpdates = [];
@@ -80,6 +81,13 @@ class CorrectnessTracker {
       unexpectedReceiptCount: 0,
     };
     this.messages.set(record.messageId, record);
+    const pendingReceipts = this.pendingReceipts.get(record.messageId) || [];
+    if (pendingReceipts.length) {
+      this.pendingReceipts.delete(record.messageId);
+      for (const receipt of pendingReceipts) {
+        this.noteReceipt(record.messageId, receipt);
+      }
+    }
     return record;
   }
 
@@ -133,11 +141,9 @@ class CorrectnessTracker {
     };
 
     if (!record) {
-      this.unexpectedReceipts.push({
-        messageId,
-        reason: "unknown_message",
-        ...normalized,
-      });
+      const pending = this.pendingReceipts.get(messageId) || [];
+      pending.push(normalized);
+      this.pendingReceipts.set(messageId, pending);
       return;
     }
 

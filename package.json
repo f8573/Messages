@@ -12,7 +12,9 @@
     "test:staging": "node ./scripts/test-gates.js staging"
   },
   "dependencies": {
-    "playwright": "^1.58.2",
     "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.58.2"
   }
 }

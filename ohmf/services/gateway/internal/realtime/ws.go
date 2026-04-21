@@ -33,14 +33,18 @@ type miniappServiceInterface interface {
 }
 
 type Handler struct {
-	tokens         *token.Service
-	messages       *messages.Service
-	miniappService any // P4.3: Mini-app service for session validation (avoids circular import)
-	redis          *redis.Client
-	limiter        *limit.TokenBucket
-	enableSend     bool
-	replication    *replication.Store
-	upgrader       websocket.Upgrader
+	tokens          *token.Service
+	messages        *messages.Service
+	miniappService  any // P4.3: Mini-app service for session validation (avoids circular import)
+	redis           *redis.Client
+	limiter         *limit.TokenBucket
+	enableSend      bool
+	replication     *replication.Store
+	wsConnectRate   int64
+	wsConnectBurst  int64
+	wsConnectCost   int64
+	wsConnectWindow time.Duration
+	upgrader        websocket.Upgrader
 
 	mu      sync.RWMutex
 	clients map[string]map[*client]struct{}
@@ -110,13 +114,17 @@ func NewHandlerReadOnly(tokens *token.Service, messageService *messages.Service,
 
 func newHandlerInternal(tokens *token.Service, messageService *messages.Service, redisClient *redis.Client, limiter *limit.TokenBucket, enableSend bool, store *replication.Store, miniappService any) *Handler {
 	return &Handler{
-		tokens:         tokens,
-		messages:       messageService,
-		miniappService: miniappService,
-		redis:          redisClient,
-		limiter:        limiter,
-		enableSend:     enableSend,
-		replication:    store,
+		tokens:          tokens,
+		messages:        messageService,
+		miniappService:  miniappService,
+		redis:           redisClient,
+		limiter:         limiter,
+		enableSend:      enableSend,
+		replication:     store,
+		wsConnectRate:   60,
+		wsConnectBurst:  120,
+		wsConnectCost:   1,
+		wsConnectWindow: time.Minute,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(_ *http.Request) bool { return true },
 		},
@@ -124,11 +132,20 @@ func newHandlerInternal(tokens *token.Service, messageService *messages.Service,
 	}
 }
 
+func (h *Handler) SetConnectRateLimit(refillTokens int64, refillWindow time.Duration, burst int64) {
+	h.wsConnectRate = refillTokens
+	h.wsConnectWindow = refillWindow
+	h.wsConnectBurst = burst
+	if h.wsConnectCost <= 0 {
+		h.wsConnectCost = 1
+	}
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	ip := ipOnly(r.RemoteAddr)
-	if err := h.allowConnect(ctx, ip); err != nil {
-		http.Error(w, "rate_limited", http.StatusTooManyRequests)
+	if decision, err := h.allowConnect(ctx, ip); err != nil {
+		h.writeConnectError(w, err, decision)
 		return
 	}
 
@@ -177,8 +194,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) ServeV2(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	ip := ipOnly(r.RemoteAddr)
-	if err := h.allowConnect(ctx, ip); err != nil {
-		http.Error(w, "rate_limited", http.StatusTooManyRequests)
+	if decision, err := h.allowConnect(ctx, ip); err != nil {
+		h.writeConnectError(w, err, decision)
 		return
 	}
 	userID, err := h.authenticate(r)
@@ -208,18 +225,37 @@ func (h *Handler) ServeV2(w http.ResponseWriter, r *http.Request) {
 	h.readLoopV2(c, ip)
 }
 
-func (h *Handler) allowConnect(ctx context.Context, ip string) error {
-	if h.limiter == nil {
-		return nil
+func (h *Handler) allowConnect(ctx context.Context, ip string) (limit.Decision, error) {
+	if h.limiter == nil || h.wsConnectRate <= 0 || h.wsConnectBurst <= 0 || h.wsConnectWindow <= 0 {
+		return limit.Decision{Allowed: true}, nil
 	}
-	decision, err := h.limiter.Allow(ctx, "rate:ws:connect:ip:"+ip, 60, time.Minute, 120, 1)
+	decision, err := h.limiter.Allow(ctx, "rate:ws:connect:ip:"+ip, h.wsConnectRate, h.wsConnectWindow, h.wsConnectBurst, h.wsConnectCost)
 	if err != nil {
-		return err
+		return decision, err
 	}
 	if !decision.Allowed {
-		return limit.ErrRateLimited
+		return decision, limit.ErrRateLimited
 	}
-	return nil
+	return decision, nil
+}
+
+func (h *Handler) writeConnectError(w http.ResponseWriter, err error, decision limit.Decision) {
+	if errors.Is(err, limit.ErrRateLimited) {
+		if decision.RetryAfter > 0 {
+			retryAfterSeconds := int64(decision.RetryAfter / time.Second)
+			if decision.RetryAfter%time.Second != 0 {
+				retryAfterSeconds += 1
+			}
+			if retryAfterSeconds <= 0 {
+				retryAfterSeconds = 1
+			}
+			w.Header().Set("Retry-After", strconv.FormatInt(retryAfterSeconds, 10))
+			w.Header().Set("X-Retry-After-Ms", strconv.FormatInt(decision.RetryAfter.Milliseconds(), 10))
+		}
+		http.Error(w, "rate_limited", http.StatusTooManyRequests)
+		return
+	}
+	http.Error(w, "rate_limit_unavailable", http.StatusServiceUnavailable)
 }
 
 func (h *Handler) authenticate(r *http.Request) (string, error) {

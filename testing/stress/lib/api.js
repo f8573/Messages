@@ -18,9 +18,9 @@ async function parseResponse(response) {
 
 function buildPhone(runID, suffix) {
   const digits = String(runID || "").replace(/\D/g, "");
-  const core = digits.slice(-4).padStart(4, "0");
-  const tail = String(suffix).padStart(3, "0").slice(-3);
-  return `+1555${core}${tail}`;
+  const areaCode = String(200 + (Number(digits.slice(-3) || "0") % 700)).padStart(3, "0");
+  const code = String(Number(suffix) || 0).padStart(6, "0").slice(-6);
+  return `+1${areaCode}4${code}`;
 }
 
 function makeHeaders(bearerToken = "", extra = {}) {
@@ -33,7 +33,38 @@ function makeHeaders(bearerToken = "", extra = {}) {
 
 async function requestJSON(baseURL, path, options = {}) {
   const url = `${normalizeBaseURL(baseURL)}${path}`;
-  const response = await fetch(url, options);
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  const timeoutMs = Number.isFinite(options.timeoutMs) ? Number(options.timeoutMs) : 0;
+  const timeout = controller && timeoutMs > 0
+    ? setTimeout(() => controller.abort(new Error(`request timeout after ${timeoutMs}ms`)), timeoutMs)
+    : null;
+  const fetchOptions = {
+    ...options,
+  };
+  delete fetchOptions.timeoutMs;
+  if (controller) {
+    fetchOptions.signal = controller.signal;
+  }
+
+  let response = null;
+  try {
+    response = await fetch(url, fetchOptions);
+  } catch (error) {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+    if (error?.name === "AbortError" || /timeout/i.test(String(error?.message || ""))) {
+      const timeoutError = new Error(`request_timeout ${path} after ${timeoutMs}ms`);
+      timeoutError.code = "REQUEST_TIMEOUT";
+      timeoutError.timeoutMs = timeoutMs;
+      timeoutError.url = url;
+      throw timeoutError;
+    }
+    throw error;
+  }
+  if (timeout) {
+    clearTimeout(timeout);
+  }
   const body = await parseResponse(response);
   if (!response.ok) {
     const message = body?.message || body?.code || JSON.stringify(body);
@@ -59,20 +90,22 @@ async function requestText(url, options = {}) {
   return body;
 }
 
-async function postJSON(baseURL, path, body, bearerToken = "") {
+async function postJSON(baseURL, path, body, bearerToken = "", options = {}) {
   return requestJSON(baseURL, path, {
     method: "POST",
     headers: makeHeaders(bearerToken, {
       "Content-Type": "application/json",
     }),
     body: JSON.stringify(body),
+    timeoutMs: options.timeoutMs,
   });
 }
 
-async function getJSON(baseURL, path, bearerToken = "") {
+async function getJSON(baseURL, path, bearerToken = "", options = {}) {
   return requestJSON(baseURL, path, {
     method: "GET",
     headers: makeHeaders(bearerToken),
+    timeoutMs: options.timeoutMs,
   });
 }
 
@@ -130,32 +163,64 @@ async function createUserWithDevices(baseURL, phoneE164, deviceCount, label) {
   };
 }
 
-async function createDirectConversation(baseURL, accessToken, participantUserID) {
+async function createDirectConversation(baseURL, accessToken, participantUserID, options = {}) {
   const response = await postJSON(baseURL, "/v1/conversations", {
     type: "DM",
     participants: [participantUserID],
-  }, accessToken);
+  }, accessToken, options);
   return {
     conversationId: response?.conversation_id || "",
     raw: response,
   };
 }
 
-async function sendTextMessage(baseURL, accessToken, conversationID, text, idempotencyKey) {
+async function blockUser(baseURL, accessToken, targetUserID, options = {}) {
+  return requestJSON(baseURL, `/v1/blocks/${encodeURIComponent(targetUserID)}`, {
+    method: "POST",
+    headers: makeHeaders(accessToken, {
+      "Content-Type": "application/json",
+    }),
+    body: JSON.stringify({
+      user_id: targetUserID,
+    }),
+    timeoutMs: options.timeoutMs,
+  });
+}
+
+async function unblockUser(baseURL, accessToken, targetUserID, options = {}) {
+  return requestJSON(baseURL, `/v1/blocks/${encodeURIComponent(targetUserID)}`, {
+    method: "DELETE",
+    headers: makeHeaders(accessToken),
+    timeoutMs: options.timeoutMs,
+  });
+}
+
+async function sendTextMessage(baseURL, accessToken, conversationID, text, idempotencyKey, options = {}) {
   return postJSON(baseURL, "/v1/messages", {
     conversation_id: conversationID,
     idempotency_key: idempotencyKey,
     content_type: "text",
     content: { text },
-  }, accessToken);
+  }, accessToken, options);
 }
 
-async function listConversationMessages(baseURL, accessToken, conversationID) {
-  return getJSON(baseURL, `/v1/conversations/${conversationID}/messages`, accessToken);
+async function listConversationMessages(baseURL, accessToken, conversationID, options = {}) {
+  return getJSON(baseURL, `/v1/conversations/${conversationID}/messages`, accessToken, options);
 }
 
 async function listMessageDeliveries(baseURL, accessToken, messageID) {
   return getJSON(baseURL, `/v1/messages/${messageID}/deliveries`, accessToken);
+}
+
+async function refreshAuthTokens(baseURL, refreshToken, options = {}) {
+  const response = await postJSON(baseURL, "/v1/auth/refresh", {
+    refresh_token: refreshToken,
+  }, "", options);
+  return {
+    accessToken: response?.tokens?.access_token || "",
+    refreshToken: response?.tokens?.refresh_token || "",
+    raw: response,
+  };
 }
 
 function sleep(ms) {
@@ -189,8 +254,10 @@ async function poll(check, options = {}) {
 }
 
 module.exports = {
+  blockUser,
   buildPhone,
   createDirectConversation,
+  refreshAuthTokens,
   createUserWithDevices,
   createVerifiedDevice,
   listConversationMessages,
@@ -199,4 +266,5 @@ module.exports = {
   requestText,
   sendTextMessage,
   sleep,
+  unblockUser,
 };

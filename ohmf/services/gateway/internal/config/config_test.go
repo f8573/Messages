@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestLoadIncludesSecurityTunables(t *testing.T) {
 	t.Setenv("APP_DISCOVERY_MAX_CONTACTS", "128")
@@ -8,6 +11,9 @@ func TestLoadIncludesSecurityTunables(t *testing.T) {
 	t.Setenv("APP_OTP_START_PER_PHONE_LIMIT", "3")
 	t.Setenv("APP_OTP_VERIFY_PER_PHONE_LIMIT", "4")
 	t.Setenv("APP_OTP_VERIFY_WINDOW_MINUTES", "12")
+	t.Setenv("APP_WS_CONNECT_WINDOW_SECONDS", "30")
+	t.Setenv("APP_WS_CONNECT_PER_IP_LIMIT", "25")
+	t.Setenv("APP_WS_CONNECT_BURST", "50")
 
 	cfg := Load()
 	if cfg.DiscoveryMaxContacts != 128 {
@@ -24,6 +30,15 @@ func TestLoadIncludesSecurityTunables(t *testing.T) {
 	}
 	if cfg.OTPVerifyWindow.Minutes() != 12 {
 		t.Fatalf("expected OTP verify window 12 minutes, got %v", cfg.OTPVerifyWindow)
+	}
+	if cfg.WSConnectWindow != 30*time.Second {
+		t.Fatalf("expected ws connect window 30s, got %v", cfg.WSConnectWindow)
+	}
+	if cfg.WSConnectPerIPLimit != 25 {
+		t.Fatalf("expected ws connect per ip limit 25, got %d", cfg.WSConnectPerIPLimit)
+	}
+	if cfg.WSConnectBurst != 50 {
+		t.Fatalf("expected ws connect burst 50, got %d", cfg.WSConnectBurst)
 	}
 }
 

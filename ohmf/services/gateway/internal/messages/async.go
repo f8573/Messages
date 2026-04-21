@@ -13,6 +13,8 @@ import (
 
 const (
 	ackKeyPrefix = "msg:ack:"
+	ackPollDelay = 50 * time.Millisecond
+	ackPollLimit = 250 * time.Millisecond
 )
 
 type IngressEvent struct {
@@ -78,7 +80,13 @@ func (p *AsyncPipeline) WaitAck(ctx context.Context, eventID string, timeout tim
 	key := ackKeyPrefix + eventID
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		payload, err := p.redis.Get(ctx, key).Result()
+		pollTimeout := ackPollLimit
+		if remaining := time.Until(deadline); remaining > 0 && remaining < pollTimeout {
+			pollTimeout = remaining
+		}
+		pollCtx, cancel := context.WithTimeout(ctx, pollTimeout)
+		payload, err := p.redis.Get(pollCtx, key).Result()
+		cancel()
 		if err == nil {
 			var ack PersistedAck
 			if uErr := json.Unmarshal([]byte(payload), &ack); uErr != nil {
@@ -86,13 +94,16 @@ func (p *AsyncPipeline) WaitAck(ctx context.Context, eventID string, timeout tim
 			}
 			return ack, true, nil
 		}
-		if err != nil && err != redis.Nil {
-			return PersistedAck{}, false, err
+		if ctx.Err() != nil {
+			return PersistedAck{}, false, ctx.Err()
 		}
+		// Ack lookup is best-effort. If Redis is briefly unavailable while the
+		// async worker is still recovering, fall back to the queued response
+		// instead of failing the entire send request.
 		select {
 		case <-ctx.Done():
 			return PersistedAck{}, false, ctx.Err()
-		case <-time.After(50 * time.Millisecond):
+		case <-time.After(ackPollDelay):
 		}
 	}
 	return PersistedAck{}, false, nil

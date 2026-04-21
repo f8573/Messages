@@ -17,6 +17,7 @@ import (
 	"ohmf/services/gateway/internal/e2ee"
 	"ohmf/services/gateway/internal/limit"
 	"ohmf/services/gateway/internal/middleware"
+	"ohmf/services/gateway/internal/observability"
 	"ohmf/services/gateway/internal/replication"
 )
 
@@ -58,14 +59,21 @@ type SendResult struct {
 }
 
 type Options struct {
-	UseKafkaSend      bool
-	UseCassandraReads bool
-	AckTimeout        time.Duration
-	Async             *AsyncPipeline
-	Cassandra         *CassandraStore
-	RateLimiter       *limit.TokenBucket
-	Redis             *redis.Client
-	Replication       *replication.Store
+	UseKafkaSend              bool
+	UseCassandraReads         bool
+	AckTimeout                time.Duration
+	Async                     *AsyncPipeline
+	Cassandra                 *CassandraStore
+	RateLimiter               *limit.TokenBucket
+	SendRateWindow            time.Duration
+	SendRatePerUser           int64
+	SendRateUserBurst         int64
+	SendRatePerConversation   int64
+	SendRateConversationBurst int64
+	SendRatePerIP             int64
+	SendRateIPBurst           int64
+	Redis                     *redis.Client
+	Replication               *replication.Store
 }
 
 type DB interface {
@@ -80,15 +88,22 @@ type rowQuerier interface {
 }
 
 type Service struct {
-	db                DB
-	useKafkaSend      bool
-	useCassandraReads bool
-	ackTimeout        time.Duration
-	async             *AsyncPipeline
-	cassandra         *CassandraStore
-	rateLimiter       *limit.TokenBucket
-	redis             *redis.Client
-	replication       *replication.Store
+	db                        DB
+	useKafkaSend              bool
+	useCassandraReads         bool
+	ackTimeout                time.Duration
+	async                     *AsyncPipeline
+	cassandra                 *CassandraStore
+	rateLimiter               *limit.TokenBucket
+	sendRateWindow            time.Duration
+	sendRatePerUser           int64
+	sendRateUserBurst         int64
+	sendRatePerConversation   int64
+	sendRateConversationBurst int64
+	sendRatePerIP             int64
+	sendRateIPBurst           int64
+	redis                     *redis.Client
+	replication               *replication.Store
 }
 
 type DeliveryRecord struct {
@@ -1435,16 +1450,51 @@ func NewService(db DB, opts Options) *Service {
 	if ackTimeout <= 0 {
 		ackTimeout = 2 * time.Second
 	}
+	sendRateWindow := opts.SendRateWindow
+	if sendRateWindow <= 0 {
+		sendRateWindow = 10 * time.Second
+	}
+	sendRatePerUser := opts.SendRatePerUser
+	if sendRatePerUser <= 0 {
+		sendRatePerUser = 30
+	}
+	sendRateUserBurst := opts.SendRateUserBurst
+	if sendRateUserBurst <= 0 {
+		sendRateUserBurst = 60
+	}
+	sendRatePerConversation := opts.SendRatePerConversation
+	if sendRatePerConversation <= 0 {
+		sendRatePerConversation = 300
+	}
+	sendRateConversationBurst := opts.SendRateConversationBurst
+	if sendRateConversationBurst <= 0 {
+		sendRateConversationBurst = 500
+	}
+	sendRatePerIP := opts.SendRatePerIP
+	if sendRatePerIP <= 0 {
+		sendRatePerIP = 120
+	}
+	sendRateIPBurst := opts.SendRateIPBurst
+	if sendRateIPBurst <= 0 {
+		sendRateIPBurst = 240
+	}
 	return &Service{
-		db:                db,
-		useKafkaSend:      opts.UseKafkaSend,
-		useCassandraReads: opts.UseCassandraReads,
-		ackTimeout:        ackTimeout,
-		async:             opts.Async,
-		cassandra:         opts.Cassandra,
-		rateLimiter:       opts.RateLimiter,
-		redis:             opts.Redis,
-		replication:       opts.Replication,
+		db:                        db,
+		useKafkaSend:              opts.UseKafkaSend,
+		useCassandraReads:         opts.UseCassandraReads,
+		ackTimeout:                ackTimeout,
+		async:                     opts.Async,
+		cassandra:                 opts.Cassandra,
+		rateLimiter:               opts.RateLimiter,
+		sendRateWindow:            sendRateWindow,
+		sendRatePerUser:           sendRatePerUser,
+		sendRateUserBurst:         sendRateUserBurst,
+		sendRatePerConversation:   sendRatePerConversation,
+		sendRateConversationBurst: sendRateConversationBurst,
+		sendRatePerIP:             sendRatePerIP,
+		sendRateIPBurst:           sendRateIPBurst,
+		redis:                     opts.Redis,
+		replication:               opts.Replication,
 	}
 }
 
@@ -1731,55 +1781,125 @@ func (s *Service) SendToPhone(ctx context.Context, userID, senderDeviceID, phone
 	return SendResult{Message: msg}, nil
 }
 
-func (s *Service) sendAsync(ctx context.Context, userID, conversationID, idemKey, contentType string, content map[string]any, clientGeneratedID, transportIntent, phoneE164, endpoint, traceID string) (SendResult, error) {
-	if ok, err := s.hasMembership(ctx, s.db, userID, conversationID); err != nil {
+func (s *Service) sendAsync(ctx context.Context, userID, conversationID, idemKey, contentType string, content map[string]any, clientGeneratedID, transportIntent, phoneE164, endpoint, traceID string) (result SendResult, err error) {
+	const slowSendAsyncThreshold = 5 * time.Second
+
+	startedAt := time.Now()
+	hasMembershipMS := int64(0)
+	blockCheckMS := int64(0)
+	loadIdempotencyMS := int64(0)
+	upsertQueuedMS := int64(0)
+	publishIngressMS := int64(0)
+	waitAckMS := int64(0)
+	upsertPersistedMS := int64(0)
+	cachedStatus := 0
+	ackReceived := false
+	defer func() {
+		total := time.Since(startedAt)
+		if err == nil && total < slowSendAsyncThreshold {
+			return
+		}
+		fields := map[string]any{
+			"trace_id":            traceID,
+			"conversation_id":     conversationID,
+			"sender_user_id":      userID,
+			"endpoint":            endpoint,
+			"queued":              result.Queued,
+			"cached_status":       cachedStatus,
+			"ack_received":        ackReceived,
+			"total_ms":            total.Milliseconds(),
+			"has_membership_ms":   hasMembershipMS,
+			"block_check_ms":      blockCheckMS,
+			"load_idempotency_ms": loadIdempotencyMS,
+			"upsert_queued_ms":    upsertQueuedMS,
+			"publish_ingress_ms":  publishIngressMS,
+			"wait_ack_ms":         waitAckMS,
+			"upsert_persisted_ms": upsertPersistedMS,
+		}
+		if err != nil {
+			fields["error"] = err.Error()
+		}
+		observability.EmitEvent("message.send_async.timing", fields)
+	}()
+
+	stageStartedAt := time.Now()
+	ok, hasMembershipErr := s.hasMembership(ctx, s.db, userID, conversationID)
+	hasMembershipMS = time.Since(stageStartedAt).Milliseconds()
+	if hasMembershipErr != nil {
+		err = hasMembershipErr
 		return SendResult{}, err
-	} else if !ok {
-		return SendResult{}, ErrConversationAccess
+	}
+	if !ok {
+		err = ErrConversationAccess
+		return SendResult{}, err
 	}
 
-	if blocked, _, err := s.checkBlockedRecipients(ctx, s.db, userID, conversationID); err != nil {
+	stageStartedAt = time.Now()
+	blocked, _, blockedErr := s.checkBlockedRecipients(ctx, s.db, userID, conversationID)
+	blockCheckMS = time.Since(stageStartedAt).Milliseconds()
+	if blockedErr != nil {
+		err = blockedErr
 		return SendResult{}, err
-	} else if blocked {
-		return SendResult{}, ErrConversationBlocked
+	}
+	if blocked {
+		err = ErrConversationBlocked
+		return SendResult{}, err
 	}
 
-	cached, cachedStatus, err := s.loadIdempotency(ctx, userID, endpoint, idemKey)
-	if err != nil {
+	stageStartedAt = time.Now()
+	cached, statusCode, loadErr := s.loadIdempotency(ctx, userID, endpoint, idemKey)
+	loadIdempotencyMS = time.Since(stageStartedAt).Milliseconds()
+	cachedStatus = statusCode
+	if loadErr != nil {
+		err = loadErr
 		return SendResult{}, err
 	}
 	if cached != nil {
-		if cachedStatus == 202 {
-			return SendResult{
+		if statusCode == 202 {
+			result = SendResult{
 				Message:      *cached,
 				Queued:       true,
 				AckTimeoutMS: s.ackTimeout.Milliseconds(),
-			}, nil
+			}
+			return result, nil
 		}
-		return SendResult{Message: *cached}, nil
+		result = SendResult{Message: *cached}
+		return result, nil
 	}
 
 	evt := NewIngressEvent(userID, conversationID, endpoint, idemKey, contentType, transportIntent, phoneE164, clientGeneratedID, traceID, content)
 	provisional := evt.ProvisionalMessage()
 
-	if err := s.upsertIdempotency(ctx, userID, endpoint, idemKey, provisional, 202); err != nil {
+	stageStartedAt = time.Now()
+	if err = s.upsertIdempotency(ctx, userID, endpoint, idemKey, provisional, 202); err != nil {
+		upsertQueuedMS = time.Since(stageStartedAt).Milliseconds()
 		return SendResult{}, err
 	}
-	if err := s.async.PublishIngress(ctx, evt); err != nil {
-		return SendResult{}, err
-	}
+	upsertQueuedMS = time.Since(stageStartedAt).Milliseconds()
 
-	ack, ok, err := s.async.WaitAck(ctx, evt.EventID, s.ackTimeout)
-	if err != nil {
+	stageStartedAt = time.Now()
+	if err = s.async.PublishIngress(ctx, evt); err != nil {
+		publishIngressMS = time.Since(stageStartedAt).Milliseconds()
+		return SendResult{}, err
+	}
+	publishIngressMS = time.Since(stageStartedAt).Milliseconds()
+
+	stageStartedAt = time.Now()
+	ack, ok, waitErr := s.async.WaitAck(ctx, evt.EventID, s.ackTimeout)
+	waitAckMS = time.Since(stageStartedAt).Milliseconds()
+	if waitErr != nil {
+		err = waitErr
 		return SendResult{}, err
 	}
 	if !ok {
-		return SendResult{
+		result = SendResult{
 			Message:      provisional,
 			Queued:       true,
 			AckTimeoutMS: s.ackTimeout.Milliseconds(),
-		}, nil
+		}
+		return result, nil
 	}
+	ackReceived = true
 
 	msg := Message{
 		MessageID:         ack.MessageID,
@@ -1793,10 +1913,14 @@ func (s *Service) sendAsync(ctx context.Context, userID, conversationID, idemKey
 		Status:            ack.Status,
 		CreatedAt:         time.UnixMilli(ack.PersistedAtMS).UTC().Format(time.RFC3339),
 	}
-	if err := s.upsertIdempotency(ctx, userID, endpoint, idemKey, msg, 201); err != nil {
+	stageStartedAt = time.Now()
+	if err = s.upsertIdempotency(ctx, userID, endpoint, idemKey, msg, 201); err != nil {
+		upsertPersistedMS = time.Since(stageStartedAt).Milliseconds()
 		return SendResult{}, err
 	}
-	return SendResult{Message: msg}, nil
+	upsertPersistedMS = time.Since(stageStartedAt).Milliseconds()
+	result = SendResult{Message: msg}
+	return result, nil
 }
 
 func (s *Service) List(ctx context.Context, actor, conversationID string) ([]Message, error) {
@@ -2651,6 +2775,14 @@ func userPreferenceFlag(ctx context.Context, q rowQuerier, userID, column string
 }
 
 func (s *Service) DeliverPendingToUser(ctx context.Context, recipientUserID string) ([]map[string]any, error) {
+	type pendingDelivery struct {
+		messageID      string
+		conversationID string
+		senderID       string
+		transport      string
+		serverOrder    int64
+	}
+
 	rows, err := s.db.Query(ctx, `
 		SELECT m.id::text, m.conversation_id::text, m.sender_user_id::text, m.server_order, m.transport
 		FROM messages m
@@ -2671,16 +2803,24 @@ func (s *Service) DeliverPendingToUser(ctx context.Context, recipientUserID stri
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	pending := make([]pendingDelivery, 0, 16)
+	for rows.Next() {
+		var item pendingDelivery
+		if err := rows.Scan(&item.messageID, &item.conversationID, &item.senderID, &item.serverOrder, &item.transport); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		pending = append(pending, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
 
 	events := make([]map[string]any, 0)
 	statusUpdatedAt := time.Now().UTC().Format(time.RFC3339Nano)
-	for rows.Next() {
-		var messageID, conversationID, senderID, transport string
-		var serverOrder int64
-		if err := rows.Scan(&messageID, &conversationID, &senderID, &serverOrder, &transport); err != nil {
-			return nil, err
-		}
+	for _, item := range pending {
 		tag, err := s.db.Exec(ctx, `
 			INSERT INTO message_deliveries (
 				id, message_id, recipient_user_id, transport, state, submitted_at, updated_at
@@ -2693,7 +2833,7 @@ func (s *Service) DeliverPendingToUser(ctx context.Context, recipientUserID stri
 				  AND md.recipient_user_id = $2::uuid
 				  AND md.state = 'DELIVERED'
 			)
-		`, messageID, recipientUserID, transport)
+		`, item.messageID, recipientUserID, item.transport)
 		if err != nil {
 			return nil, err
 		}
@@ -2701,16 +2841,16 @@ func (s *Service) DeliverPendingToUser(ctx context.Context, recipientUserID stri
 			continue
 		}
 		events = append(events, map[string]any{
-			"sender_user_id":    senderID,
+			"sender_user_id":    item.senderID,
 			"recipient_user_id": recipientUserID,
-			"message_id":        messageID,
-			"conversation_id":   conversationID,
-			"server_order":      serverOrder,
+			"message_id":        item.messageID,
+			"conversation_id":   item.conversationID,
+			"server_order":      item.serverOrder,
 			"status":            "DELIVERED",
 			"status_updated_at": statusUpdatedAt,
 		})
 	}
-	return events, rows.Err()
+	return events, nil
 }
 
 func (s *Service) enforceSendRate(ctx context.Context, userID, conversationID, ip string) error {
@@ -2718,7 +2858,7 @@ func (s *Service) enforceSendRate(ctx context.Context, userID, conversationID, i
 		return nil
 	}
 	if userID != "" {
-		userDecision, err := s.rateLimiter.Allow(ctx, "rate:send:user:"+userID, 30, 10*time.Second, 60, 1)
+		userDecision, err := s.rateLimiter.Allow(ctx, "rate:send:user:"+userID, s.sendRatePerUser, s.sendRateWindow, s.sendRateUserBurst, 1)
 		if err != nil {
 			return err
 		}
@@ -2727,7 +2867,7 @@ func (s *Service) enforceSendRate(ctx context.Context, userID, conversationID, i
 		}
 	}
 	if conversationID != "" {
-		convDecision, err := s.rateLimiter.Allow(ctx, "rate:send:conversation:"+conversationID, 300, 10*time.Second, 500, 1)
+		convDecision, err := s.rateLimiter.Allow(ctx, "rate:send:conversation:"+conversationID, s.sendRatePerConversation, s.sendRateWindow, s.sendRateConversationBurst, 1)
 		if err != nil {
 			return err
 		}
@@ -2736,7 +2876,7 @@ func (s *Service) enforceSendRate(ctx context.Context, userID, conversationID, i
 		}
 	}
 	if ip != "" {
-		ipDecision, err := s.rateLimiter.Allow(ctx, "rate:send:ip:"+ip, 120, 10*time.Second, 240, 1)
+		ipDecision, err := s.rateLimiter.Allow(ctx, "rate:send:ip:"+ip, s.sendRatePerIP, s.sendRateWindow, s.sendRateIPBurst, 1)
 		if err != nil {
 			return err
 		}

@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gocql/gocql"
@@ -107,26 +109,29 @@ type processor struct {
 
 const domainEventMessageCreated = "message_created"
 
+var (
+	startupRetryDelay     = time.Second
+	startupAttemptTimeout = 3 * time.Second
+)
+
 func main() {
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	cfg := loadConfig()
 
-	pg, err := pgxpool.New(ctx, cfg.PostgresDSN)
+	pg, err := openPostgres(ctx, cfg.PostgresDSN)
 	if err != nil {
 		log.Fatalf("postgres init failed: %v", err)
 	}
 	defer pg.Close()
-	if err := pg.Ping(ctx); err != nil {
-		log.Fatalf("postgres ping failed: %v", err)
-	}
 
-	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		log.Fatalf("redis ping failed: %v", err)
+	rdb, err := openRedis(ctx, cfg.RedisAddr)
+	if err != nil {
+		log.Fatalf("redis init failed: %v", err)
 	}
 	defer rdb.Close()
 
-	cass, err := newCassandra(cfg)
+	cass, err := openCassandra(ctx, cfg)
 	if err != nil {
 		log.Fatalf("cassandra init failed: %v", err)
 	}
@@ -163,6 +168,9 @@ func main() {
 	for {
 		msg, err := p.reader.FetchMessage(ctx)
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			log.Printf("fetch failed: %v", err)
 			time.Sleep(300 * time.Millisecond)
 			continue
@@ -602,4 +610,79 @@ func getenv(k, d string) string {
 		return v
 	}
 	return d
+}
+
+func retryUntilReady(ctx context.Context, name string, fn func(context.Context) error) error {
+	attempt := 0
+	for {
+		attempt += 1
+		attemptCtx, cancel := context.WithTimeout(ctx, startupAttemptTimeout)
+		err := fn(attemptCtx)
+		cancel()
+		if err == nil {
+			if attempt > 1 {
+				log.Printf("%s became ready after %d attempts", name, attempt)
+			}
+			return nil
+		}
+		if ctx.Err() != nil {
+			return fmt.Errorf("%s init canceled: %w", name, ctx.Err())
+		}
+		log.Printf("%s not ready (attempt %d): %v", name, attempt, err)
+		timer := time.NewTimer(startupRetryDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("%s init canceled: %w", name, ctx.Err())
+		case <-timer.C:
+		}
+	}
+}
+
+func openPostgres(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
+	var pool *pgxpool.Pool
+	err := retryUntilReady(ctx, "postgres", func(attemptCtx context.Context) error {
+		candidate, err := pgxpool.New(attemptCtx, dsn)
+		if err != nil {
+			return err
+		}
+		if err := candidate.Ping(attemptCtx); err != nil {
+			candidate.Close()
+			return err
+		}
+		pool = candidate
+		return nil
+	})
+	return pool, err
+}
+
+func openRedis(ctx context.Context, addr string) (*redis.Client, error) {
+	var client *redis.Client
+	err := retryUntilReady(ctx, "redis", func(attemptCtx context.Context) error {
+		candidate := redis.NewClient(&redis.Options{Addr: addr})
+		if err := candidate.Ping(attemptCtx).Err(); err != nil {
+			_ = candidate.Close()
+			return err
+		}
+		client = candidate
+		return nil
+	})
+	return client, err
+}
+
+func openCassandra(ctx context.Context, cfg config) (*gocql.Session, error) {
+	var session *gocql.Session
+	err := retryUntilReady(ctx, "cassandra", func(attemptCtx context.Context) error {
+		candidate, err := newCassandra(cfg)
+		if err != nil {
+			return err
+		}
+		if err := ensureCassandraSchema(attemptCtx, candidate, cfg.CassandraKeyspace); err != nil {
+			candidate.Close()
+			return err
+		}
+		session = candidate
+		return nil
+	})
+	return session, err
 }

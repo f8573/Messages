@@ -4,14 +4,25 @@ This workspace adds a browser-level QA layer on top of the existing `node:test` 
 
 ## Install
 
-From [apps/web](c:/Users/James/Downloads/Messages/ohmf/apps/web):
+From the [repo root](c:/Users/James/Downloads/Messages):
 
 ```powershell
 npm install
-npx playwright install chromium
+npx playwright install chromium firefox webkit
 ```
 
+The standardized `npm run test:e2e` and `npm run test:live` entrypoints resolve Playwright from the repo-root install. A separate `ohmf/apps/web/node_modules` directory is optional.
+
 ## Run
+
+Standardized root gates:
+
+```powershell
+npm run test:e2e
+npm run test:live
+```
+
+From [apps/web](c:/Users/James/Downloads/Messages/ohmf/apps/web), the workspace-local commands still work after the root install:
 
 Fast local checks:
 

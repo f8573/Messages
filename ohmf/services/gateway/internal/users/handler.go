@@ -133,14 +133,22 @@ func (h *Handler) BlockUser(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "missing auth", nil)
 		return
 	}
-	var req struct {
-		UserID string `json:"user_id"`
+	targetID := chi.URLParam(r, "id")
+	if targetID == "" {
+		var req struct {
+			UserID string `json:"user_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "invalid body", nil)
+			return
+		}
+		targetID = req.UserID
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "invalid body", nil)
+	if targetID == "" {
+		httpx.WriteError(w, r, http.StatusBadRequest, "invalid_request", "missing user id", nil)
 		return
 	}
-	if err := h.svc.BlockUser(r.Context(), userID, req.UserID); err != nil {
+	if err := h.svc.BlockUser(r.Context(), userID, targetID); err != nil {
 		httpx.WriteError(w, r, http.StatusInternalServerError, "block_failed", err.Error(), nil)
 		return
 	}

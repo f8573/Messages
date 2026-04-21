@@ -411,3 +411,96 @@ func TestFinalizeDeletionMarksCompletedAndDeletesOperationalArtifacts(t *testing
 		t.Fatalf("unmet expectations: %v", err)
 	}
 }
+
+func TestBlockUserUsesBlockerUserID(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mock.Close()
+
+	svc := &Service{db: mock}
+
+	mock.ExpectExec(`INSERT INTO user_blocks \(blocker_user_id, blocked_user_id, created_at\)`).
+		WithArgs("user-1", "user-2").
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+
+	if err := svc.BlockUser(context.Background(), "user-1", "user-2"); err != nil {
+		t.Fatalf("BlockUser failed: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestUnblockUserUsesBlockerUserID(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mock.Close()
+
+	svc := &Service{db: mock}
+
+	mock.ExpectExec(`DELETE FROM user_blocks WHERE blocker_user_id = \$1::uuid AND blocked_user_id = \$2::uuid`).
+		WithArgs("user-1", "user-2").
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+
+	if err := svc.UnblockUser(context.Background(), "user-1", "user-2"); err != nil {
+		t.Fatalf("UnblockUser failed: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestHasBlockedUsesBlockerUserID(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mock.Close()
+
+	svc := &Service{db: mock}
+
+	mock.ExpectQuery(`SELECT EXISTS\(SELECT 1 FROM user_blocks WHERE blocker_user_id = \$1::uuid AND blocked_user_id = \$2::uuid\)`).
+		WithArgs("user-1", "user-2").
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
+
+	blocked, err := svc.HasBlocked(context.Background(), "user-1", "user-2")
+	if err != nil {
+		t.Fatalf("HasBlocked failed: %v", err)
+	}
+	if !blocked {
+		t.Fatalf("expected block relationship to exist")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestListBlockedUsersUsesBlockerUserID(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mock.Close()
+
+	svc := &Service{db: mock}
+
+	mock.ExpectQuery(`WHERE ub.blocker_user_id = \$1::uuid`).
+		WithArgs("user-1").
+		WillReturnRows(pgxmock.NewRows([]string{"id", "display_name", "avatar_url", "primary_phone_e164"}).
+			AddRow("user-2", "User Two", "https://example.com/avatar.png", "+15550002222"))
+
+	blocked, err := svc.ListBlockedUsers(context.Background(), "user-1")
+	if err != nil {
+		t.Fatalf("ListBlockedUsers failed: %v", err)
+	}
+	if len(blocked) != 1 || blocked[0].UserID != "user-2" {
+		t.Fatalf("unexpected blocked users: %#v", blocked)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
