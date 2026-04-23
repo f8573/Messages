@@ -1,0 +1,8 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ohmf-gateway
+  namespace: ohmf-app
+spec:
+  minReplicas: 6
+  maxReplicas: 18

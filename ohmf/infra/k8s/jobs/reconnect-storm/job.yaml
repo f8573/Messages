@@ -1,0 +1,64 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ohmf-reconnect-storm
+  namespace: ohmf-loadgen
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ohmf-reconnect-storm
+        app.kubernetes.io/component: loadgen
+    spec:
+      restartPolicy: Never
+      priorityClassName: ohmf-loadgen-low
+      nodeSelector:
+        ohmf.node-role: loadgen
+      containers:
+        - name: loadgen
+          image: ohmf-stress:dev
+          imagePullPolicy: IfNotPresent
+          command:
+            - node
+            - ./testing/stress/run.js
+          args:
+            - --scenario
+            - reconnect-storm
+            - --total-clients
+            - "1000"
+            - --unique-user-ratio
+            - "0.75"
+            - --reconnect-storm-size
+            - "250"
+            - --reconnect-batch-size
+            - "50"
+            - --reconnect-batch-interval-ms
+            - "1000"
+            - --reconnect-pause-ms
+            - "1000"
+            - --hold-ms
+            - "5000"
+            - --report-dir
+            - /var/reports
+          env:
+            - name: OHMF_STRESS_BASE_URL
+              value: http://ohmf-gateway.ohmf-app.svc.cluster.local:8080
+            - name: OHMF_STRESS_METRICS_URLS
+              value: http://ohmf-gateway.ohmf-app.svc.cluster.local:8080/metrics
+            - name: OHMF_STRESS_RUN_LABEL
+              value: k8s-reconnect-storm
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+          volumeMounts:
+            - name: reports
+              mountPath: /var/reports
+      volumes:
+        - name: reports
+          emptyDir: {}

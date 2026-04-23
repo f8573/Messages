@@ -1,0 +1,8 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ohmf-messages-processor
+  namespace: ohmf-app
+spec:
+  minReplicas: 6
+  maxReplicas: 18

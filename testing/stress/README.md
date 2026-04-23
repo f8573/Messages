@@ -31,6 +31,12 @@ There is also a suite runner for multi-stage validation:
 
 Artifacts are written under `testing/stress/reports/`.
 
+## Kubernetes Note
+
+For Kubernetes-based performance and chaos testing, use the single-scenario runner in `run.js` together with the manifests under `ohmf/infra/k8s`.
+
+The multi-stage suite runners (`capacity-suite.js` and `full-suite.js`) still inject failures and recover services by calling local Docker directly. They are appropriate for the local Docker stack, but not yet the correct control plane for in-cluster failure injection.
+
 ## Running It
 
 From the repo root:
@@ -51,6 +57,12 @@ node .\testing\stress\run.js --scenario send-abort --users 2 --devices-per-user 
 node .\testing\stress\run.js --scenario high-latency-link --users 2 --devices-per-user 1 --send-timeout-ms 5000 --fault-request-delay-ms 5500
 node .\testing\stress\run.js --scenario block-race --users 2 --devices-per-user 1 --race-iterations 10
 node .\testing\stress\full-suite.js --total-clients 10000 --unique-user-ratio 0.75 --messages-per-stage 600 --rate 120
+```
+
+Container image for cluster jobs:
+
+```powershell
+docker build -f testing/stress/Dockerfile -t ohmf-stress:dev .
 ```
 
 ## Key Options

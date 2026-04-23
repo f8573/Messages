@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ohmf-processors-config
+  namespace: ohmf-app
+data:
+  APP_LOG_LEVEL: info
+  APP_KAFKA_INGRESS_TOPIC: msg.ingress.v1
+  APP_KAFKA_PERSISTED_TOPIC: msg.persisted.v1
+  APP_KAFKA_DELIVERY_TOPIC: msg.delivery.v1
+  APP_KAFKA_SMS_DISPATCH_TOPIC: msg.sms.dispatch.v1
+  APP_KAFKA_PRESENCE_TOPIC: presence.events.v1
+  APP_KAFKA_MICROSERVICE_TOPIC: microservice.events.v1
+  APP_KAFKA_DLQ_TOPIC: msg.ingress.dlq.v1
+  APP_KAFKA_DELIVERY_DLQ_TOPIC: msg.delivery.dlq.v1
+  APP_KAFKA_SMS_DLQ_TOPIC: msg.sms.dlq.v1

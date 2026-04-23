@@ -1,0 +1,23 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespaces.yaml
+  - priorityclasses.yaml
+  - gateway-configmap.yaml
+  - processors-configmap.yaml
+  - gateway-deployment.yaml
+  - gateway-service.yaml
+  - gateway-pdb.yaml
+  - gateway-hpa.yaml
+  - messages-processor-deployment.yaml
+  - messages-processor-pdb.yaml
+  - messages-processor-hpa.yaml
+  - delivery-processor-deployment.yaml
+  - delivery-processor-pdb.yaml
+  - delivery-processor-hpa.yaml
+  - sms-processor-deployment.yaml
+  - sms-processor-pdb.yaml
+
+commonLabels:
+  app.kubernetes.io/part-of: ohmf

@@ -1,0 +1,23 @@
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: ohmf-edge-high
+value: 100000
+globalDefault: false
+description: Prefer gateway pods during pressure.
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: ohmf-workers-medium
+value: 90000
+globalDefault: false
+description: Prefer async processors behind gateway pods.
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: ohmf-loadgen-low
+value: 1000
+globalDefault: false
+description: Load generators should lose scheduling races to app traffic.

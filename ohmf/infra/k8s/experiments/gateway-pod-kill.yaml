@@ -1,0 +1,14 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: gateway-pod-kill
+  namespace: ohmf-chaos
+spec:
+  action: pod-kill
+  mode: one
+  selector:
+    namespaces:
+      - ohmf-app
+    labelSelectors:
+      app.kubernetes.io/name: gateway
+  duration: 30s

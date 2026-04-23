@@ -29,3 +29,4 @@ Testing requirements
 
 References
 - infra/docker for compose, infra/docker/README.md for examples, infra/observability for metrics and dashboards.
+- infra/k8s for the first-pass distributed performance and chaos-test layout.

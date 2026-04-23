@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ohmf-gateway
+  namespace: ohmf-app
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/component: edge
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
