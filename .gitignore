@@ -15,4 +15,6 @@ node_modules/
 testing/stress/reports/
 ohmf/AGENTS.md
 ohmf/docs/
+.gocache/
+.tmp/
 # removed: generated binaries and captured outputs do not belong in source control

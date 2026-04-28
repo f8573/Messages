@@ -1,0 +1,14 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: gateway-reconnect-storm-pod-kill
+  namespace: ohmf-chaos
+spec:
+  action: pod-kill
+  mode: fixed-percent
+  value: "25"
+  selector:
+    namespaces:
+      - ohmf-app
+    labelSelectors:
+      app.kubernetes.io/name: gateway

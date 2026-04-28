@@ -1,0 +1,25 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: gateway-to-kafka-delay
+  namespace: ohmf-chaos
+spec:
+  action: delay
+  mode: all
+  selector:
+    namespaces:
+      - ohmf-app
+    labelSelectors:
+      app.kubernetes.io/name: gateway
+  direction: to
+  target:
+    mode: all
+    selector:
+      namespaces:
+        - ohmf-data
+      labelSelectors:
+        app.kubernetes.io/name: kafka
+  delay:
+    latency: 150ms
+    correlation: "25"
+    jitter: 25ms

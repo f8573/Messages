@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - gateway-servicemonitor.yaml
+  - ohmf-prometheusrule.yaml
+
+commonLabels:
+  app.kubernetes.io/part-of: ohmf
+  app.kubernetes.io/component: observability

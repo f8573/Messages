@@ -1,0 +1,20 @@
+[
+  {
+    "label": "start",
+    "url": "http://127.0.0.1:18080/metrics",
+    "file": "C:\\Users\\James\\Downloads\\Messages\\test-results\\2026-04-28T18-21-52Z-throughput-docker-kubernetes-worst-case-throughput\\metrics\\start-1.prom",
+    "bytes": 321637
+  },
+  {
+    "label": "connected",
+    "url": "http://127.0.0.1:18080/metrics",
+    "file": "C:\\Users\\James\\Downloads\\Messages\\test-results\\2026-04-28T18-21-52Z-throughput-docker-kubernetes-worst-case-throughput\\metrics\\connected-1.prom",
+    "bytes": 321655
+  },
+  {
+    "label": "end",
+    "url": "http://127.0.0.1:18080/metrics",
+    "file": "C:\\Users\\James\\Downloads\\Messages\\test-results\\2026-04-28T18-21-52Z-throughput-docker-kubernetes-worst-case-throughput\\metrics\\end-1.prom",
+    "bytes": 944140
+  }
+]

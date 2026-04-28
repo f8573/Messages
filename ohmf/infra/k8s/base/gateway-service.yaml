@@ -3,6 +3,9 @@ kind: Service
 metadata:
   name: ohmf-gateway
   namespace: ohmf-app
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/component: edge
 spec:
   type: ClusterIP
   selector:

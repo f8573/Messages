@@ -1,0 +1,18 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: processor-pod-restart
+  namespace: ohmf-chaos
+spec:
+  action: pod-kill
+  mode: one
+  selector:
+    namespaces:
+      - ohmf-app
+    expressionSelectors:
+      - key: app.kubernetes.io/name
+        operator: In
+        values:
+          - messages-processor
+          - delivery-processor
+          - sms-processor

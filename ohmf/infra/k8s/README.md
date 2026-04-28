@@ -25,6 +25,7 @@ This layout does not attempt to fully own Kafka, Cassandra, Redis, or Postgres. 
 - `base/`: namespaces, app deployments, HPAs, services, and PDBs
 - `overlays/perf-lab/`: performance-test replica counts and relaxed admission limits
 - `jobs/`: loadgen jobs that run the existing `testing/stress/run.js` scenarios in-cluster
+- `observability/`: Prometheus Operator scrape and alert resources
 - `experiments/`: chaos templates and node-offline runbook
 - `templates/`: secret examples and operator-facing placeholders
 
@@ -62,9 +63,16 @@ kubectl apply -k ohmf/infra/k8s/jobs/standard-throughput
 kubectl apply -k ohmf/infra/k8s/jobs/worst-case-throughput
 ```
 
-7. Run chaos while the job is active:
-   - `kubectl apply -f ohmf/infra/k8s/experiments/gateway-pod-kill.yaml`
+7. If Prometheus Operator is installed, apply the scrape and alert resources:
+
+```powershell
+kubectl apply -k ohmf/infra/k8s/observability
+```
+
+8. Run chaos while the job is active:
+   - `kubectl apply -k ohmf/infra/k8s/experiments`
    - follow the node drain runbook in `experiments/node-offline-runbook.md`
+   - follow the dependency drill runbook in `experiments/dependency-failure-runbook.md`
 
 ## Important Limits
 

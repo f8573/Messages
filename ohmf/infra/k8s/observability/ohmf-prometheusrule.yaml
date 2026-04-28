@@ -1,0 +1,45 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: ohmf-performance-lab
+  namespace: ohmf-observability
+spec:
+  groups:
+    - name: ohmf.gateway.availability
+      rules:
+        - alert: OHMFGatewayScrapeDown
+          expr: up{namespace="ohmf-app",service="ohmf-gateway"} == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: OHMF gateway metrics scrape is down
+            description: Prometheus cannot scrape the gateway metrics endpoint during a lab run.
+        - alert: OHMFGatewayReplicasUnavailable
+          expr: kube_deployment_status_replicas_available{namespace="ohmf-app",deployment="ohmf-gateway"} < 2
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: OHMF gateway has fewer than two available replicas
+            description: A drain, pod kill, or scheduling failure reduced gateway redundancy.
+    - name: ohmf.gateway.latency
+      rules:
+        - alert: OHMFGatewayAcceptLatencyP99High
+          expr: histogram_quantile(0.99, sum by (le) (rate(ohmf_gateway_http_request_duration_seconds_bucket{route="/v1/messages"}[5m]))) > 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: OHMF message accept p99 is above one second
+            description: Gateway message accept latency stayed above the perf-lab threshold.
+    - name: ohmf.correctness.slo
+      rules:
+        - alert: OHMFLoadgenJobFailed
+          expr: kube_job_failed{namespace="ohmf-loadgen",job_name=~"ohmf-.*"} > 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: OHMF loadgen job failed
+            description: Inspect the loadgen report artifact for duplicates, lost deliveries, or ordering violations.
