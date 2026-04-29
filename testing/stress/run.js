@@ -1661,6 +1661,9 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error(error.message || error);
+  console.error(error?.stack || error?.message || error);
+  if (error?.cause) {
+    console.error("Cause:", error.cause?.stack || error.cause?.message || error.cause);
+  }
   process.exitCode = 1;
 });

@@ -1,0 +1,20 @@
+[
+  {
+    "label": "start",
+    "url": "http://172.23.0.3:8080/metrics",
+    "file": "/var/reports/2026-04-29T06-29-42Z-throughput-k8s-standard-throughput-phase1-local-pvc/metrics/start-1.prom",
+    "bytes": 326635
+  },
+  {
+    "label": "connected",
+    "url": "http://172.23.0.3:8080/metrics",
+    "file": "/var/reports/2026-04-29T06-29-42Z-throughput-k8s-standard-throughput-phase1-local-pvc/metrics/connected-1.prom",
+    "bytes": 326657
+  },
+  {
+    "label": "end",
+    "url": "http://172.23.0.3:8080/metrics",
+    "file": "/var/reports/2026-04-29T06-29-42Z-throughput-k8s-standard-throughput-phase1-local-pvc/metrics/end-1.prom",
+    "bytes": 625479
+  }
+]
