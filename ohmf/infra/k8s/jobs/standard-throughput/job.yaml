@@ -1,3 +1,15 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ohmf-standard-throughput-reports
+  namespace: ohmf-loadgen
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -59,4 +71,5 @@ spec:
               mountPath: /var/reports
       volumes:
         - name: reports
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: ohmf-standard-throughput-reports

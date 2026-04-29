@@ -162,6 +162,7 @@ function buildConfig(args) {
     raceIterations: Math.max(1, integerOption(args.raceIterations ?? process.env.OHMF_STRESS_RACE_ITERATIONS, 5)),
     connectBatchSize: Math.max(1, integerOption(args.connectBatchSize ?? process.env.OHMF_STRESS_CONNECT_BATCH_SIZE, 1)),
     settleTimeoutMs: Math.max(1000, integerOption(args.settleTimeoutMs ?? process.env.OHMF_STRESS_SETTLE_TIMEOUT_MS, 20000)),
+    postConnectSettleMs: Math.max(0, integerOption(args.postConnectSettleMs ?? process.env.OHMF_STRESS_POST_CONNECT_SETTLE_MS, 0)),
     persistPollIntervalMs: Math.max(50, integerOption(args.persistPollIntervalMs ?? process.env.OHMF_STRESS_PERSIST_POLL_INTERVAL_MS, 500)),
     receiptPollIntervalMs: Math.max(25, integerOption(args.receiptPollIntervalMs ?? process.env.OHMF_STRESS_RECEIPT_POLL_INTERVAL_MS, 100)),
     connectDelayMs: Math.max(0, integerOption(args.connectDelayMs ?? process.env.OHMF_STRESS_CONNECT_DELAY_MS, 50)),
@@ -252,6 +253,7 @@ function printUsage() {
   console.log("  --fault-response-delay-ms <milliseconds>");
   console.log("  --fault-retry-delay-ms <milliseconds>");
   console.log("  --settle-timeout-ms <milliseconds>");
+  console.log("  --post-connect-settle-ms <milliseconds>");
   console.log("  --connect-delay-ms <milliseconds>");
   console.log("  --connect-batch-size <devices>");
   console.log("  --topology-file <path>");
@@ -273,7 +275,8 @@ function printUsage() {
   console.log("  OHMF_STRESS_RECONNECT_STORM_SIZE, OHMF_STRESS_RECONNECT_BATCH_SIZE,");
   console.log("  OHMF_STRESS_RECONNECT_BATCH_INTERVAL_MS, OHMF_STRESS_RECONNECT_PAUSE_MS,");
   console.log("  OHMF_STRESS_SETTLE_TIMEOUT_MS, OHMF_STRESS_CONNECT_DELAY_MS,");
-  console.log("  OHMF_STRESS_CONNECT_BATCH_SIZE, OHMF_STRESS_TOPOLOGY_FILE, OHMF_STRESS_TOPOLOGY_USER_OFFSET,");
+  console.log("  OHMF_STRESS_POST_CONNECT_SETTLE_MS, OHMF_STRESS_CONNECT_BATCH_SIZE,");
+  console.log("  OHMF_STRESS_TOPOLOGY_FILE, OHMF_STRESS_TOPOLOGY_USER_OFFSET,");
   console.log("  OHMF_STRESS_METRICS_URLS, OHMF_STRESS_REPORT_DIR.");
 }
 
@@ -1581,6 +1584,9 @@ async function main() {
     topology = await provisionTopology(config, tracker, runID);
     connectedDevicesAtMeasurement = countConnectedClients(topology);
     metrics.push(...await captureMetrics("connected", config, runDir));
+    if (config.postConnectSettleMs > 0) {
+      await sleep(config.postConnectSettleMs);
+    }
 
     if (config.scenario === "smoke") {
       await runSmokeScenario(config, tracker, topology);

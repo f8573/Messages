@@ -80,6 +80,7 @@ docker build -f testing/stress/Dockerfile -t ohmf-stress:dev .
 - `--duration-ms`: duration budget for throughput mode when `--messages` is omitted
 - `--hold-ms`: how long to keep the ramped or reconnected devices open before shutdown
 - `--connect-timeout-ms`: handshake timeout before a stalled socket is counted as a failed connection
+- `--post-connect-settle-ms`: pause after all WebSockets connect before starting the scenario; useful for Kubernetes fanout runs so server-side subscriptions are ready before the first message burst
 - `--reconnect-storm-size`: how many already-connected devices to drop and reconnect in `reconnect-storm`
 - `--reconnect-batch-size`: reconnect batch size during a reconnect storm
 - `--reconnect-batch-interval-ms`: wait time between reconnect batches

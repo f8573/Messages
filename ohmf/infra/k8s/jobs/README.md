@@ -23,4 +23,4 @@ Push that image to the registry your cluster can pull from, or preload it on the
 - `worst-case-throughput`: heavy throughput at `75%` unique users
 - `reconnect-storm`: reconnect surge against a `75%` unique-user topology
 
-Each job writes reports under `/var/reports` inside the pod. The examples use `emptyDir`, so copy the artifacts out before deleting the pod if you want to retain them.
+Each job writes reports under `/var/reports` inside the pod. The throughput examples use PVC-backed report volumes so artifacts survive completed pods and can be copied with a short-lived helper pod if needed.

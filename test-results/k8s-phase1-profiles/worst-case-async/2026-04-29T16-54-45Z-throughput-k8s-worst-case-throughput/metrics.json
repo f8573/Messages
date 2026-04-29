@@ -1,0 +1,20 @@
+[
+  {
+    "label": "start",
+    "url": "http://ohmf-gateway.ohmf-app.svc.cluster.local:8080/metrics",
+    "file": "/var/reports/2026-04-29T16-54-45Z-throughput-k8s-worst-case-throughput/metrics/start-1.prom",
+    "bytes": 12089
+  },
+  {
+    "label": "connected",
+    "url": "http://ohmf-gateway.ohmf-app.svc.cluster.local:8080/metrics",
+    "file": "/var/reports/2026-04-29T16-54-45Z-throughput-k8s-worst-case-throughput/metrics/connected-1.prom",
+    "bytes": 19281
+  },
+  {
+    "label": "end",
+    "url": "http://ohmf-gateway.ohmf-app.svc.cluster.local:8080/metrics",
+    "file": "/var/reports/2026-04-29T16-54-45Z-throughput-k8s-worst-case-throughput/metrics/end-1.prom",
+    "bytes": 636704
+  }
+]

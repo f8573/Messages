@@ -186,8 +186,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	go h.writeLoop(c)
-	go h.subscribeDelivery(ctx, c)
-	go h.subscribeMessages(ctx, c)
+	go h.subscribeDelivery(c.clientCtx, c)
+	go h.subscribeMessages(c.clientCtx, c)
 	h.readLoop(c, ip)
 }
 
@@ -221,7 +221,7 @@ func (h *Handler) ServeV2(w http.ResponseWriter, r *http.Request) {
 	h.touchConnection(ctx, c)
 
 	go h.writeLoop(c)
-	go h.subscribeUserEvents(ctx, c)
+	go h.subscribeUserEvents(c.clientCtx, c)
 	h.readLoopV2(c, ip)
 }
 
@@ -557,8 +557,16 @@ func (h *Handler) subscribeDelivery(ctx context.Context, c *client) {
 	pubsub := h.redis.Subscribe(ctx, "delivery:user:"+c.userID)
 	defer pubsub.Close()
 	ch := pubsub.Channel()
-	for msg := range ch {
-		h.sendJSON(c, "delivery_update", json.RawMessage(msg.Payload))
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg, ok := <-ch:
+			if !ok {
+				return
+			}
+			h.sendJSON(c, "delivery_update", json.RawMessage(msg.Payload))
+		}
 	}
 }
 
@@ -569,8 +577,16 @@ func (h *Handler) subscribeMessages(ctx context.Context, c *client) {
 	pubsub := h.redis.Subscribe(ctx, "message:user:"+c.userID)
 	defer pubsub.Close()
 	ch := pubsub.Channel()
-	for msg := range ch {
-		h.sendJSON(c, "message_created", json.RawMessage(msg.Payload))
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg, ok := <-ch:
+			if !ok {
+				return
+			}
+			h.sendJSON(c, "message_created", json.RawMessage(msg.Payload))
+		}
 	}
 }
 
@@ -580,13 +596,22 @@ func (h *Handler) subscribeUserEvents(ctx context.Context, c *client) {
 	}
 	pubsub := h.redis.Subscribe(ctx, h.replication.ChannelForUser(c.userID))
 	defer pubsub.Close()
-	for msg := range pubsub.Channel() {
-		var evt replication.Event
-		if err := json.Unmarshal([]byte(msg.Payload), &evt); err != nil {
-			observability.RecordWSMessage("user_event_unmarshal_error", evt.Type)
-			continue
+	ch := pubsub.Channel()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg, ok := <-ch:
+			if !ok {
+				return
+			}
+			var evt replication.Event
+			if err := json.Unmarshal([]byte(msg.Payload), &evt); err != nil {
+				observability.RecordWSMessage("user_event_unmarshal_error", evt.Type)
+				continue
+			}
+			h.sendJSON(c, "event", evt)
 		}
-		h.sendJSON(c, "event", evt)
 	}
 }
 
